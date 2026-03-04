@@ -93,7 +93,9 @@ impl PubSub {
 
     /// Subscribe to a topic. Returns a broadcast receiver that will receive
     /// all future messages published to this topic.
-    pub async fn subscribe(&self, topic: &str) -> broadcast::Receiver<PubSubMessage> {
+    ///
+    /// Returns `None` if the PubSub server has been dropped.
+    pub async fn subscribe(&self, topic: &str) -> Option<broadcast::Receiver<PubSubMessage>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(PubSubCommand::Subscribe {
@@ -101,7 +103,13 @@ impl PubSub {
                 reply: reply_tx,
             })
             .ok();
-        reply_rx.await.expect("PubSub server dropped unexpectedly")
+        match reply_rx.await {
+            Ok(rx) => Some(rx),
+            Err(_) => {
+                tracing::warn!(topic = %topic, "PubSub server dropped before subscribe completed");
+                None
+            }
+        }
     }
 
     /// Broadcast a message to all current subscribers of the given topic.
@@ -163,7 +171,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_and_receive() {
         let pubsub = PubSub::start();
-        let mut rx = pubsub.subscribe("room:lobby").await;
+        let mut rx = pubsub.subscribe("room:lobby").await.unwrap();
 
         pubsub.broadcast("room:lobby", "new_msg", serde_json::json!({"text": "hello"}));
 
@@ -182,8 +190,8 @@ mod tests {
     #[tokio::test]
     async fn multiple_subscribers_receive_same_broadcast() {
         let pubsub = PubSub::start();
-        let mut rx1 = pubsub.subscribe("room:lobby").await;
-        let mut rx2 = pubsub.subscribe("room:lobby").await;
+        let mut rx1 = pubsub.subscribe("room:lobby").await.unwrap();
+        let mut rx2 = pubsub.subscribe("room:lobby").await.unwrap();
 
         pubsub.broadcast("room:lobby", "ping", serde_json::json!(null));
 
@@ -213,7 +221,7 @@ mod tests {
     #[tokio::test]
     async fn unsubscribe_cleans_up_empty_topic() {
         let pubsub = PubSub::start();
-        let rx = pubsub.subscribe("ephemeral").await;
+        let rx = pubsub.subscribe("ephemeral").await.unwrap();
 
         // Drop the receiver so receiver_count goes to 0
         drop(rx);
@@ -229,8 +237,8 @@ mod tests {
     #[tokio::test]
     async fn subscribers_on_different_topics_are_independent() {
         let pubsub = PubSub::start();
-        let mut rx_a = pubsub.subscribe("topic_a").await;
-        let mut rx_b = pubsub.subscribe("topic_b").await;
+        let mut rx_a = pubsub.subscribe("topic_a").await.unwrap();
+        let mut rx_b = pubsub.subscribe("topic_b").await.unwrap();
 
         pubsub.broadcast("topic_a", "only_a", serde_json::json!("a"));
 

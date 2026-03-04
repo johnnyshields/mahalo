@@ -30,3 +30,35 @@ where
 {
     PlugFn(f)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::{Method, StatusCode, Uri};
+
+    #[tokio::test]
+    async fn plug_fn_creates_callable_plug() {
+        let plug = plug_fn(|conn: Conn| async {
+            conn.put_status(StatusCode::IM_A_TEAPOT)
+        });
+        let conn = Conn::new(Method::GET, Uri::from_static("/"));
+        let conn = plug.call(conn).await;
+        assert_eq!(conn.status, StatusCode::IM_A_TEAPOT);
+    }
+
+    #[tokio::test]
+    async fn plug_fn_can_modify_body() {
+        let plug = plug_fn(|conn: Conn| async {
+            conn.put_resp_body("hello from plug")
+        });
+        let conn = Conn::new(Method::GET, Uri::from_static("/"));
+        let conn = plug.call(conn).await;
+        assert_eq!(conn.resp_body, "hello from plug");
+    }
+
+    #[test]
+    fn plug_fn_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PlugFn<fn(Conn) -> std::pin::Pin<Box<dyn Future<Output = Conn> + Send>>>>();
+    }
+}

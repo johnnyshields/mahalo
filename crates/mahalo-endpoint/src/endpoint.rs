@@ -15,6 +15,9 @@ use rebar_core::supervisor::spec::ChildSpec;
 use mahalo_core::conn::Conn;
 use mahalo_router::MahaloRouter;
 
+/// Default maximum request body size (2 MB).
+const DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
 /// Shared state passed to each Axum handler via State extractor.
 #[derive(Clone)]
 struct EndpointState {
@@ -118,7 +121,7 @@ async fn request_to_conn(
     let uri = request.uri().clone();
     let headers = request.headers().clone();
 
-    let body_bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+    let body_bytes = axum::body::to_bytes(request.into_body(), DEFAULT_BODY_LIMIT)
         .await
         .unwrap_or_default();
 
@@ -200,5 +203,68 @@ mod tests {
         let endpoint = MahaloEndpoint::new(router, addr, runtime);
         let entry = endpoint.child_entry();
         assert_eq!(entry.spec.id, "mahalo_endpoint");
+    }
+
+    #[tokio::test]
+    async fn integration_start_server_and_make_request() {
+        use mahalo_core::plug::plug_fn;
+
+        let runtime = Arc::new(Runtime::new(1));
+        let router = MahaloRouter::new()
+            .get(
+                "/health",
+                plug_fn(|conn: Conn| async {
+                    conn.put_status(StatusCode::OK)
+                        .put_resp_body("ok")
+                }),
+            )
+            .post(
+                "/echo",
+                plug_fn(|conn: Conn| async {
+                    let body = conn.body.clone();
+                    conn.put_status(StatusCode::OK).put_resp_body(body)
+                }),
+            );
+
+        // Bind to port 0 to get a random available port
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let endpoint = MahaloEndpoint::new(router, addr, runtime);
+        let axum_router = endpoint.into_axum_router();
+
+        // Spawn server in background
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum_router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let base = format!("http://{addr}");
+
+        // Test GET /health
+        let resp = reqwest::get(format!("{base}/health")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "ok");
+
+        // Test POST /echo
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/echo"))
+            .body("hello mahalo")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "hello mahalo");
+
+        // Test 404
+        let resp = reqwest::get(format!("{base}/nonexistent")).await.unwrap();
+        assert_eq!(resp.status(), 404);
+
+        server.abort();
     }
 }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, Uri};
+use percent_encoding::percent_decode_str;
 use rebar_core::runtime::Runtime;
 
 /// Typed key for the assigns map.
@@ -96,6 +97,7 @@ impl Conn {
     }
 
     /// Parse the query string from the URI into `query_params`.
+    /// Keys and values are percent-decoded.
     pub fn parse_query_params(&mut self) {
         if let Some(query) = self.uri.query() {
             self.query_params = query
@@ -104,7 +106,9 @@ impl Conn {
                     let mut parts = pair.splitn(2, '=');
                     let key = parts.next()?;
                     let value = parts.next().unwrap_or("");
-                    Some((key.to_string(), value.to_string()))
+                    let key = percent_decode_str(key).decode_utf8_lossy().into_owned();
+                    let value = percent_decode_str(value).decode_utf8_lossy().into_owned();
+                    Some((key, value))
                 })
                 .collect();
         }
@@ -182,5 +186,27 @@ mod tests {
         let mut conn = Conn::new(Method::GET, Uri::from_static("/search"));
         conn.parse_query_params();
         assert!(conn.query_params.is_empty());
+    }
+
+    #[test]
+    fn parse_query_params_url_decoded() {
+        let mut conn = Conn::new(
+            Method::GET,
+            "/search?name=hello%20world&city=S%C3%A3o%20Paulo".parse::<Uri>().unwrap(),
+        );
+        conn.parse_query_params();
+        assert_eq!(conn.query_params.get("name").unwrap(), "hello world");
+        assert_eq!(conn.query_params.get("city").unwrap(), "São Paulo");
+    }
+
+    #[test]
+    fn parse_query_params_plus_not_decoded_as_space() {
+        let mut conn = Conn::new(
+            Method::GET,
+            "/search?q=a+b".parse::<Uri>().unwrap(),
+        );
+        conn.parse_query_params();
+        // percent-encoding does not decode '+' as space (that's form-urlencoded)
+        assert_eq!(conn.query_params.get("q").unwrap(), "a+b");
     }
 }

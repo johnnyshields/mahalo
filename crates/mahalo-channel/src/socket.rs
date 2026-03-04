@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use mahalo_core::conn::AssignKey;
 use mahalo_pubsub::PubSub;
 
 use crate::channel::{Channel, Reply};
@@ -49,7 +50,9 @@ impl ChannelSocket {
             msg_ref: None,
         };
         if let Ok(json) = serde_json::to_string(&msg) {
-            let _ = self.sender.send(WsMessage::Text(json.into()));
+            if self.sender.send(WsMessage::Text(json.into())).is_err() {
+                tracing::warn!(topic = %self.topic, event = %event, "push failed, client disconnected");
+            }
         }
     }
 
@@ -70,17 +73,19 @@ impl ChannelSocket {
             msg_ref: Some(msg_ref.to_string()),
         };
         if let Ok(json) = serde_json::to_string(&msg) {
-            let _ = self.sender.send(WsMessage::Text(json.into()));
+            if self.sender.send(WsMessage::Text(json.into())).is_err() {
+                tracing::warn!(topic = %self.topic, msg_ref = %msg_ref, "reply failed, client disconnected");
+            }
         }
     }
 
-    pub fn assign<T: Send + Sync + 'static>(&mut self, value: T) {
-        self.assigns.insert(TypeId::of::<T>(), Box::new(value));
+    pub fn assign<K: AssignKey>(&mut self, value: K::Value) {
+        self.assigns.insert(TypeId::of::<K>(), Box::new(value));
     }
 
-    pub fn get_assign<T: Send + Sync + 'static>(&self) -> Option<&T> {
+    pub fn get_assign<K: AssignKey>(&self) -> Option<&K::Value> {
         self.assigns
-            .get(&TypeId::of::<T>())
+            .get(&TypeId::of::<K>())
             .and_then(|v| v.downcast_ref())
     }
 }
@@ -127,6 +132,117 @@ fn topic_matches(pattern: &str, topic: &str) -> bool {
     }
 }
 
+/// Handle a `phx_join` event: create a socket, call channel.join, subscribe to PubSub.
+async fn handle_join(
+    phoenix_msg: &PhoenixMessage,
+    channel: &Arc<dyn Channel>,
+    tx: &mpsc::UnboundedSender<WsMessage>,
+    pubsub: &PubSub,
+    joined_channels: &mut HashMap<String, (Arc<dyn Channel>, ChannelSocket)>,
+) {
+    let mut socket = ChannelSocket::new(phoenix_msg.topic.clone(), tx.clone(), pubsub.clone());
+    match channel
+        .join(&phoenix_msg.topic, &phoenix_msg.payload, &mut socket)
+        .await
+    {
+        Ok(resp) => {
+            let reply = Reply::ok(resp);
+            if let Some(ref r) = phoenix_msg.msg_ref {
+                socket.reply(r, &reply).await;
+            }
+
+            // Subscribe to PubSub and spawn forwarder task
+            if let Some(mut pubsub_rx) = pubsub.subscribe(&phoenix_msg.topic).await {
+                let sender_clone = tx.clone();
+                let topic_clone = phoenix_msg.topic.clone();
+                tokio::spawn(async move {
+                    while let Ok(pubsub_msg) = pubsub_rx.recv().await {
+                        let out = PhoenixMessage {
+                            topic: topic_clone.clone(),
+                            event: pubsub_msg.event.clone(),
+                            payload: pubsub_msg.payload.clone(),
+                            msg_ref: None,
+                        };
+                        if let Ok(json) = serde_json::to_string(&out) {
+                            if sender_clone.send(WsMessage::Text(json.into())).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+            } else {
+                tracing::warn!(
+                    topic = %phoenix_msg.topic,
+                    "PubSub subscribe failed, channel will not receive broadcasts"
+                );
+            }
+
+            joined_channels.insert(phoenix_msg.topic.clone(), (Arc::clone(channel), socket));
+        }
+        Err(_) => {
+            let reply = Reply::error(serde_json::json!({"reason": "join failed"}));
+            if let Some(ref r) = phoenix_msg.msg_ref {
+                socket.reply(r, &reply).await;
+            }
+        }
+    }
+}
+
+/// Handle a `phx_leave` event: terminate the channel and send a reply.
+async fn handle_leave(
+    phoenix_msg: &PhoenixMessage,
+    joined_channels: &mut HashMap<String, (Arc<dyn Channel>, ChannelSocket)>,
+) {
+    if let Some((channel, mut socket)) = joined_channels.remove(&phoenix_msg.topic) {
+        channel.terminate("leave", &mut socket).await;
+        if let Some(ref r) = phoenix_msg.msg_ref {
+            let reply = Reply::ok(serde_json::json!({}));
+            socket.reply(r, &reply).await;
+        }
+    }
+}
+
+/// Handle a heartbeat event: reply with an ok status.
+fn handle_heartbeat(phoenix_msg: &PhoenixMessage, tx: &mpsc::UnboundedSender<WsMessage>) {
+    let reply_msg = PhoenixMessage {
+        topic: "phoenix".to_string(),
+        event: "phx_reply".to_string(),
+        payload: serde_json::json!({"status": "ok", "response": {}}),
+        msg_ref: phoenix_msg.msg_ref.clone(),
+    };
+    if let Ok(json) = serde_json::to_string(&reply_msg) {
+        if tx.send(WsMessage::Text(json.into())).is_err() {
+            tracing::warn!("failed to send heartbeat reply, client disconnected");
+        }
+    }
+}
+
+/// Dispatch a regular event to the appropriate joined channel.
+async fn dispatch_event(
+    phoenix_msg: &PhoenixMessage,
+    joined_channels: &mut HashMap<String, (Arc<dyn Channel>, ChannelSocket)>,
+) {
+    if let Some((channel, socket)) = joined_channels.get_mut(&phoenix_msg.topic) {
+        match channel
+            .handle_in(&phoenix_msg.event, &phoenix_msg.payload, socket)
+            .await
+        {
+            Ok(Some(reply)) => {
+                if let Some(ref r) = phoenix_msg.msg_ref {
+                    socket.reply(r, &reply).await;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                let reply = Reply::error(serde_json::json!({"reason": "error"}));
+                if let Some(ref r) = phoenix_msg.msg_ref {
+                    socket.reply(r, &reply).await;
+                }
+            }
+        }
+    }
+}
+
 /// Handle a WebSocket connection. This should be called from an Axum handler.
 /// Each connection becomes its own async task (would be a rebar process in full integration).
 pub async fn handle_websocket(
@@ -162,109 +278,24 @@ pub async fn handle_websocket(
                 match phoenix_msg.event.as_str() {
                     "phx_join" => {
                         if let Some(channel) = channel_router.find(&phoenix_msg.topic) {
-                            let mut socket = ChannelSocket::new(
-                                phoenix_msg.topic.clone(),
-                                tx.clone(),
-                                pubsub.clone(),
-                            );
-                            match channel
-                                .join(&phoenix_msg.topic, &phoenix_msg.payload, &mut socket)
-                                .await
-                            {
-                                Ok(resp) => {
-                                    let reply = Reply::ok(resp);
-                                    if let Some(ref r) = phoenix_msg.msg_ref {
-                                        socket.reply(r, &reply).await;
-                                    }
-                                    // Subscribe to PubSub for this topic
-                                    let mut pubsub_rx =
-                                        pubsub.subscribe(&phoenix_msg.topic).await;
-                                    let sender_clone = tx.clone();
-                                    let topic_clone = phoenix_msg.topic.clone();
-
-                                    // Spawn task to forward PubSub messages
-                                    tokio::spawn(async move {
-                                        while let Ok(pubsub_msg) = pubsub_rx.recv().await {
-                                            let out = PhoenixMessage {
-                                                topic: topic_clone.clone(),
-                                                event: pubsub_msg.event.clone(),
-                                                payload: pubsub_msg.payload.clone(),
-                                                msg_ref: None,
-                                            };
-                                            if let Ok(json) = serde_json::to_string(&out) {
-                                                if sender_clone
-                                                    .send(WsMessage::Text(json.into()))
-                                                    .is_err()
-                                                {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    });
-
-                                    joined_channels.insert(
-                                        phoenix_msg.topic.clone(),
-                                        (Arc::clone(channel), socket),
-                                    );
-                                }
-                                Err(_) => {
-                                    let reply = Reply::error(
-                                        serde_json::json!({"reason": "join failed"}),
-                                    );
-                                    if let Some(ref r) = phoenix_msg.msg_ref {
-                                        socket.reply(r, &reply).await;
-                                    }
-                                }
-                            }
+                            handle_join(
+                                &phoenix_msg,
+                                channel,
+                                &tx,
+                                &pubsub,
+                                &mut joined_channels,
+                            )
+                            .await;
                         }
                     }
                     "phx_leave" => {
-                        if let Some((channel, mut socket)) =
-                            joined_channels.remove(&phoenix_msg.topic)
-                        {
-                            channel.terminate("leave", &mut socket).await;
-                            if let Some(ref r) = phoenix_msg.msg_ref {
-                                let reply = Reply::ok(serde_json::json!({}));
-                                socket.reply(r, &reply).await;
-                            }
-                        }
+                        handle_leave(&phoenix_msg, &mut joined_channels).await;
                     }
                     "heartbeat" => {
-                        let reply_msg = PhoenixMessage {
-                            topic: "phoenix".to_string(),
-                            event: "phx_reply".to_string(),
-                            payload: serde_json::json!({"status": "ok", "response": {}}),
-                            msg_ref: phoenix_msg.msg_ref,
-                        };
-                        if let Ok(json) = serde_json::to_string(&reply_msg) {
-                            let _ = tx.send(WsMessage::Text(json.into()));
-                        }
+                        handle_heartbeat(&phoenix_msg, &tx);
                     }
                     _ => {
-                        // Regular event - dispatch to joined channel
-                        if let Some((channel, socket)) =
-                            joined_channels.get_mut(&phoenix_msg.topic)
-                        {
-                            match channel
-                                .handle_in(&phoenix_msg.event, &phoenix_msg.payload, socket)
-                                .await
-                            {
-                                Ok(Some(reply)) => {
-                                    if let Some(ref r) = phoenix_msg.msg_ref {
-                                        socket.reply(r, &reply).await;
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(_) => {
-                                    let reply = Reply::error(
-                                        serde_json::json!({"reason": "error"}),
-                                    );
-                                    if let Some(ref r) = phoenix_msg.msg_ref {
-                                        socket.reply(r, &reply).await;
-                                    }
-                                }
-                            }
-                        }
+                        dispatch_event(&phoenix_msg, &mut joined_channels).await;
                     }
                 }
             }
@@ -279,4 +310,163 @@ pub async fn handle_websocket(
     }
 
     send_task.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    // -- topic_matches ---------------------------------------------------------
+
+    #[test]
+    fn topic_matches_exact() {
+        assert!(topic_matches("room:lobby", "room:lobby"));
+    }
+
+    #[test]
+    fn topic_matches_wildcard() {
+        assert!(topic_matches("room:*", "room:lobby"));
+        assert!(topic_matches("room:*", "room:123"));
+    }
+
+    #[test]
+    fn topic_matches_wildcard_no_match() {
+        assert!(!topic_matches("room:*", "chat:lobby"));
+    }
+
+    #[test]
+    fn topic_matches_exact_no_match() {
+        assert!(!topic_matches("room:lobby", "room:other"));
+    }
+
+    // -- ChannelRouter ---------------------------------------------------------
+
+    struct DummyChannel;
+
+    #[async_trait]
+    impl Channel for DummyChannel {
+        async fn join(
+            &self,
+            _topic: &str,
+            _payload: &Value,
+            _socket: &mut ChannelSocket,
+        ) -> Result<Value, crate::channel::ChannelError> {
+            Ok(serde_json::json!({}))
+        }
+
+        async fn handle_in(
+            &self,
+            _event: &str,
+            _payload: &Value,
+            _socket: &mut ChannelSocket,
+        ) -> Result<Option<Reply>, crate::channel::ChannelError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn channel_router_find_exact() {
+        let router = ChannelRouter::new()
+            .channel("room:lobby", Arc::new(DummyChannel));
+        assert!(router.find("room:lobby").is_some());
+        assert!(router.find("room:other").is_none());
+    }
+
+    #[test]
+    fn channel_router_find_wildcard() {
+        let router = ChannelRouter::new()
+            .channel("room:*", Arc::new(DummyChannel));
+        assert!(router.find("room:lobby").is_some());
+        assert!(router.find("room:123").is_some());
+        assert!(router.find("chat:lobby").is_none());
+    }
+
+    #[test]
+    fn channel_router_empty_returns_none() {
+        let router = ChannelRouter::new();
+        assert!(router.find("anything").is_none());
+    }
+
+    // -- ChannelSocket assigns -------------------------------------------------
+
+    struct UserId;
+    impl AssignKey for UserId {
+        type Value = u64;
+    }
+
+    struct UserName;
+    impl AssignKey for UserName {
+        type Value = String;
+    }
+
+    struct IsAdmin;
+    impl AssignKey for IsAdmin {
+        type Value = bool;
+    }
+
+    #[tokio::test]
+    async fn channel_socket_assigns() {
+        let pubsub = PubSub::start();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
+
+        socket.assign::<UserId>(42);
+        socket.assign::<UserName>("hello".to_string());
+
+        assert_eq!(socket.get_assign::<UserId>(), Some(&42));
+        assert_eq!(socket.get_assign::<UserName>(), Some(&"hello".to_string()));
+        assert_eq!(socket.get_assign::<IsAdmin>(), None);
+
+        pubsub.shutdown();
+    }
+
+    // -- PhoenixMessage serde --------------------------------------------------
+
+    #[test]
+    fn phoenix_message_serialize() {
+        let msg = PhoenixMessage {
+            topic: "room:lobby".into(),
+            event: "new_msg".into(),
+            payload: serde_json::json!({"text": "hi"}),
+            msg_ref: Some("1".into()),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["topic"], "room:lobby");
+        assert_eq!(json["event"], "new_msg");
+        assert_eq!(json["ref"], "1");
+        assert_eq!(json["payload"]["text"], "hi");
+    }
+
+    #[test]
+    fn phoenix_message_deserialize() {
+        let json = r#"{"topic":"room:lobby","event":"phx_join","payload":{},"ref":"1"}"#;
+        let msg: PhoenixMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.topic, "room:lobby");
+        assert_eq!(msg.event, "phx_join");
+        assert_eq!(msg.msg_ref, Some("1".into()));
+    }
+
+    #[test]
+    fn phoenix_message_deserialize_null_ref() {
+        let json = r#"{"topic":"t","event":"e","payload":null,"ref":null}"#;
+        let msg: PhoenixMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.msg_ref, None);
+    }
+
+    #[test]
+    fn phoenix_message_roundtrip() {
+        let original = PhoenixMessage {
+            topic: "room:1".into(),
+            event: "update".into(),
+            payload: serde_json::json!({"count": 5}),
+            msg_ref: None,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: PhoenixMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.topic, original.topic);
+        assert_eq!(decoded.event, original.event);
+        assert_eq!(decoded.payload, original.payload);
+        assert_eq!(decoded.msg_ref, original.msg_ref);
+    }
 }

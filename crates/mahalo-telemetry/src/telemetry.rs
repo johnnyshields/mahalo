@@ -121,7 +121,7 @@ impl Telemetry {
             }
         }
 
-        // Broadcast to subscribers (ignore if none).
+        // Broadcast to subscribers (no receivers is normal for telemetry).
         let _ = self.tx.send(event);
     }
 
