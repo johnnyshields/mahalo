@@ -8,6 +8,7 @@ members = [
     "crates/mahalo-channel",
     "crates/mahalo-telemetry",
     "crates/mahalo",
+    "crates/cargo-mahalo",
 ]
 
 [workspace.package]
@@ -26,3 +27,4 @@ tracing = "0.1"
 async-trait = "0.1"
 tower-http = { version = "0.6", features = ["cors"] }
 futures = "0.3"
+clap = { version = "4", features = ["derive"] }
