@@ -1,0 +1,19 @@
+[package]
+name = "mahalo-router"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Declarative routing with scoped pipelines for Mahalo"
+
+[dependencies]
+mahalo-core = { path = "../mahalo-core" }
+rebar-core = { workspace = true }
+tokio = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+serde_json = { workspace = true }

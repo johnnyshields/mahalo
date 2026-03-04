@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mahalo-core",
+    "crates/mahalo-router",
+    "crates/mahalo-endpoint",
+    "crates/mahalo-pubsub",
+    "crates/mahalo-channel",
+    "crates/mahalo-telemetry",
+    "crates/mahalo",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+rebar-core = { path = "../rebar/crates/rebar-core" }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+http = "1"
+bytes = "1"
+tracing = "0.1"
+async-trait = "0.1"
+tower-http = { version = "0.6", features = ["cors"] }
+futures = "0.3"

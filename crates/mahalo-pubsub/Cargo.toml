@@ -1,0 +1,16 @@
+[package]
+name = "mahalo-pubsub"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Distributed PubSub backed by rebar processes"
+
+[dependencies]
+rebar-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
