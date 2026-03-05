@@ -282,6 +282,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_to_conn_with_remote_addr() {
+        let runtime = Arc::new(Runtime::new(1));
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .unwrap();
+
+        let conn = request_to_conn(request, Some(addr), &runtime).await;
+
+        assert_eq!(conn.remote_addr, Some(addr));
+    }
+
+    #[tokio::test]
     async fn integration_start_server_and_make_request() {
         use mahalo_core::plug::plug_fn;
 

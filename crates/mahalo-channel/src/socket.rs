@@ -317,6 +317,37 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
 
+    /// Parse a WsMessage as JSON, panicking on non-Text variants.
+    fn parse_ws_json(msg: WsMessage) -> Value {
+        match msg {
+            WsMessage::Text(text) => serde_json::from_str(&text).unwrap(),
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    /// Create a ChannelSocket with a fresh PubSub and unbounded channel.
+    fn test_socket(topic: &str) -> (ChannelSocket, mpsc::UnboundedReceiver<WsMessage>, PubSub) {
+        let pubsub = PubSub::start();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let socket = ChannelSocket::new(topic.into(), tx, pubsub.clone());
+        (socket, rx, pubsub)
+    }
+
+    /// Like `test_socket` but also returns the sender for tests that need it.
+    fn test_socket_with_tx(
+        topic: &str,
+    ) -> (
+        ChannelSocket,
+        mpsc::UnboundedSender<WsMessage>,
+        mpsc::UnboundedReceiver<WsMessage>,
+        PubSub,
+    ) {
+        let pubsub = PubSub::start();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let socket = ChannelSocket::new(topic.into(), tx.clone(), pubsub.clone());
+        (socket, tx, rx, pubsub)
+    }
+
     // -- topic_matches ---------------------------------------------------------
 
     #[test]
@@ -407,9 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_socket_assigns() {
-        let pubsub = PubSub::start();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let mut socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
+        let (mut socket, _rx, pubsub) = test_socket("test:topic");
 
         socket.assign::<UserId>(42);
         socket.assign::<UserName>("hello".to_string());
@@ -468,5 +497,515 @@ mod tests {
         assert_eq!(decoded.event, original.event);
         assert_eq!(decoded.payload, original.payload);
         assert_eq!(decoded.msg_ref, original.msg_ref);
+    }
+
+    // -- ChannelSocket push/reply/broadcast ------------------------------------
+
+    #[tokio::test]
+    async fn channel_socket_push() {
+        let (socket, mut rx, pubsub) = test_socket("test:topic");
+
+        socket.push("event", &serde_json::json!({"a": 1})).await;
+
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive a message"));
+        assert_eq!(parsed["event"], "event");
+        assert_eq!(parsed["payload"]["a"], 1);
+        assert_eq!(parsed["topic"], "test:topic");
+
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn channel_socket_push_closed_sender() {
+        let (socket, rx, pubsub) = test_socket("test:topic");
+
+        drop(rx); // close the receiver
+        // should not panic, just logs a warning
+        socket.push("event", &serde_json::json!({})).await;
+
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn channel_socket_broadcast() {
+        let (socket, _rx, pubsub) = test_socket("test:topic");
+
+        // Subscribe before broadcasting
+        let mut sub_rx = pubsub.subscribe("test:topic").await.expect("subscribe should succeed");
+
+        socket.broadcast("evt", serde_json::json!({"key": "val"}));
+
+        let msg = sub_rx.recv().await.expect("should receive broadcast");
+        assert_eq!(msg.event, "evt");
+        assert_eq!(msg.payload, serde_json::json!({"key": "val"}));
+
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn channel_socket_reply() {
+        let (socket, mut rx, pubsub) = test_socket("test:topic");
+
+        let reply = Reply::ok(serde_json::json!({"data": "ok"}));
+        socket.reply("ref1", &reply).await;
+
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive reply"));
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["ref"], "ref1");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["payload"]["response"]["data"], "ok");
+
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn channel_socket_reply_closed() {
+        let (socket, rx, pubsub) = test_socket("test:topic");
+
+        drop(rx);
+        // should not panic
+        socket.reply("ref1", &Reply::ok(serde_json::json!({}))).await;
+
+        pubsub.shutdown();
+    }
+
+    // -- ChannelRouter default -------------------------------------------------
+
+    #[test]
+    fn channel_router_default() {
+        let router = ChannelRouter::default();
+        assert!(router.find("anything").is_none());
+    }
+
+    // -- handle_heartbeat ------------------------------------------------------
+
+    #[test]
+    fn handle_heartbeat_sends_reply() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let msg = PhoenixMessage {
+            topic: "phoenix".into(),
+            event: "heartbeat".into(),
+            payload: serde_json::json!({}),
+            msg_ref: Some("hb-1".into()),
+        };
+
+        handle_heartbeat(&msg, &tx);
+
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive heartbeat reply"));
+        assert_eq!(parsed["topic"], "phoenix");
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["ref"], "hb-1");
+    }
+
+    // -- handle_join -----------------------------------------------------------
+
+    struct FailChannel;
+
+    #[async_trait]
+    impl Channel for FailChannel {
+        async fn join(
+            &self,
+            _topic: &str,
+            _payload: &Value,
+            _socket: &mut ChannelSocket,
+        ) -> Result<Value, crate::channel::ChannelError> {
+            Err(crate::channel::ChannelError::NotAuthorized)
+        }
+
+        async fn handle_in(
+            &self,
+            _event: &str,
+            _payload: &Value,
+            _socket: &mut ChannelSocket,
+        ) -> Result<Option<Reply>, crate::channel::ChannelError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_join_success() {
+        let pubsub = PubSub::start();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let channel: Arc<dyn Channel> = Arc::new(DummyChannel);
+        let mut joined_channels = HashMap::new();
+
+        let msg = PhoenixMessage {
+            topic: "room:lobby".into(),
+            event: "phx_join".into(),
+            payload: serde_json::json!({}),
+            msg_ref: Some("join-1".into()),
+        };
+
+        handle_join(&msg, &channel, &tx, &pubsub, &mut joined_channels).await;
+
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive join reply"));
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["ref"], "join-1");
+
+        assert!(joined_channels.contains_key("room:lobby"));
+
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn handle_join_failure() {
+        let pubsub = PubSub::start();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let channel: Arc<dyn Channel> = Arc::new(FailChannel);
+        let mut joined_channels = HashMap::new();
+
+        let msg = PhoenixMessage {
+            topic: "room:lobby".into(),
+            event: "phx_join".into(),
+            payload: serde_json::json!({}),
+            msg_ref: Some("join-2".into()),
+        };
+
+        handle_join(&msg, &channel, &tx, &pubsub, &mut joined_channels).await;
+
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive error reply"));
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "error");
+        assert_eq!(parsed["ref"], "join-2");
+
+        assert!(!joined_channels.contains_key("room:lobby"));
+
+        pubsub.shutdown();
+    }
+
+    // -- handle_leave ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_leave_known_topic() {
+        let (socket, tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
+        let channel: Arc<dyn Channel> = Arc::new(DummyChannel);
+
+        let mut joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)> = HashMap::new();
+        joined_channels.insert("room:lobby".into(), (channel, socket));
+
+        let msg = PhoenixMessage {
+            topic: "room:lobby".into(),
+            event: "phx_leave".into(),
+            payload: serde_json::json!({}),
+            msg_ref: Some("leave-1".into()),
+        };
+
+        handle_leave(&msg, &mut joined_channels).await;
+
+        assert!(!joined_channels.contains_key("room:lobby"));
+
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive leave reply"));
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+
+        drop(tx);
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn handle_leave_unknown_topic() {
+        let mut joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)> = HashMap::new();
+
+        let msg = PhoenixMessage {
+            topic: "room:unknown".into(),
+            event: "phx_leave".into(),
+            payload: serde_json::json!({}),
+            msg_ref: Some("leave-2".into()),
+        };
+
+        handle_leave(&msg, &mut joined_channels).await;
+        // no panic = success
+    }
+
+    // -- dispatch_event --------------------------------------------------------
+
+    struct ReplyChannel;
+
+    #[async_trait]
+    impl Channel for ReplyChannel {
+        async fn join(
+            &self,
+            _topic: &str,
+            _payload: &Value,
+            _socket: &mut ChannelSocket,
+        ) -> Result<Value, crate::channel::ChannelError> {
+            Ok(serde_json::json!({}))
+        }
+
+        async fn handle_in(
+            &self,
+            _event: &str,
+            _payload: &Value,
+            _socket: &mut ChannelSocket,
+        ) -> Result<Option<Reply>, crate::channel::ChannelError> {
+            Ok(Some(Reply::ok(serde_json::json!({"echo": true}))))
+        }
+    }
+
+    struct ErrorChannel;
+
+    #[async_trait]
+    impl Channel for ErrorChannel {
+        async fn join(
+            &self,
+            _topic: &str,
+            _payload: &Value,
+            _socket: &mut ChannelSocket,
+        ) -> Result<Value, crate::channel::ChannelError> {
+            Ok(serde_json::json!({}))
+        }
+
+        async fn handle_in(
+            &self,
+            _event: &str,
+            _payload: &Value,
+            _socket: &mut ChannelSocket,
+        ) -> Result<Option<Reply>, crate::channel::ChannelError> {
+            Err(crate::channel::ChannelError::Internal("test error".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_with_reply() {
+        let (socket, _tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
+        let channel: Arc<dyn Channel> = Arc::new(ReplyChannel);
+
+        let mut joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)> = HashMap::new();
+        joined_channels.insert("room:lobby".into(), (channel, socket));
+
+        let msg = PhoenixMessage {
+            topic: "room:lobby".into(),
+            event: "custom_event".into(),
+            payload: serde_json::json!({}),
+            msg_ref: Some("ev-1".into()),
+        };
+
+        dispatch_event(&msg, &mut joined_channels).await;
+
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive reply"));
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["payload"]["response"]["echo"], true);
+        assert_eq!(parsed["ref"], "ev-1");
+
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_no_reply() {
+        let (socket, _tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
+        let channel: Arc<dyn Channel> = Arc::new(DummyChannel); // returns Ok(None)
+
+        let mut joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)> = HashMap::new();
+        joined_channels.insert("room:lobby".into(), (channel, socket));
+
+        let msg = PhoenixMessage {
+            topic: "room:lobby".into(),
+            event: "silent_event".into(),
+            payload: serde_json::json!({}),
+            msg_ref: Some("ev-2".into()),
+        };
+
+        dispatch_event(&msg, &mut joined_channels).await;
+
+        // No message should be sent
+        assert!(rx.try_recv().is_err());
+
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_error() {
+        let (socket, _tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
+        let channel: Arc<dyn Channel> = Arc::new(ErrorChannel);
+
+        let mut joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)> = HashMap::new();
+        joined_channels.insert("room:lobby".into(), (channel, socket));
+
+        let msg = PhoenixMessage {
+            topic: "room:lobby".into(),
+            event: "bad_event".into(),
+            payload: serde_json::json!({}),
+            msg_ref: Some("ev-3".into()),
+        };
+
+        dispatch_event(&msg, &mut joined_channels).await;
+
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive error reply"));
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "error");
+        assert_eq!(parsed["ref"], "ev-3");
+
+        pubsub.shutdown();
+    }
+
+    // -- handle_websocket integration test ------------------------------------
+
+    /// A channel that echoes back events for testing handle_websocket end-to-end.
+    struct EchoChannel;
+
+    #[async_trait]
+    impl Channel for EchoChannel {
+        async fn join(
+            &self,
+            _topic: &str,
+            _payload: &Value,
+            _socket: &mut ChannelSocket,
+        ) -> Result<Value, crate::channel::ChannelError> {
+            Ok(serde_json::json!({"status": "connected"}))
+        }
+
+        async fn handle_in(
+            &self,
+            event: &str,
+            payload: &Value,
+            _socket: &mut ChannelSocket,
+        ) -> Result<Option<Reply>, crate::channel::ChannelError> {
+            Ok(Some(Reply::ok(serde_json::json!({
+                "echo_event": event,
+                "echo_payload": payload,
+            }))))
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_websocket_full_lifecycle() {
+        use axum::extract::ws::WebSocketUpgrade;
+        use axum::routing::get;
+        use axum::Router;
+        use tokio_tungstenite::tungstenite::Message as TungsteniteMsg;
+
+        let pubsub = PubSub::start();
+        let channel_router = Arc::new(
+            ChannelRouter::new().channel("room:*", Arc::new(EchoChannel)),
+        );
+
+        let pubsub_clone = pubsub.clone();
+        let router_clone = channel_router.clone();
+
+        let app = Router::new().route(
+            "/ws",
+            get(move |ws: WebSocketUpgrade| {
+                let cr = router_clone.clone();
+                let ps = pubsub_clone.clone();
+                async move { ws.on_upgrade(move |socket| handle_websocket(socket, cr, ps)) }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Connect via tokio-tungstenite
+        let (mut ws_stream, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+                .await
+                .expect("WebSocket connect failed");
+
+        use futures::{SinkExt, StreamExt};
+
+        // 1. Send heartbeat
+        let heartbeat = serde_json::json!({
+            "topic": "phoenix",
+            "event": "heartbeat",
+            "payload": {},
+            "ref": "hb-1"
+        });
+        ws_stream
+            .send(TungsteniteMsg::Text(heartbeat.to_string().into()))
+            .await
+            .unwrap();
+
+        let reply = ws_stream.next().await.unwrap().unwrap();
+        let parsed: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["ref"], "hb-1");
+
+        // 2. Join a channel
+        let join_msg = serde_json::json!({
+            "topic": "room:lobby",
+            "event": "phx_join",
+            "payload": {},
+            "ref": "join-1"
+        });
+        ws_stream
+            .send(TungsteniteMsg::Text(join_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        let reply = ws_stream.next().await.unwrap().unwrap();
+        let parsed: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["payload"]["response"]["status"], "connected");
+        assert_eq!(parsed["ref"], "join-1");
+
+        // 3. Send a custom event
+        let custom_msg = serde_json::json!({
+            "topic": "room:lobby",
+            "event": "new_msg",
+            "payload": {"text": "hello"},
+            "ref": "msg-1"
+        });
+        ws_stream
+            .send(TungsteniteMsg::Text(custom_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        let reply = ws_stream.next().await.unwrap().unwrap();
+        let parsed: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["payload"]["response"]["echo_event"], "new_msg");
+        assert_eq!(parsed["payload"]["response"]["echo_payload"]["text"], "hello");
+        assert_eq!(parsed["ref"], "msg-1");
+
+        // 4. Send invalid JSON (should be ignored, no crash)
+        ws_stream
+            .send(TungsteniteMsg::Text("not json".to_string().into()))
+            .await
+            .unwrap();
+
+        // 5. Leave the channel
+        let leave_msg = serde_json::json!({
+            "topic": "room:lobby",
+            "event": "phx_leave",
+            "payload": {},
+            "ref": "leave-1"
+        });
+        ws_stream
+            .send(TungsteniteMsg::Text(leave_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        let reply = ws_stream.next().await.unwrap().unwrap();
+        let parsed: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["ref"], "leave-1");
+
+        // 6. Send event to unmatched topic (no crash)
+        let unmatched = serde_json::json!({
+            "topic": "nonexistent:topic",
+            "event": "phx_join",
+            "payload": {},
+            "ref": "x"
+        });
+        ws_stream
+            .send(TungsteniteMsg::Text(unmatched.to_string().into()))
+            .await
+            .unwrap();
+
+        // 7. Close
+        ws_stream.close(None).await.unwrap();
+
+        server.abort();
+        pubsub.shutdown();
     }
 }

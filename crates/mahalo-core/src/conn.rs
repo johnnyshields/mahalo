@@ -219,4 +219,19 @@ mod tests {
         // percent-encoding does not decode '+' as space (that's form-urlencoded)
         assert_eq!(conn.query_params.get("q").unwrap(), "a+b");
     }
+
+    #[test]
+    fn with_runtime() {
+        let runtime = Arc::new(Runtime::new(1));
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .with_runtime(runtime);
+        assert!(conn.runtime.is_some());
+    }
+
+    #[test]
+    fn put_resp_header_invalid() {
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .put_resp_header("", "value");
+        assert!(conn.resp_headers.is_empty());
+    }
 }

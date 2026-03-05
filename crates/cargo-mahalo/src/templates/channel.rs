@@ -43,3 +43,15 @@ impl Channel for {pascal}Channel {{
 "#
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_channel_file() {
+        let output = channel_file("Chat", "chat");
+        assert!(output.contains("ChatChannel"));
+        assert!(output.contains("impl Channel"));
+    }
+}

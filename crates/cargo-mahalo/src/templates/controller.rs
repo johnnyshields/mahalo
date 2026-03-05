@@ -30,3 +30,15 @@ impl Controller for {pascal}Controller {{
 "#
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_controller_file() {
+        let output = controller_file("Room");
+        assert!(output.contains("RoomController"));
+        assert!(output.contains("impl Controller"));
+    }
+}

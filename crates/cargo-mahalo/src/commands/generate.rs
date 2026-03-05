@@ -229,6 +229,7 @@ fn pluralize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::make_test_dir;
 
     #[test]
     fn test_normalize_pascal() {
@@ -252,5 +253,143 @@ mod tests {
     fn test_pluralize() {
         assert_eq!(pluralize("room"), "rooms");
         assert_eq!(pluralize("post"), "posts");
+    }
+
+    #[test]
+    fn test_inject_module_with_marker() {
+        let dir = make_test_dir("inject_marker");
+        let file = dir.join("mod.rs");
+        fs::write(&file, "// mahalo:modules\n").unwrap();
+
+        inject_module(&file, "foo").unwrap();
+
+        let content = fs::read_to_string(&file).unwrap();
+        assert!(content.contains("pub mod foo;"));
+
+    }
+
+    #[test]
+    fn test_inject_module_without_marker() {
+        let dir = make_test_dir("inject_no_marker");
+        let file = dir.join("mod.rs");
+        fs::write(&file, "// other\n").unwrap();
+
+        inject_module(&file, "foo").unwrap();
+
+        let content = fs::read_to_string(&file).unwrap();
+        assert!(content.contains("pub mod foo;"));
+
+    }
+
+    #[test]
+    fn test_inject_module_already_exists() {
+        let dir = make_test_dir("inject_exists");
+        let file = dir.join("mod.rs");
+        let original = "pub mod foo;\n// mahalo:modules\n";
+        fs::write(&file, original).unwrap();
+
+        inject_module(&file, "foo").unwrap();
+
+        let content = fs::read_to_string(&file).unwrap();
+        assert_eq!(content, original);
+
+    }
+
+    #[test]
+    fn test_inject_router() {
+        let dir = make_test_dir("inject_router");
+        let file = dir.join("router.rs");
+        fs::write(&file, "// mahalo:imports\nstuff\n// mahalo:routes\nmore\n").unwrap();
+
+        inject_router(
+            &file,
+            "use crate::controllers::foo_controller::FooController;",
+            "        .scope(\"/foos\", &[], |s| { s.resources(\"/foos\", std::sync::Arc::new(FooController)); })",
+            "foo",
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(&file).unwrap();
+        assert!(content.contains("use crate::controllers::foo_controller::FooController;"));
+        assert!(content.contains("FooController"));
+
+    }
+
+    #[test]
+    fn test_inject_router_missing_markers() {
+        let dir = make_test_dir("inject_router_no_markers");
+        let file = dir.join("router.rs");
+        let original = "fn build_router() {}\n";
+        fs::write(&file, original).unwrap();
+
+        inject_router(&file, "use foo;", "  .route(\"/foo\")", "foo").unwrap();
+
+        let content = fs::read_to_string(&file).unwrap();
+        // No markers => no modification
+        assert_eq!(content, original);
+
+    }
+
+    #[test]
+    fn test_inject_router_duplicate() {
+        let dir = make_test_dir("inject_router_dup");
+        let file = dir.join("router.rs");
+        let original =
+            "use crate::controllers::foo_controller::FooController;\n// mahalo:imports\n// mahalo:routes\n";
+        fs::write(&file, original).unwrap();
+
+        inject_router(&file, "use foo;", "  .route(\"/foo\")", "foo").unwrap();
+
+        let content = fs::read_to_string(&file).unwrap();
+        assert_eq!(content, original);
+
+    }
+
+    #[test]
+    fn test_controller_generates_file() {
+        let _lock = crate::commands::CWD_LOCK.lock().unwrap();
+        let dir = make_test_dir("gen_ctrl");
+        // Set up project structure: crates/testapp_web/src/controllers/mod.rs
+        let web_dir = dir.join("crates/testapp_web/src/controllers");
+        fs::create_dir_all(&web_dir).unwrap();
+        fs::write(web_dir.join("mod.rs"), "// mahalo:modules\n").unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let result = controller("room");
+
+        std::env::set_current_dir(&prev).unwrap();
+
+        assert!(result.is_ok());
+        let ctrl_file = dir.join("crates/testapp_web/src/controllers/room_controller.rs");
+        assert!(ctrl_file.exists());
+        let content = fs::read_to_string(&ctrl_file).unwrap();
+        assert!(content.contains("RoomController"));
+
+    }
+
+    #[test]
+    fn test_channel_generates_file() {
+        let _lock = crate::commands::CWD_LOCK.lock().unwrap();
+        let dir = make_test_dir("gen_chan");
+        // Set up project structure: crates/testapp_web/src/channels/mod.rs
+        let chan_dir = dir.join("crates/testapp_web/src/channels");
+        fs::create_dir_all(&chan_dir).unwrap();
+        fs::write(chan_dir.join("mod.rs"), "// mahalo:modules\n").unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let result = channel("chat");
+
+        std::env::set_current_dir(&prev).unwrap();
+
+        assert!(result.is_ok());
+        let chan_file = dir.join("crates/testapp_web/src/channels/chat_channel.rs");
+        assert!(chan_file.exists());
+        let content = fs::read_to_string(&chan_file).unwrap();
+        assert!(content.contains("ChatChannel"));
+
     }
 }

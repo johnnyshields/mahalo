@@ -680,6 +680,60 @@ mod tests {
         assert_eq!(conn.get_assign::<AuthApplied>(), Some(&true));
     }
 
+    #[test]
+    fn router_default() {
+        let router = MahaloRouter::default();
+        assert!(router.resolve(&Method::GET, "/anything").is_none());
+    }
+
+    #[test]
+    fn top_level_post() {
+        let router = MahaloRouter::new().post(
+            "/submit",
+            plug_fn(|conn: Conn| async { conn.put_status(StatusCode::OK) }),
+        );
+
+        let resolved = router.resolve(&Method::POST, "/submit");
+        assert!(resolved.is_some());
+        assert!(resolved.unwrap().path_params.is_empty());
+        // GET should not match
+        assert!(router.resolve(&Method::GET, "/submit").is_none());
+    }
+
+    #[test]
+    fn scope_post() {
+        let router = MahaloRouter::new().scope("/api", &[], |s| {
+            s.post("/items", plug_fn(|conn: Conn| async { conn.put_status(StatusCode::OK) }));
+        });
+        assert!(router.resolve(&Method::POST, "/api/items").is_some());
+    }
+
+    #[test]
+    fn scope_put() {
+        let router = MahaloRouter::new().scope("/api", &[], |s| {
+            s.put("/items/:id", plug_fn(|conn: Conn| async { conn.put_status(StatusCode::OK) }));
+        });
+        let resolved = router.resolve(&Method::PUT, "/api/items/5").unwrap();
+        assert_eq!(resolved.path_params.get("id").unwrap(), "5");
+    }
+
+    #[test]
+    fn scope_patch() {
+        let router = MahaloRouter::new().scope("/api", &[], |s| {
+            s.patch("/items/:id", plug_fn(|conn: Conn| async { conn.put_status(StatusCode::OK) }));
+        });
+        let resolved = router.resolve(&Method::PATCH, "/api/items/3").unwrap();
+        assert_eq!(resolved.path_params.get("id").unwrap(), "3");
+    }
+
+    #[test]
+    fn scope_delete() {
+        let router = MahaloRouter::new().scope("/api", &[], |s| {
+            s.delete("/items/:id", plug_fn(|conn: Conn| async { conn.put_status(StatusCode::OK) }));
+        });
+        assert!(router.resolve(&Method::DELETE, "/api/items/1").is_some());
+    }
+
     #[tokio::test]
     async fn pipeline_halt_skips_handler() {
         let auth_pipeline = Pipeline::new("auth").plug(plug_fn(|conn: Conn| async {

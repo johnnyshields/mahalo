@@ -76,4 +76,28 @@ mod tests {
         let conn = ctrl.call_action("nonexistent", conn).await;
         assert_eq!(conn.status, StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn default_create_returns_404() {
+        let ctrl = TestController;
+        let conn = Conn::new(Method::POST, Uri::from_static("/"));
+        let conn = ctrl.call_action("create", conn).await;
+        assert_eq!(conn.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn default_update_returns_404() {
+        let ctrl = TestController;
+        let conn = Conn::new(Method::PUT, Uri::from_static("/"));
+        let conn = ctrl.call_action("update", conn).await;
+        assert_eq!(conn.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn default_delete_returns_404() {
+        let ctrl = TestController;
+        let conn = Conn::new(Method::DELETE, Uri::from_static("/"));
+        let conn = ctrl.call_action("delete", conn).await;
+        assert_eq!(conn.status, StatusCode::NOT_FOUND);
+    }
 }
