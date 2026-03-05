@@ -120,18 +120,7 @@ fn print_tree(dir: &Path, prefix: &str, is_last: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use crate::commands::CWD_LOCK;
-
-    fn make_test_dir(label: &str) -> PathBuf {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mahalo_new_test_{label}_{ts}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::commands::{make_test_dir, CWD_LOCK};
 
     #[test]
     fn test_run_creates_project() {
@@ -152,7 +141,7 @@ mod tests {
         assert!(root.join("crates/testproj_models/src/lib.rs").exists());
         assert!(root.join("crates/testproj_web/src/controllers/mod.rs").exists());
         assert!(root.join("crates/testproj_web/src/channels/mod.rs").exists());
-        fs::remove_dir_all(&dir).ok();
+
     }
 
     #[test]
@@ -170,7 +159,7 @@ mod tests {
         std::env::set_current_dir(&prev).unwrap();
 
         assert!(result.is_err());
-        fs::remove_dir_all(&dir).ok();
+
     }
 
     #[test]
@@ -182,6 +171,6 @@ mod tests {
 
         // Should not panic
         print_tree(&dir, "", true).unwrap();
-        fs::remove_dir_all(&dir).ok();
+
     }
 }

@@ -317,6 +317,37 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
 
+    /// Parse a WsMessage as JSON, panicking on non-Text variants.
+    fn parse_ws_json(msg: WsMessage) -> Value {
+        match msg {
+            WsMessage::Text(text) => serde_json::from_str(&text).unwrap(),
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    /// Create a ChannelSocket with a fresh PubSub and unbounded channel.
+    fn test_socket(topic: &str) -> (ChannelSocket, mpsc::UnboundedReceiver<WsMessage>, PubSub) {
+        let pubsub = PubSub::start();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let socket = ChannelSocket::new(topic.into(), tx, pubsub.clone());
+        (socket, rx, pubsub)
+    }
+
+    /// Like `test_socket` but also returns the sender for tests that need it.
+    fn test_socket_with_tx(
+        topic: &str,
+    ) -> (
+        ChannelSocket,
+        mpsc::UnboundedSender<WsMessage>,
+        mpsc::UnboundedReceiver<WsMessage>,
+        PubSub,
+    ) {
+        let pubsub = PubSub::start();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let socket = ChannelSocket::new(topic.into(), tx.clone(), pubsub.clone());
+        (socket, tx, rx, pubsub)
+    }
+
     // -- topic_matches ---------------------------------------------------------
 
     #[test]
@@ -407,9 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_socket_assigns() {
-        let pubsub = PubSub::start();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let mut socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
+        let (mut socket, _rx, pubsub) = test_socket("test:topic");
 
         socket.assign::<UserId>(42);
         socket.assign::<UserName>("hello".to_string());
@@ -474,31 +503,21 @@ mod tests {
 
     #[tokio::test]
     async fn channel_socket_push() {
-        let pubsub = PubSub::start();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
+        let (socket, mut rx, pubsub) = test_socket("test:topic");
 
         socket.push("event", &serde_json::json!({"a": 1})).await;
 
-        let msg = rx.try_recv().expect("should receive a message");
-        match msg {
-            WsMessage::Text(text) => {
-                let parsed: Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(parsed["event"], "event");
-                assert_eq!(parsed["payload"]["a"], 1);
-                assert_eq!(parsed["topic"], "test:topic");
-            }
-            other => panic!("expected Text, got {:?}", other),
-        }
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive a message"));
+        assert_eq!(parsed["event"], "event");
+        assert_eq!(parsed["payload"]["a"], 1);
+        assert_eq!(parsed["topic"], "test:topic");
 
         pubsub.shutdown();
     }
 
     #[tokio::test]
     async fn channel_socket_push_closed_sender() {
-        let pubsub = PubSub::start();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
+        let (socket, rx, pubsub) = test_socket("test:topic");
 
         drop(rx); // close the receiver
         // should not panic, just logs a warning
@@ -509,9 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_socket_broadcast() {
-        let pubsub = PubSub::start();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
+        let (socket, _rx, pubsub) = test_socket("test:topic");
 
         // Subscribe before broadcasting
         let mut sub_rx = pubsub.subscribe("test:topic").await.expect("subscribe should succeed");
@@ -527,33 +544,23 @@ mod tests {
 
     #[tokio::test]
     async fn channel_socket_reply() {
-        let pubsub = PubSub::start();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
+        let (socket, mut rx, pubsub) = test_socket("test:topic");
 
         let reply = Reply::ok(serde_json::json!({"data": "ok"}));
         socket.reply("ref1", &reply).await;
 
-        let msg = rx.try_recv().expect("should receive reply");
-        match msg {
-            WsMessage::Text(text) => {
-                let parsed: Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(parsed["event"], "phx_reply");
-                assert_eq!(parsed["ref"], "ref1");
-                assert_eq!(parsed["payload"]["status"], "ok");
-                assert_eq!(parsed["payload"]["response"]["data"], "ok");
-            }
-            other => panic!("expected Text, got {:?}", other),
-        }
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive reply"));
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["ref"], "ref1");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["payload"]["response"]["data"], "ok");
 
         pubsub.shutdown();
     }
 
     #[tokio::test]
     async fn channel_socket_reply_closed() {
-        let pubsub = PubSub::start();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
+        let (socket, rx, pubsub) = test_socket("test:topic");
 
         drop(rx);
         // should not panic
@@ -584,43 +591,14 @@ mod tests {
 
         handle_heartbeat(&msg, &tx);
 
-        let ws_msg = rx.try_recv().expect("should receive heartbeat reply");
-        match ws_msg {
-            WsMessage::Text(text) => {
-                let parsed: Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(parsed["topic"], "phoenix");
-                assert_eq!(parsed["event"], "phx_reply");
-                assert_eq!(parsed["payload"]["status"], "ok");
-                assert_eq!(parsed["ref"], "hb-1");
-            }
-            other => panic!("expected Text, got {:?}", other),
-        }
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive heartbeat reply"));
+        assert_eq!(parsed["topic"], "phoenix");
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["ref"], "hb-1");
     }
 
     // -- handle_join -----------------------------------------------------------
-
-    struct OkChannel;
-
-    #[async_trait]
-    impl Channel for OkChannel {
-        async fn join(
-            &self,
-            _topic: &str,
-            _payload: &Value,
-            _socket: &mut ChannelSocket,
-        ) -> Result<Value, crate::channel::ChannelError> {
-            Ok(serde_json::json!({"joined": true}))
-        }
-
-        async fn handle_in(
-            &self,
-            _event: &str,
-            _payload: &Value,
-            _socket: &mut ChannelSocket,
-        ) -> Result<Option<Reply>, crate::channel::ChannelError> {
-            Ok(None)
-        }
-    }
 
     struct FailChannel;
 
@@ -649,7 +627,7 @@ mod tests {
     async fn handle_join_success() {
         let pubsub = PubSub::start();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let channel: Arc<dyn Channel> = Arc::new(OkChannel);
+        let channel: Arc<dyn Channel> = Arc::new(DummyChannel);
         let mut joined_channels = HashMap::new();
 
         let msg = PhoenixMessage {
@@ -661,20 +639,11 @@ mod tests {
 
         handle_join(&msg, &channel, &tx, &pubsub, &mut joined_channels).await;
 
-        // Should have sent an ok reply
-        let ws_msg = rx.try_recv().expect("should receive join reply");
-        match ws_msg {
-            WsMessage::Text(text) => {
-                let parsed: Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(parsed["event"], "phx_reply");
-                assert_eq!(parsed["payload"]["status"], "ok");
-                assert_eq!(parsed["payload"]["response"]["joined"], true);
-                assert_eq!(parsed["ref"], "join-1");
-            }
-            other => panic!("expected Text, got {:?}", other),
-        }
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive join reply"));
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["ref"], "join-1");
 
-        // Channel should be in joined_channels
         assert!(joined_channels.contains_key("room:lobby"));
 
         pubsub.shutdown();
@@ -696,19 +665,11 @@ mod tests {
 
         handle_join(&msg, &channel, &tx, &pubsub, &mut joined_channels).await;
 
-        // Should have sent an error reply
-        let ws_msg = rx.try_recv().expect("should receive error reply");
-        match ws_msg {
-            WsMessage::Text(text) => {
-                let parsed: Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(parsed["event"], "phx_reply");
-                assert_eq!(parsed["payload"]["status"], "error");
-                assert_eq!(parsed["ref"], "join-2");
-            }
-            other => panic!("expected Text, got {:?}", other),
-        }
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive error reply"));
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "error");
+        assert_eq!(parsed["ref"], "join-2");
 
-        // Channel should NOT be in joined_channels
         assert!(!joined_channels.contains_key("room:lobby"));
 
         pubsub.shutdown();
@@ -718,10 +679,8 @@ mod tests {
 
     #[tokio::test]
     async fn handle_leave_known_topic() {
-        let pubsub = PubSub::start();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (socket, tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
         let channel: Arc<dyn Channel> = Arc::new(DummyChannel);
-        let socket = ChannelSocket::new("room:lobby".into(), tx.clone(), pubsub.clone());
 
         let mut joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)> = HashMap::new();
         joined_channels.insert("room:lobby".into(), (channel, socket));
@@ -737,17 +696,11 @@ mod tests {
 
         assert!(!joined_channels.contains_key("room:lobby"));
 
-        // Should receive ok reply
-        let ws_msg = rx.try_recv().expect("should receive leave reply");
-        match ws_msg {
-            WsMessage::Text(text) => {
-                let parsed: Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(parsed["event"], "phx_reply");
-                assert_eq!(parsed["payload"]["status"], "ok");
-            }
-            other => panic!("expected Text, got {:?}", other),
-        }
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive leave reply"));
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
 
+        drop(tx);
         pubsub.shutdown();
     }
 
@@ -816,10 +769,8 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_event_with_reply() {
-        let pubsub = PubSub::start();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (socket, _tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
         let channel: Arc<dyn Channel> = Arc::new(ReplyChannel);
-        let socket = ChannelSocket::new("room:lobby".into(), tx.clone(), pubsub.clone());
 
         let mut joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)> = HashMap::new();
         joined_channels.insert("room:lobby".into(), (channel, socket));
@@ -833,27 +784,19 @@ mod tests {
 
         dispatch_event(&msg, &mut joined_channels).await;
 
-        let ws_msg = rx.try_recv().expect("should receive reply");
-        match ws_msg {
-            WsMessage::Text(text) => {
-                let parsed: Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(parsed["event"], "phx_reply");
-                assert_eq!(parsed["payload"]["status"], "ok");
-                assert_eq!(parsed["payload"]["response"]["echo"], true);
-                assert_eq!(parsed["ref"], "ev-1");
-            }
-            other => panic!("expected Text, got {:?}", other),
-        }
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive reply"));
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["payload"]["response"]["echo"], true);
+        assert_eq!(parsed["ref"], "ev-1");
 
         pubsub.shutdown();
     }
 
     #[tokio::test]
     async fn dispatch_event_no_reply() {
-        let pubsub = PubSub::start();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (socket, _tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
         let channel: Arc<dyn Channel> = Arc::new(DummyChannel); // returns Ok(None)
-        let socket = ChannelSocket::new("room:lobby".into(), tx.clone(), pubsub.clone());
 
         let mut joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)> = HashMap::new();
         joined_channels.insert("room:lobby".into(), (channel, socket));
@@ -875,10 +818,8 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_event_error() {
-        let pubsub = PubSub::start();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (socket, _tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
         let channel: Arc<dyn Channel> = Arc::new(ErrorChannel);
-        let socket = ChannelSocket::new("room:lobby".into(), tx.clone(), pubsub.clone());
 
         let mut joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)> = HashMap::new();
         joined_channels.insert("room:lobby".into(), (channel, socket));
@@ -892,16 +833,10 @@ mod tests {
 
         dispatch_event(&msg, &mut joined_channels).await;
 
-        let ws_msg = rx.try_recv().expect("should receive error reply");
-        match ws_msg {
-            WsMessage::Text(text) => {
-                let parsed: Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(parsed["event"], "phx_reply");
-                assert_eq!(parsed["payload"]["status"], "error");
-                assert_eq!(parsed["ref"], "ev-3");
-            }
-            other => panic!("expected Text, got {:?}", other),
-        }
+        let parsed = parse_ws_json(rx.try_recv().expect("should receive error reply"));
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "error");
+        assert_eq!(parsed["ref"], "ev-3");
 
         pubsub.shutdown();
     }

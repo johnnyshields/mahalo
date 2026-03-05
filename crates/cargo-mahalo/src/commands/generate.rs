@@ -229,6 +229,7 @@ fn pluralize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::make_test_dir;
 
     #[test]
     fn test_normalize_pascal() {
@@ -254,17 +255,6 @@ mod tests {
         assert_eq!(pluralize("post"), "posts");
     }
 
-    /// Helper to create a unique temp directory for test isolation.
-    fn make_test_dir(label: &str) -> PathBuf {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mahalo_test_{label}_{ts}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn test_inject_module_with_marker() {
         let dir = make_test_dir("inject_marker");
@@ -275,7 +265,7 @@ mod tests {
 
         let content = fs::read_to_string(&file).unwrap();
         assert!(content.contains("pub mod foo;"));
-        fs::remove_dir_all(&dir).ok();
+
     }
 
     #[test]
@@ -288,7 +278,7 @@ mod tests {
 
         let content = fs::read_to_string(&file).unwrap();
         assert!(content.contains("pub mod foo;"));
-        fs::remove_dir_all(&dir).ok();
+
     }
 
     #[test]
@@ -302,7 +292,7 @@ mod tests {
 
         let content = fs::read_to_string(&file).unwrap();
         assert_eq!(content, original);
-        fs::remove_dir_all(&dir).ok();
+
     }
 
     #[test]
@@ -322,7 +312,7 @@ mod tests {
         let content = fs::read_to_string(&file).unwrap();
         assert!(content.contains("use crate::controllers::foo_controller::FooController;"));
         assert!(content.contains("FooController"));
-        fs::remove_dir_all(&dir).ok();
+
     }
 
     #[test]
@@ -337,7 +327,7 @@ mod tests {
         let content = fs::read_to_string(&file).unwrap();
         // No markers => no modification
         assert_eq!(content, original);
-        fs::remove_dir_all(&dir).ok();
+
     }
 
     #[test]
@@ -352,7 +342,7 @@ mod tests {
 
         let content = fs::read_to_string(&file).unwrap();
         assert_eq!(content, original);
-        fs::remove_dir_all(&dir).ok();
+
     }
 
     #[test]
@@ -376,7 +366,7 @@ mod tests {
         assert!(ctrl_file.exists());
         let content = fs::read_to_string(&ctrl_file).unwrap();
         assert!(content.contains("RoomController"));
-        fs::remove_dir_all(&dir).ok();
+
     }
 
     #[test]
@@ -400,6 +390,6 @@ mod tests {
         assert!(chan_file.exists());
         let content = fs::read_to_string(&chan_file).unwrap();
         assert!(content.contains("ChatChannel"));
-        fs::remove_dir_all(&dir).ok();
+
     }
 }
