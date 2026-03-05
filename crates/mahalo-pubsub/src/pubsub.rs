@@ -256,6 +256,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pubsub_message_serde() {
+        let msg = PubSubMessage {
+            topic: "room:lobby".to_string(),
+            event: "new_msg".to_string(),
+            payload: serde_json::json!({"text": "hello"}),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: PubSubMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.topic, "room:lobby");
+        assert_eq!(deserialized.event, "new_msg");
+        assert_eq!(deserialized.payload, serde_json::json!({"text": "hello"}));
+    }
+
+    #[tokio::test]
+    async fn child_entry_creates_entry() {
+        let pubsub = PubSub::start();
+        let pubsub_arc = Arc::new(pubsub.clone());
+        let entry = PubSub::child_entry(pubsub_arc);
+        assert_eq!(entry.spec.id, "mahalo_pubsub");
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn subscribe_returns_none_after_shutdown() {
+        let pubsub = PubSub::start();
+        pubsub.shutdown();
+        // Allow server loop to process shutdown
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // After shutdown, subscribe may return None since the server has stopped
+        let result = pubsub.subscribe("test").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
     async fn pubsub_handle_is_clone_send_sync() {
         fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
         assert_clone_send_sync::<PubSub>();

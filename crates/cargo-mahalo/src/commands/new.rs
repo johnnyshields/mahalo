@@ -116,3 +116,72 @@ fn print_tree(dir: &Path, prefix: &str, is_last: bool) -> io::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use crate::commands::CWD_LOCK;
+
+    fn make_test_dir(label: &str) -> PathBuf {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mahalo_new_test_{label}_{ts}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_run_creates_project() {
+        let _lock = CWD_LOCK.lock().unwrap();
+        let dir = make_test_dir("creates");
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let result = run("testproj");
+
+        std::env::set_current_dir(&prev).unwrap();
+
+        assert!(result.is_ok());
+        let root = dir.join("testproj");
+        assert!(root.join("Cargo.toml").exists());
+        assert!(root.join("crates/testproj/src/main.rs").exists());
+        assert!(root.join("crates/testproj_web/src/lib.rs").exists());
+        assert!(root.join("crates/testproj_models/src/lib.rs").exists());
+        assert!(root.join("crates/testproj_web/src/controllers/mod.rs").exists());
+        assert!(root.join("crates/testproj_web/src/channels/mod.rs").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_run_existing_dir_errors() {
+        let _lock = CWD_LOCK.lock().unwrap();
+        let dir = make_test_dir("existing");
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        // First run creates the project
+        let _ = run("existproj2");
+        // Second run with same name should fail
+        let result = run("existproj2");
+
+        std::env::set_current_dir(&prev).unwrap();
+
+        assert!(result.is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_print_tree_no_panic() {
+        let dir = make_test_dir("tree");
+        let sub = dir.join("child");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("file.txt"), "hello").unwrap();
+
+        // Should not panic
+        print_tree(&dir, "", true).unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+}
