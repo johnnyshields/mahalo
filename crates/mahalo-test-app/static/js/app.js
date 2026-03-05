@@ -102,13 +102,13 @@ document.addEventListener('DOMContentLoaded', function() {
                     wsStatusEl.textContent = '\u2705 Connected to live updates';
                     wsStatusEl.className = 'ws-connected';
                 }
-                var joinMsg = [String(msgRef), String(msgRef), 'order:' + orderId, 'phx_join', { customer_name: 'Web User' }];
+                var joinMsg = {topic: 'order:' + orderId, event: 'phx_join', payload: { customer_name: 'Web User' }, ref: String(msgRef)};
                 ws.send(JSON.stringify(joinMsg));
                 msgRef++;
 
                 heartbeatInterval = setInterval(function() {
                     if (ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify([null, String(msgRef), 'phoenix', 'heartbeat', {}]));
+                        ws.send(JSON.stringify({topic: 'phoenix', event: 'heartbeat', payload: {}, ref: String(msgRef)}));
                         msgRef++;
                     }
                 }, 30000);
@@ -117,8 +117,8 @@ document.addEventListener('DOMContentLoaded', function() {
             ws.onmessage = function(event) {
                 try {
                     var msg = JSON.parse(event.data);
-                    var eventName = msg[3];
-                    var payload = msg[4];
+                    var eventName = msg.event;
+                    var payload = msg.payload;
 
                     if (eventName === 'phx_reply' && payload && payload.response) {
                         if (payload.response.status) {
@@ -152,108 +152,6 @@ document.addEventListener('DOMContentLoaded', function() {
         connect();
     }
 
-    // === Support Chat (on About page) ===
-    var chatMessages = document.getElementById('chat-messages');
-    var chatInput = document.getElementById('chat-input');
-    var chatSend = document.getElementById('chat-send');
-
-    if (chatMessages && chatInput && chatSend) {
-        var chatResponses = [
-            { patterns: ['hour', 'open', 'close', 'when'], response: '\ud83d\udd50 We\'re open Mon-Wed 10am-9pm, Thu 10am-10pm, Fri 10am-11pm, Sat 9am-11pm, Sun 9am-8pm! Come visit us! \ud83c\udf1e' },
-            { patterns: ['flavor', 'menu', 'what do you', 'options'], response: '\ud83c\udf66 We have 7 amazing tropical flavors! Coconut Dream, Pineapple Paradise, Passion Fruit Swirl, Guava Sunset, Mango Tango, Lychee Blossom, and Papaya Cream! Check out our <a href="/menu">full menu</a>! \ud83c\udf34' },
-            { patterns: ['price', 'cost', 'how much', 'expensive'], response: '\ud83d\udcb0 Our scoops range from $4.00 to $5.25! Plus we have awesome specials like Mahalo Monday (buy 2 get 1 free!) and Aloha Hour (half-price 3-5pm daily)! \ud83c\udf89' },
-            { patterns: ['special', 'deal', 'discount', 'promo'], response: '\ud83c\udf1f Current specials: \ud83c\udf1e Mahalo Monday - Buy 2, get 1 free! \ud83c\udf34 Tropical Thursday - 20% off tropical flavors! \u2615 Aloha Hour - Half-price single scoops 3-5pm daily!' },
-            { patterns: ['topping', 'add', 'extra'], response: '\ud83e\uddc1 Toppings: Macadamia Nuts, Toasted Coconut, Mochi Bits, Li Hing Mui Powder, Hot Fudge, and Passion Fruit Drizzle! Prices range from $0.50 to $1.00 \ud83d\ude0b' },
-            { patterns: ['order', 'buy', 'get some'], response: '\ud83d\uded2 Ready to order? Head over to our <a href="/order">order page</a> and we\'ll get scooping! \ud83c\udf68' },
-            { patterns: ['location', 'where', 'address', 'find'], response: '\ud83d\udccd We\'re located in beautiful Honolulu, HI! \ud83c\udf3a Come feel the island vibes! \ud83c\udfd6\ufe0f' },
-            { patterns: ['thank', 'thanks', 'mahalo'], response: '\ud83e\udd19 Mahalo to YOU! We appreciate your love for ice cream! Come back anytime! \ud83c\udf1a\u2728' },
-            { patterns: ['hello', 'hi', 'hey', 'aloha', 'sup'], response: '\ud83c\udf3a Aloha friend! Welcome to Mahalo Ice Cream! What can I help you with today? \ud83c\udf66\u2728' },
-            { patterns: ['best', 'recommend', 'favorite', 'popular'], response: '\ud83c\udfc6 Our most popular flavor is Coconut Dream - creamy coconut with toasted flakes! But honestly, you can\'t go wrong with any of them! \ud83e\udd24' },
-            { patterns: ['vegan', 'dairy', 'allerg'], response: '\ud83c\udf31 Great question! Our Pineapple Paradise sorbet is dairy-free! Please let us know about any allergies when you order. Your safety is our priority! \u2764\ufe0f' },
-        ];
-
-        var defaultResponses = [
-            '\ud83c\udf66 That\'s a great question! Feel free to ask about our flavors, hours, specials, or anything else! \ud83c\udf1e',
-            '\ud83e\udd14 Hmm, I\'m not sure about that, but I DO know we have amazing ice cream! Ask me about our menu or specials! \ud83c\udf34',
-            '\ud83c\udf1a I love your enthusiasm! Try asking about our flavors, toppings, prices, or store hours! \ud83c\udf66',
-            '\ud83e\udd19 Mahalo for chatting! I can help with info about our flavors, specials, hours, and more! What would you like to know? \u2728',
-        ];
-
-        function addMessage(text, isUser) {
-            var msgDiv = document.createElement('div');
-            msgDiv.className = 'chat-message ' + (isUser ? 'user' : 'bot');
-
-            var avatar = document.createElement('span');
-            avatar.className = 'chat-avatar';
-            avatar.textContent = isUser ? '\ud83d\ude0a' : '\ud83c\udf66';
-
-            var bubble = document.createElement('div');
-            bubble.className = 'chat-bubble';
-            bubble.innerHTML = text;
-
-            msgDiv.appendChild(avatar);
-            msgDiv.appendChild(bubble);
-            chatMessages.appendChild(msgDiv);
-            chatMessages.scrollTop = chatMessages.scrollHeight;
-        }
-
-        function addTypingIndicator() {
-            var msgDiv = document.createElement('div');
-            msgDiv.className = 'chat-message bot';
-            msgDiv.id = 'typing-indicator';
-
-            var avatar = document.createElement('span');
-            avatar.className = 'chat-avatar';
-            avatar.textContent = '\ud83c\udf66';
-
-            var bubble = document.createElement('div');
-            bubble.className = 'chat-bubble typing';
-            bubble.textContent = 'typing...';
-
-            msgDiv.appendChild(avatar);
-            msgDiv.appendChild(bubble);
-            chatMessages.appendChild(msgDiv);
-            chatMessages.scrollTop = chatMessages.scrollHeight;
-        }
-
-        function removeTypingIndicator() {
-            var el = document.getElementById('typing-indicator');
-            if (el) el.remove();
-        }
-
-        function getBotResponse(input) {
-            var lower = input.toLowerCase();
-            for (var i = 0; i < chatResponses.length; i++) {
-                var entry = chatResponses[i];
-                for (var j = 0; j < entry.patterns.length; j++) {
-                    if (lower.indexOf(entry.patterns[j]) !== -1) {
-                        return entry.response;
-                    }
-                }
-            }
-            return defaultResponses[Math.floor(Math.random() * defaultResponses.length)];
-        }
-
-        function sendMessage() {
-            var text = chatInput.value.trim();
-            if (!text) return;
-            addMessage(text, true);
-            chatInput.value = '';
-
-            addTypingIndicator();
-            var delay = 500 + Math.random() * 1000;
-            setTimeout(function() {
-                removeTypingIndicator();
-                addMessage(getBotResponse(text), false);
-            }, delay);
-        }
-
-        chatSend.addEventListener('click', sendMessage);
-        chatInput.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') sendMessage();
-        });
-    }
-
     // === Real-time Price Updates (menu & flavor detail pages) ===
     var priceElements = document.querySelectorAll('.price[data-flavor-id]');
     if (priceElements.length > 0) {
@@ -265,13 +163,13 @@ document.addEventListener('DOMContentLoaded', function() {
             var ws = new WebSocket(wsUrl);
 
             ws.onopen = function() {
-                var joinMsg = [String(priceRef), String(priceRef), 'store:lobby', 'phx_join', { customer_name: 'Price Watcher' }];
+                var joinMsg = {topic: 'store:lobby', event: 'phx_join', payload: { customer_name: 'Price Watcher' }, ref: String(priceRef)};
                 ws.send(JSON.stringify(joinMsg));
                 priceRef++;
 
                 setInterval(function() {
                     if (ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify([null, String(priceRef), 'phoenix', 'heartbeat', {}]));
+                        ws.send(JSON.stringify({topic: 'phoenix', event: 'heartbeat', payload: {}, ref: String(priceRef)}));
                         priceRef++;
                     }
                 }, 30000);
@@ -280,8 +178,8 @@ document.addEventListener('DOMContentLoaded', function() {
             ws.onmessage = function(event) {
                 try {
                     var msg = JSON.parse(event.data);
-                    var eventName = msg[3];
-                    var payload = msg[4];
+                    var eventName = msg.event;
+                    var payload = msg.payload;
 
                     if (eventName === 'price_updated' && payload) {
                         var flavorId = payload.flavor_id;
@@ -312,5 +210,143 @@ document.addEventListener('DOMContentLoaded', function() {
         }
 
         connectPrices();
+    }
+
+    // === Global Chat Widget ===
+    var chatWidgetBtn = document.querySelector('.chat-widget-btn');
+    var chatWidgetPanel = document.querySelector('.chat-widget-panel');
+    var chatWidgetMessages = document.getElementById('chat-widget-messages');
+    var chatWidgetInput = document.getElementById('chat-widget-input');
+    var chatWidgetSend = document.getElementById('chat-widget-send');
+
+    var chatWidgetClose = document.getElementById('chat-widget-close');
+
+    if (chatWidgetBtn && chatWidgetPanel) {
+        chatWidgetBtn.addEventListener('click', function() {
+            chatWidgetPanel.classList.toggle('open');
+        });
+        if (chatWidgetClose) {
+            chatWidgetClose.addEventListener('click', function() {
+                chatWidgetPanel.classList.remove('open');
+            });
+        }
+    }
+
+    if (chatWidgetMessages) {
+        var chatRef = 1;
+        var chatWs = null;
+        var chatHeartbeatInterval = null;
+
+        function addChatMessage(text, isUser) {
+            var msgDiv = document.createElement('div');
+            msgDiv.className = 'chat-message ' + (isUser ? 'user' : 'bot');
+
+            var avatar = document.createElement('span');
+            avatar.className = 'chat-avatar';
+            avatar.textContent = isUser ? '\ud83d\ude0a' : '\ud83c\udf66';
+
+            var bubble = document.createElement('div');
+            bubble.className = 'chat-bubble';
+            bubble.innerHTML = text;
+
+            msgDiv.appendChild(avatar);
+            msgDiv.appendChild(bubble);
+            chatWidgetMessages.appendChild(msgDiv);
+            chatWidgetMessages.scrollTop = chatWidgetMessages.scrollHeight;
+        }
+
+        function addTypingIndicator() {
+            var msgDiv = document.createElement('div');
+            msgDiv.className = 'chat-message bot';
+            msgDiv.id = 'chat-widget-typing';
+
+            var avatar = document.createElement('span');
+            avatar.className = 'chat-avatar';
+            avatar.textContent = '\ud83c\udf66';
+
+            var bubble = document.createElement('div');
+            bubble.className = 'chat-bubble typing';
+            bubble.textContent = 'typing...';
+
+            msgDiv.appendChild(avatar);
+            msgDiv.appendChild(bubble);
+            chatWidgetMessages.appendChild(msgDiv);
+            chatWidgetMessages.scrollTop = chatWidgetMessages.scrollHeight;
+        }
+
+        function removeTypingIndicator() {
+            var el = document.getElementById('chat-widget-typing');
+            if (el) el.remove();
+        }
+
+        function connectChat() {
+            var protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            var wsUrl = protocol + '//' + window.location.host + '/ws';
+            chatWs = new WebSocket(wsUrl);
+
+            chatWs.onopen = function() {
+                chatWs.send(JSON.stringify({topic: 'support:chat', event: 'phx_join', payload: {customer_name: 'Guest'}, ref: String(chatRef)}));
+                chatRef++;
+
+                chatHeartbeatInterval = setInterval(function() {
+                    if (chatWs && chatWs.readyState === WebSocket.OPEN) {
+                        chatWs.send(JSON.stringify({topic: 'phoenix', event: 'heartbeat', payload: {}, ref: String(chatRef)}));
+                        chatRef++;
+                    }
+                }, 30000);
+            };
+
+            chatWs.onmessage = function(event) {
+                try {
+                    var msg = JSON.parse(event.data);
+                    var eventName = msg.event;
+                    var payload = msg.payload;
+
+                    if (eventName === 'phx_reply' && payload && payload.response) {
+                        removeTypingIndicator();
+                        if (payload.response.message) {
+                            addChatMessage(payload.response.message, false);
+                        }
+                    } else if (eventName === 'chat_reply' && payload) {
+                        removeTypingIndicator();
+                        if (payload.message) {
+                            addChatMessage(payload.message, false);
+                        }
+                    }
+                } catch (e) {
+                    console.error('Chat WS parse error:', e);
+                }
+            };
+
+            chatWs.onclose = function() {
+                clearInterval(chatHeartbeatInterval);
+                setTimeout(connectChat, 3000);
+            };
+        }
+
+        function sendChatMessage() {
+            if (!chatWidgetInput) return;
+            var text = chatWidgetInput.value.trim();
+            if (!text) return;
+            addChatMessage(text, true);
+            chatWidgetInput.value = '';
+
+            if (chatWs && chatWs.readyState === WebSocket.OPEN) {
+                addTypingIndicator();
+                chatWs.send(JSON.stringify({topic: 'support:chat', event: 'chat_message', payload: {message: text}, ref: String(chatRef)}));
+                chatRef++;
+            }
+        }
+
+        if (chatWidgetSend) {
+            chatWidgetSend.addEventListener('click', sendChatMessage);
+        }
+        if (chatWidgetInput) {
+            chatWidgetInput.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') sendChatMessage();
+            });
+        }
+
+        connectChat();
     }
 });

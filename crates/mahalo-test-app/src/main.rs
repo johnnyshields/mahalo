@@ -398,6 +398,8 @@ impl Controller for OrderController {
 
 struct OrderChannel {
     store: Store,
+    pubsub: PubSub,
+    runtime: Arc<rebar_core::runtime::Runtime>,
 }
 
 #[async_trait]
@@ -419,12 +421,43 @@ impl Channel for OrderChannel {
         // Extract order ID from topic (e.g., "order:42")
         let order_id = parse_order_id(topic);
 
-        let orders = self.store.orders.lock().unwrap();
-        let status = orders
-            .iter()
-            .find(|o| o.id == order_id)
-            .map(|o| o.status.clone())
-            .unwrap_or_else(|| "not_found".to_string());
+        let status = {
+            let orders = self.store.orders.lock().unwrap();
+            orders
+                .iter()
+                .find(|o| o.id == order_id)
+                .map(|o| o.status.clone())
+                .unwrap_or_else(|| "not_found".to_string())
+        };
+
+        // Spawn a rebar process to simulate order status progression
+        if status == "pending" {
+            let sim_store = self.store.clone();
+            let sim_pubsub = self.pubsub.clone();
+            let topic = topic.to_string();
+            let sim_order_id = order_id;
+            self.runtime.spawn(move |mut _ctx| async move {
+                let statuses = ["preparing", "ready", "delivered"];
+                for next_status in statuses {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    {
+                        let mut orders = sim_store.orders.lock().unwrap();
+                        if let Some(order) = orders.iter_mut().find(|o| o.id == sim_order_id) {
+                            order.status = next_status.to_string();
+                        }
+                    }
+                    tracing::info!(order_id = sim_order_id, status = next_status, "📦 Order status updated");
+                    sim_pubsub.broadcast(
+                        &topic,
+                        "status_changed",
+                        serde_json::json!({
+                            "order_id": sim_order_id,
+                            "status": next_status,
+                        }),
+                    );
+                }
+            }).await;
+        }
 
         Ok(serde_json::json!({
             "status": status,
@@ -1124,13 +1157,17 @@ async fn main() {
             s.resources("/orders", order_controller);
         });
 
-    // --- Channel Router ---
+    // --- Runtime & Channel Router ---
+
+    let runtime = Arc::new(rebar_core::runtime::Runtime::new(4));
 
     let channel_router = ChannelRouter::new()
         .channel(
             "order:*",
             Arc::new(OrderChannel {
                 store: store.clone(),
+                pubsub: pubsub.clone(),
+                runtime: runtime.clone(),
             }),
         )
         .channel("store:lobby", Arc::new(StoreChannel { store: store.clone() }))
@@ -1138,7 +1175,6 @@ async fn main() {
 
     // --- Start Server ---
 
-    let runtime = Arc::new(rebar_core::runtime::Runtime::new(4));
     let addr: std::net::SocketAddr = "127.0.0.1:4000".parse().unwrap();
 
     let endpoint = MahaloEndpoint::new(router, addr, runtime)

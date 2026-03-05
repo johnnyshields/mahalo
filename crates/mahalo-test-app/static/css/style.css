@@ -599,6 +599,97 @@ select:focus {
     flex-shrink: 0;
 }
 
+/* Chat Widget (floating) */
+.chat-widget-btn {
+    position: fixed;
+    bottom: 1.5rem;
+    right: 1.5rem;
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    background: var(--primary);
+    color: white;
+    font-size: 1.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: 0 4px 20px rgba(255, 71, 87, 0.4);
+    z-index: 9999;
+    transition: transform 0.2s;
+}
+
+.chat-widget-btn:hover {
+    transform: scale(1.1);
+}
+
+.chat-widget-panel {
+    display: none;
+    position: fixed;
+    bottom: 5rem;
+    right: 1.5rem;
+    width: 350px;
+    height: 450px;
+    background: var(--card-bg);
+    border-radius: 16px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.2);
+    z-index: 9998;
+    flex-direction: column;
+    overflow: hidden;
+    border: 2px solid var(--secondary);
+}
+
+.chat-widget-panel.open {
+    display: flex;
+}
+
+.chat-widget-header {
+    background: linear-gradient(135deg, var(--secondary), var(--secondary-bright));
+    color: white;
+    padding: 0.75rem 1rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-weight: 600;
+}
+
+.chat-widget-close {
+    background: none;
+    border: none;
+    color: white;
+    font-size: 1.5rem;
+    cursor: pointer;
+}
+
+.chat-widget-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.chat-widget-input {
+    display: flex;
+    gap: 0.5rem;
+    padding: 0.75rem;
+    border-top: 1px solid #eee;
+    background: #f8f9fa;
+}
+
+.chat-widget-input input {
+    flex: 1;
+    border-radius: 20px;
+    padding: 0.6rem 1rem;
+    border: 2px solid #ddd;
+}
+
+.chat-widget-input input:focus {
+    border-color: var(--secondary);
+    outline: none;
+}
+
 /* Footer */
 .footer {
     background: linear-gradient(135deg, #2C3E50, #34495E);
@@ -648,5 +739,10 @@ select:focus {
 
     .flavor-hero h1 {
         font-size: 1.8rem;
+    }
+
+    .chat-widget-panel {
+        width: calc(100vw - 2rem);
+        right: 1rem;
     }
 }
