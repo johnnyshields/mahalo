@@ -20,6 +20,12 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
+impl Default for ETag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Plug for ETag {
     fn call(&self, conn: Conn) -> BoxFuture<'_, Conn> {
         Box::pin(async {

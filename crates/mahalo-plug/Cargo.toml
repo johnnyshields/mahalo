@@ -10,7 +10,6 @@ mahalo-core = { path = "../mahalo-core" }
 http = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
-async-trait = { workspace = true }
 tokio = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }

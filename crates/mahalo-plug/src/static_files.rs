@@ -65,8 +65,8 @@ impl Plug for StaticFiles {
             let relative = if path == self.url_prefix {
                 ""
             } else if let Some(rest) = path.strip_prefix(&self.url_prefix) {
-                if rest.starts_with('/') {
-                    &rest[1..]
+                if let Some(stripped) = rest.strip_prefix('/') {
+                    stripped
                 } else {
                     return conn;
                 }

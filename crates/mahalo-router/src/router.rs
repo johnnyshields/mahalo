@@ -298,6 +298,84 @@ impl MahaloRouter {
         self
     }
 
+    /// Add a top-level PUT route.
+    pub fn put(mut self, path: &str, plug: impl Plug) -> Self {
+        self.routes.push(Route {
+            method: Method::PUT,
+            segments: parse_segments(path),
+            handler: Handler::Plug(Box::new(plug)),
+            pipeline_names: Vec::new(),
+            name: None,
+        });
+        self
+    }
+
+    /// Add a top-level PATCH route.
+    pub fn patch(mut self, path: &str, plug: impl Plug) -> Self {
+        self.routes.push(Route {
+            method: Method::PATCH,
+            segments: parse_segments(path),
+            handler: Handler::Plug(Box::new(plug)),
+            pipeline_names: Vec::new(),
+            name: None,
+        });
+        self
+    }
+
+    /// Add a top-level DELETE route.
+    pub fn delete(mut self, path: &str, plug: impl Plug) -> Self {
+        self.routes.push(Route {
+            method: Method::DELETE,
+            segments: parse_segments(path),
+            handler: Handler::Plug(Box::new(plug)),
+            pipeline_names: Vec::new(),
+            name: None,
+        });
+        self
+    }
+
+    /// Add a top-level named PUT route.
+    pub fn put_named(mut self, path: &str, name: &str, plug: impl Plug) -> Self {
+        let idx = self.routes.len();
+        self.routes.push(Route {
+            method: Method::PUT,
+            segments: parse_segments(path),
+            handler: Handler::Plug(Box::new(plug)),
+            pipeline_names: Vec::new(),
+            name: Some(name.to_string()),
+        });
+        self.name_index.insert(name.to_string(), idx);
+        self
+    }
+
+    /// Add a top-level named PATCH route.
+    pub fn patch_named(mut self, path: &str, name: &str, plug: impl Plug) -> Self {
+        let idx = self.routes.len();
+        self.routes.push(Route {
+            method: Method::PATCH,
+            segments: parse_segments(path),
+            handler: Handler::Plug(Box::new(plug)),
+            pipeline_names: Vec::new(),
+            name: Some(name.to_string()),
+        });
+        self.name_index.insert(name.to_string(), idx);
+        self
+    }
+
+    /// Add a top-level named DELETE route.
+    pub fn delete_named(mut self, path: &str, name: &str, plug: impl Plug) -> Self {
+        let idx = self.routes.len();
+        self.routes.push(Route {
+            method: Method::DELETE,
+            segments: parse_segments(path),
+            handler: Handler::Plug(Box::new(plug)),
+            pipeline_names: Vec::new(),
+            name: Some(name.to_string()),
+        });
+        self.name_index.insert(name.to_string(), idx);
+        self
+    }
+
     /// Reverse-route: build a path string from a named route and params.
     pub fn path_for(&self, name: &str, params: &[(&str, &str)]) -> Option<String> {
         let idx = self.name_index.get(name)?;
@@ -331,7 +409,7 @@ impl MahaloRouter {
         let request_segments = parse_segments(path);
 
         for route in &self.routes {
-            if &route.method != method {
+            if route.method != *method {
                 continue;
             }
             if let Some(params) = match_segments(&route.segments, &request_segments) {

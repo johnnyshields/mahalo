@@ -5,7 +5,7 @@ pub mod logger;
 pub mod static_files;
 pub mod etag;
 
-pub use request_id::{RequestId, RequestIdPlug};
+pub use request_id::{RequestId, RequestIdKey};
 pub use secure_headers::SecureHeaders;
 pub use csrf::{CsrfProtection, CsrfToken};
 pub use logger::{RequestStartTime, request_logger};

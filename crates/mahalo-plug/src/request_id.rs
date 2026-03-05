@@ -1,14 +1,14 @@
 use mahalo_core::conn::{AssignKey, Conn};
 use mahalo_core::plug::{BoxFuture, Plug};
 
-pub struct RequestId;
-impl AssignKey for RequestId {
+pub struct RequestIdKey;
+impl AssignKey for RequestIdKey {
     type Value = String;
 }
 
-pub struct RequestIdPlug;
+pub struct RequestId;
 
-impl Plug for RequestIdPlug {
+impl Plug for RequestId {
     fn call(&self, conn: Conn) -> BoxFuture<'_, Conn> {
         Box::pin(async {
             let id = conn
@@ -18,7 +18,7 @@ impl Plug for RequestIdPlug {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-            conn.assign::<RequestId>(id.clone())
+            conn.assign::<RequestIdKey>(id.clone())
                 .put_resp_header("x-request-id", id)
         })
     }
@@ -35,14 +35,14 @@ mod tests {
         conn.headers
             .insert("x-request-id", "my-custom-id".parse().unwrap());
 
-        let conn = RequestIdPlug.call(conn).await;
+        let conn = RequestId.call(conn).await;
 
         assert_eq!(
             conn.resp_headers.get("x-request-id").unwrap(),
             "my-custom-id"
         );
         assert_eq!(
-            conn.get_assign::<RequestId>(),
+            conn.get_assign::<RequestIdKey>(),
             Some(&"my-custom-id".to_string())
         );
     }
@@ -50,17 +50,17 @@ mod tests {
     #[tokio::test]
     async fn generates_uuid_when_header_missing() {
         let conn = Conn::new(Method::GET, Uri::from_static("/"));
-        let conn = RequestIdPlug.call(conn).await;
+        let conn = RequestId.call(conn).await;
 
         let id = conn.resp_headers.get("x-request-id").unwrap().to_str().unwrap();
         assert!(!id.is_empty());
-        assert_eq!(conn.get_assign::<RequestId>(), Some(&id.to_string()));
+        assert_eq!(conn.get_assign::<RequestIdKey>(), Some(&id.to_string()));
     }
 
     #[tokio::test]
     async fn generated_id_is_valid_uuid() {
         let conn = Conn::new(Method::GET, Uri::from_static("/"));
-        let conn = RequestIdPlug.call(conn).await;
+        let conn = RequestId.call(conn).await;
 
         let id = conn.resp_headers.get("x-request-id").unwrap().to_str().unwrap();
         let parsed = uuid::Uuid::parse_str(id).expect("should be valid UUID");

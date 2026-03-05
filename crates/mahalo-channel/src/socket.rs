@@ -49,10 +49,10 @@ impl ChannelSocket {
             payload: payload.clone(),
             msg_ref: None,
         };
-        if let Ok(json) = serde_json::to_string(&msg) {
-            if self.sender.send(WsMessage::Text(json.into())).is_err() {
-                tracing::warn!(topic = %self.topic, event = %event, "push failed, client disconnected");
-            }
+        if let Ok(json) = serde_json::to_string(&msg)
+            && self.sender.send(WsMessage::Text(json.into())).is_err()
+        {
+            tracing::warn!(topic = %self.topic, event = %event, "push failed, client disconnected");
         }
     }
 
@@ -72,10 +72,10 @@ impl ChannelSocket {
             }),
             msg_ref: Some(msg_ref.to_string()),
         };
-        if let Ok(json) = serde_json::to_string(&msg) {
-            if self.sender.send(WsMessage::Text(json.into())).is_err() {
-                tracing::warn!(topic = %self.topic, msg_ref = %msg_ref, "reply failed, client disconnected");
-            }
+        if let Ok(json) = serde_json::to_string(&msg)
+            && self.sender.send(WsMessage::Text(json.into())).is_err()
+        {
+            tracing::warn!(topic = %self.topic, msg_ref = %msg_ref, "reply failed, client disconnected");
         }
     }
 
@@ -163,10 +163,10 @@ async fn handle_join(
                             payload: pubsub_msg.payload.clone(),
                             msg_ref: None,
                         };
-                        if let Ok(json) = serde_json::to_string(&out) {
-                            if sender_clone.send(WsMessage::Text(json.into())).is_err() {
-                                break;
-                            }
+                        if let Ok(json) = serde_json::to_string(&out)
+                            && sender_clone.send(WsMessage::Text(json.into())).is_err()
+                        {
+                            break;
                         }
                     }
                 });
@@ -210,10 +210,10 @@ fn handle_heartbeat(phoenix_msg: &PhoenixMessage, tx: &mpsc::UnboundedSender<WsM
         payload: serde_json::json!({"status": "ok", "response": {}}),
         msg_ref: phoenix_msg.msg_ref.clone(),
     };
-    if let Ok(json) = serde_json::to_string(&reply_msg) {
-        if tx.send(WsMessage::Text(json.into())).is_err() {
-            tracing::warn!("failed to send heartbeat reply, client disconnected");
-        }
+    if let Ok(json) = serde_json::to_string(&reply_msg)
+        && tx.send(WsMessage::Text(json.into())).is_err()
+    {
+        tracing::warn!("failed to send heartbeat reply, client disconnected");
     }
 }
 

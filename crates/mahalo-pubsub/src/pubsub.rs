@@ -76,11 +76,11 @@ impl PubSub {
                     }
                 }
                 PubSubCommand::Unsubscribe { topic } => {
-                    if let Some(tx) = topics.get(&topic) {
-                        if tx.receiver_count() == 0 {
-                            topics.remove(&topic);
-                            trace!(topic = %topic, "removed empty topic");
-                        }
+                    if let Some(tx) = topics.get(&topic)
+                        && tx.receiver_count() == 0
+                    {
+                        topics.remove(&topic);
+                        trace!(topic = %topic, "removed empty topic");
                     }
                 }
                 PubSubCommand::Shutdown => {

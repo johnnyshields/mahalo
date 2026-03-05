@@ -193,6 +193,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_generates_token() {
+        let plug = CsrfProtection::new("test-secret");
+        let conn = make_conn(Method::HEAD);
+        let conn = plug.call(conn).await;
+
+        assert!(!conn.halted);
+        assert!(conn.get_assign::<CsrfToken>().is_some());
+        assert!(conn.resp_headers.get("x-csrf-token").is_some());
+    }
+
+    #[tokio::test]
+    async fn options_generates_token() {
+        let plug = CsrfProtection::new("test-secret");
+        let conn = make_conn(Method::OPTIONS);
+        let conn = plug.call(conn).await;
+
+        assert!(!conn.halted);
+        assert!(conn.get_assign::<CsrfToken>().is_some());
+        assert!(conn.resp_headers.get("x-csrf-token").is_some());
+    }
+
+    #[tokio::test]
+    async fn put_without_token_returns_403() {
+        let plug = CsrfProtection::new("test-secret");
+        let conn = make_conn(Method::PUT);
+        let conn = plug.call(conn).await;
+
+        assert!(conn.halted);
+        assert_eq!(conn.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn patch_without_token_returns_403() {
+        let plug = CsrfProtection::new("test-secret");
+        let conn = make_conn(Method::PATCH);
+        let conn = plug.call(conn).await;
+
+        assert!(conn.halted);
+        assert_eq!(conn.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn delete_without_token_returns_403() {
+        let plug = CsrfProtection::new("test-secret");
+        let conn = make_conn(Method::DELETE);
+        let conn = plug.call(conn).await;
+
+        assert!(conn.halted);
+        assert_eq!(conn.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn put_with_valid_token_passes() {
+        let plug = CsrfProtection::new("test-secret");
+        let token = plug.generate_token();
+        let mut conn = make_conn(Method::PUT);
+        conn.headers.insert("x-csrf-token", token.parse().unwrap());
+        let conn = plug.call(conn).await;
+
+        assert!(!conn.halted);
+    }
+
+    #[tokio::test]
+    async fn patch_with_valid_token_passes() {
+        let plug = CsrfProtection::new("test-secret");
+        let token = plug.generate_token();
+        let mut conn = make_conn(Method::PATCH);
+        conn.headers.insert("x-csrf-token", token.parse().unwrap());
+        let conn = plug.call(conn).await;
+
+        assert!(!conn.halted);
+    }
+
+    #[tokio::test]
+    async fn delete_with_valid_token_passes() {
+        let plug = CsrfProtection::new("test-secret");
+        let token = plug.generate_token();
+        let mut conn = make_conn(Method::DELETE);
+        conn.headers.insert("x-csrf-token", token.parse().unwrap());
+        let conn = plug.call(conn).await;
+
+        assert!(!conn.halted);
+    }
+
+    #[tokio::test]
     async fn get_passes_through_without_token() {
         let plug = CsrfProtection::new("test-secret");
         let conn = make_conn(Method::GET);

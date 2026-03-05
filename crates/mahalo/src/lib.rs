@@ -18,7 +18,7 @@ pub use mahalo_channel::{handle_websocket, Channel, ChannelError, ChannelRouter,
 
 // Plugs
 pub use mahalo_plug::{
-    CsrfProtection, CsrfToken, ETag, RequestId, RequestIdPlug, RequestStartTime, SecureHeaders,
+    CsrfProtection, CsrfToken, ETag, RequestId, RequestIdKey, RequestStartTime, SecureHeaders,
     StaticFiles, request_logger,
 };
 

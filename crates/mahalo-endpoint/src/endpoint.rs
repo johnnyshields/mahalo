@@ -67,12 +67,12 @@ impl MahaloEndpoint {
     }
 
     /// Convert into an Axum Router that delegates all requests to MahaloRouter.
-    pub fn into_axum_router(&mut self) -> Router {
+    pub fn into_axum_router(self) -> Router {
         let state = EndpointState {
-            router: Arc::clone(&self.router),
-            runtime: Arc::clone(&self.runtime),
-            error_handler: self.error_handler.clone(),
-            after_plugs: Arc::new(std::mem::take(&mut self.after_plugs)),
+            router: self.router,
+            runtime: self.runtime,
+            error_handler: self.error_handler,
+            after_plugs: Arc::new(self.after_plugs),
         };
 
         Router::new()
@@ -81,10 +81,11 @@ impl MahaloEndpoint {
     }
 
     /// Start the HTTP server, blocking until shutdown.
-    pub async fn start(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn start(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let addr = self.addr;
         let axum_router = self.into_axum_router();
-        let listener = tokio::net::TcpListener::bind(self.addr).await?;
-        tracing::info!("Mahalo endpoint listening on {}", self.addr);
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!("Mahalo endpoint listening on {}", addr);
         axum::serve(
             listener,
             axum_router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -94,14 +95,14 @@ impl MahaloEndpoint {
     }
 
     /// Create a rebar ChildEntry for supervision.
-    pub fn child_entry(mut self) -> ChildEntry {
+    pub fn child_entry(self) -> ChildEntry {
         let spec = ChildSpec::new("mahalo_endpoint");
         let addr = self.addr;
         let state = EndpointState {
-            router: Arc::clone(&self.router),
-            runtime: Arc::clone(&self.runtime),
-            error_handler: self.error_handler.clone(),
-            after_plugs: Arc::new(std::mem::take(&mut self.after_plugs)),
+            router: self.router,
+            runtime: self.runtime,
+            error_handler: self.error_handler,
+            after_plugs: Arc::new(self.after_plugs),
         };
 
         ChildEntry::new(spec, move || {
@@ -194,7 +195,7 @@ fn conn_to_response(conn: Conn) -> Response {
     let mut builder = Response::builder().status(conn.status);
 
     if let Some(headers) = builder.headers_mut() {
-        headers.extend(conn.resp_headers.into_iter());
+        headers.extend(conn.resp_headers);
     }
 
     builder.body(Body::from(conn.resp_body)).unwrap()
@@ -266,7 +267,7 @@ mod tests {
         let runtime = Arc::new(Runtime::new(1));
         let router = MahaloRouter::new();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let mut endpoint = MahaloEndpoint::new(router, addr, runtime);
+        let endpoint = MahaloEndpoint::new(router, addr, runtime);
         let _axum_router = endpoint.into_axum_router();
     }
 
@@ -305,7 +306,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let mut endpoint = MahaloEndpoint::new(router, addr, runtime);
+        let endpoint = MahaloEndpoint::new(router, addr, runtime);
         let axum_router = endpoint.into_axum_router();
 
         // Spawn server in background
@@ -410,7 +411,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let mut endpoint = MahaloEndpoint::new(router, addr, runtime)
+        let endpoint = MahaloEndpoint::new(router, addr, runtime)
             .after(plug_fn(|conn: Conn| async {
                 conn.put_resp_header("x-after", "applied")
             }));
@@ -430,6 +431,47 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("x-after").unwrap(), "applied");
         assert_eq!(resp.text().await.unwrap(), "ok");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn after_plugs_respect_halted_conn() {
+        use mahalo_core::plug::plug_fn;
+
+        let runtime = Arc::new(Runtime::new(1));
+        let router = MahaloRouter::new().get(
+            "/halted",
+            plug_fn(|conn: Conn| async {
+                conn.put_status(StatusCode::OK)
+                    .put_resp_body("halted")
+                    .halt()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let endpoint = MahaloEndpoint::new(router, addr, runtime)
+            .after(plug_fn(|conn: Conn| async {
+                conn.put_resp_header("x-should-not-run", "true")
+            }));
+        let axum_router = endpoint.into_axum_router();
+
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum_router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let base = format!("http://{addr}");
+        let resp = reqwest::get(format!("{base}/halted")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.headers().get("x-should-not-run").is_none());
+        assert_eq!(resp.text().await.unwrap(), "halted");
 
         server.abort();
     }
