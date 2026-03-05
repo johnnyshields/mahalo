@@ -18,8 +18,6 @@ bytes = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 tower-http = { workspace = true }
-futures = { workspace = true }
-serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

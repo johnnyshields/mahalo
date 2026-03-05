@@ -130,8 +130,8 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<EndpointState>,
 ) -> impl IntoResponse {
-    let channel_router = state.channel_router.unwrap();
-    let pubsub = state.pubsub.unwrap();
+    let channel_router = state.channel_router.expect("ws route requires channel_router");
+    let pubsub = state.pubsub.expect("ws route requires pubsub");
     ws.on_upgrade(move |socket| handle_websocket(socket, channel_router, pubsub))
 }
 
@@ -247,6 +247,52 @@ mod tests {
         let endpoint = MahaloEndpoint::new(router, addr, runtime);
         let entry = endpoint.child_entry();
         assert_eq!(entry.spec.id, "mahalo_endpoint");
+    }
+
+    #[tokio::test]
+    async fn builder_sets_channel_router_and_pubsub() {
+        let runtime = Arc::new(Runtime::new(1));
+        let router = MahaloRouter::new();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let pubsub = PubSub::start();
+
+        let endpoint = MahaloEndpoint::new(router, addr, runtime)
+            .channel_router(ChannelRouter::new())
+            .pubsub(pubsub.clone());
+
+        assert!(endpoint.channel_router.is_some());
+        assert!(endpoint.pubsub.is_some());
+        pubsub.shutdown();
+    }
+
+    #[test]
+    fn into_axum_router_without_ws_has_no_ws_route() {
+        let runtime = Arc::new(Runtime::new(1));
+        let router = MahaloRouter::new();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let endpoint = MahaloEndpoint::new(router, addr, runtime);
+
+        // Without channel_router/pubsub, the endpoint should not panic
+        // and should produce a valid router (no /ws route)
+        assert!(endpoint.channel_router.is_none());
+        assert!(endpoint.pubsub.is_none());
+        let _axum_router = endpoint.into_axum_router();
+    }
+
+    #[tokio::test]
+    async fn into_axum_router_with_ws_creates_router() {
+        let runtime = Arc::new(Runtime::new(1));
+        let router = MahaloRouter::new();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let pubsub = PubSub::start();
+
+        let endpoint = MahaloEndpoint::new(router, addr, runtime)
+            .channel_router(ChannelRouter::new())
+            .pubsub(pubsub.clone());
+
+        // Should not panic — /ws route is added
+        let _axum_router = endpoint.into_axum_router();
+        pubsub.shutdown();
     }
 
     #[tokio::test]

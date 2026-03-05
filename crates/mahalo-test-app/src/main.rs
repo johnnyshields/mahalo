@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use http::StatusCode;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use mahalo::{
     AssignKey, Channel, ChannelError, ChannelRouter, ChannelSocket, Conn, Controller,
@@ -27,7 +27,7 @@ use mahalo::{
 // Data Models
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 struct Flavor {
     id: u64,
     name: String,
@@ -36,7 +36,7 @@ struct Flavor {
     in_stock: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 struct Order {
     id: u64,
     customer_name: String,
@@ -45,7 +45,7 @@ struct Order {
     created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 struct OrderItem {
     flavor_id: u64,
     scoops: u32,
@@ -439,10 +439,7 @@ impl Channel for OrderChannel {
         socket.assign::<CustomerName>(customer.clone());
 
         // Extract order ID from topic (e.g., "order:42")
-        let order_id: u64 = topic
-            .strip_prefix("order:")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let order_id = parse_order_id(topic);
 
         let orders = self.store.orders.lock().unwrap();
         let status = orders
@@ -465,11 +462,7 @@ impl Channel for OrderChannel {
     ) -> Result<Option<Reply>, ChannelError> {
         match event {
             "update_status" => {
-                let order_id: u64 = socket
-                    .topic
-                    .strip_prefix("order:")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
+                let order_id = parse_order_id(&socket.topic);
 
                 let new_status = payload["status"]
                     .as_str()
@@ -493,11 +486,7 @@ impl Channel for OrderChannel {
                 Ok(Some(Reply::ok(serde_json::json!({"updated": true}))))
             }
             "add_item" => {
-                let order_id: u64 = socket
-                    .topic
-                    .strip_prefix("order:")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
+                let order_id = parse_order_id(&socket.topic);
 
                 let item = OrderItem {
                     flavor_id: payload["flavor_id"].as_u64().unwrap_or(0),
@@ -541,7 +530,9 @@ impl Channel for OrderChannel {
     }
 }
 
-struct StoreChannel;
+struct StoreChannel {
+    store: Store,
+}
 
 #[async_trait]
 impl Channel for StoreChannel {
@@ -590,26 +581,22 @@ impl Channel for StoreChannel {
                 Ok(Some(Reply::ok(serde_json::json!({"announced": true}))))
             }
             "request_menu" => {
-                let menu = vec![
-                    ("Coconut Dream", "$4.50"),
-                    ("Pineapple Paradise", "$4.00"),
-                    ("Passion Fruit Swirl", "$5.00"),
-                    ("Guava Sunset", "$4.75"),
-                    ("Mango Tango", "$4.50"),
-                    ("Lychee Blossom", "$5.25"),
-                    ("Papaya Cream", "$4.50"),
-                ];
+                let menu_payload = {
+                    let flavors = self.store.flavors.lock().unwrap();
+                    let menu: Vec<serde_json::Value> = flavors
+                        .iter()
+                        .filter(|f| f.in_stock)
+                        .map(|f| {
+                            serde_json::json!({
+                                "name": f.name,
+                                "price": format!("${:.2}", f.price_cents as f64 / 100.0),
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({"flavors": menu})
+                };
 
-                socket
-                    .push(
-                        "menu",
-                        &serde_json::json!({
-                            "flavors": menu.iter().map(|(name, price)| {
-                                serde_json::json!({"name": name, "price": price})
-                            }).collect::<Vec<_>>(),
-                        }),
-                    )
-                    .await;
+                socket.push("menu", &menu_payload).await;
 
                 Ok(Some(Reply::ok(serde_json::json!({"sent": true}))))
             }
@@ -633,6 +620,14 @@ impl Channel for StoreChannel {
 // ---------------------------------------------------------------------------
 // Helper: simple timestamp
 // ---------------------------------------------------------------------------
+
+/// Extract order ID from a topic string like "order:42".
+fn parse_order_id(topic: &str) -> u64 {
+    topic
+        .strip_prefix("order:")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
 
 fn chrono_now() -> String {
     let d = std::time::SystemTime::now()
@@ -771,10 +766,11 @@ async fn main() {
         .pipeline(api_pipeline)
         .pipeline(auth_pipeline)
         // Browser routes
-        .get(
-            "/",
-            plug_fn(|conn: Conn| async {
-                let html = r#"<!DOCTYPE html>
+        .scope("/", &["browser"], |s| {
+            s.get(
+                "/",
+                plug_fn(|conn: Conn| async {
+                    let html = r#"<!DOCTYPE html>
 <html>
 <head><title>Mahalo Ice Cream Store</title></head>
 <body>
@@ -794,11 +790,10 @@ async fn main() {
 <p>Connect to <code>ws://localhost:4000/ws</code> for real-time order updates.</p>
 </body>
 </html>"#;
-                conn.put_status(StatusCode::OK)
-                    .put_resp_header("content-type", "text/html; charset=utf-8")
-                    .put_resp_body(html)
-            }),
-        )
+                    conn.put_status(StatusCode::OK).put_resp_body(html)
+                }),
+            );
+        })
         .get(
             "/health",
             plug_fn(|conn: Conn| async {
@@ -807,7 +802,7 @@ async fn main() {
                     .put_resp_body(r#"{"status":"healthy","store":"open"}"#)
             }),
         )
-        // API scope - public endpoints
+        // API scope - public endpoints (flavors, menu, hours, about, toppings, specials)
         .scope("/api", &["api"], |s| {
             // Menu (with telemetry span)
             s.get(
@@ -881,11 +876,8 @@ async fn main() {
                 }),
             );
 
-            // Flavors CRUD (public read, auth for writes handled by controller)
+            // Flavors CRUD (public - no auth required)
             s.resources("/flavors", flavor_controller);
-
-            // Orders CRUD
-            s.resources("/orders", order_controller);
 
             // Toppings
             s.get(
@@ -904,6 +896,10 @@ async fn main() {
                         .put_resp_body(specials_json())
                 }),
             );
+        })
+        // Orders scope - auth-protected
+        .scope("/api", &["api", "auth"], |s| {
+            s.resources("/orders", order_controller);
         });
 
     // --- Channel Router ---
@@ -915,7 +911,7 @@ async fn main() {
                 store: store.clone(),
             }),
         )
-        .channel("store:lobby", Arc::new(StoreChannel));
+        .channel("store:lobby", Arc::new(StoreChannel { store: store.clone() }));
 
     // --- Start Server ---
 
