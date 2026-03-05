@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block title %}🍦 {{ flavor.name }} - Mahalo Ice Cream{% endblock title %}
+
+{% block content %}
+<div class="container">
+    <a href="/menu" class="back-link">⬅️ Back to Menu</a>
+
+    <div class="flavor-detail">
+        <div class="flavor-hero">
+            <h1>🍦 {{ flavor.name }}</h1>
+            <p class="flavor-description">{{ flavor.description }}</p>
+            <div class="flavor-meta">
+                <span class="price price-large" data-flavor-id="{{ flavor.id }}">{{ flavor.price }}</span>
+                {% if flavor.in_stock %}
+                <span class="badge in-stock badge-large">✅ Available</span>
+                {% else %}
+                <span class="badge sold-out badge-large">❌ Sold Out</span>
+                {% endif %}
+            </div>
+        </div>
+
+        {% if flavor.in_stock %}
+        <div class="cta-buttons">
+            <a href="/order" class="btn btn-large">🛒 Order This Flavor!</a>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock content %}

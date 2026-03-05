@@ -17,9 +17,11 @@ use async_trait::async_trait;
 use http::StatusCode;
 use serde::Serialize;
 
+use tera::{Tera, Context};
+
 use mahalo::{
     AssignKey, Channel, ChannelError, ChannelRouter, ChannelSocket, Conn, Controller,
-    MahaloEndpoint, MahaloRouter, Pipeline, PubSub, Reply, Telemetry,
+    MahaloEndpoint, MahaloRouter, Pipeline, PubSub, Reply, StaticFiles, Telemetry,
     plug_fn, BoxFuture,
 };
 
@@ -600,6 +602,30 @@ impl Channel for StoreChannel {
 
                 Ok(Some(Reply::ok(serde_json::json!({"sent": true}))))
             }
+            "update_price" => {
+                let flavor_id = payload["flavor_id"].as_u64().unwrap_or(0);
+                let new_price_cents = payload["price_cents"].as_u64().unwrap_or(0);
+
+                let mut flavors = self.store.flavors.lock().unwrap();
+                if let Some(flavor) = flavors.iter_mut().find(|f| f.id == flavor_id) {
+                    flavor.price_cents = new_price_cents;
+                    let price_str = format_price(new_price_cents);
+                    let flavor_name = flavor.name.clone();
+
+                    socket.broadcast(
+                        "price_updated",
+                        serde_json::json!({
+                            "flavor_id": flavor_id,
+                            "price": price_str,
+                            "flavor_name": flavor_name,
+                        }),
+                    );
+
+                    Ok(Some(Reply::ok(serde_json::json!({"updated": true}))))
+                } else {
+                    Ok(Some(Reply::error(serde_json::json!({"reason": "flavor not found"}))))
+                }
+            }
             _ => Ok(None),
         }
     }
@@ -614,6 +640,80 @@ impl Channel for StoreChannel {
             reason = %reason,
             "Customer left the store"
         );
+    }
+}
+
+struct SupportChannel;
+
+#[async_trait]
+impl Channel for SupportChannel {
+    async fn join(
+        &self,
+        _topic: &str,
+        payload: &serde_json::Value,
+        socket: &mut ChannelSocket,
+    ) -> Result<serde_json::Value, ChannelError> {
+        let customer = payload["customer_name"]
+            .as_str()
+            .unwrap_or("Guest")
+            .to_string();
+        tracing::info!(customer = %customer, "Customer joined support chat");
+        socket.assign::<CustomerName>(customer.clone());
+
+        Ok(serde_json::json!({
+            "message": format!("🌺 Aloha {customer}! How can we help you today?"),
+        }))
+    }
+
+    async fn handle_in(
+        &self,
+        event: &str,
+        payload: &serde_json::Value,
+        socket: &mut ChannelSocket,
+    ) -> Result<Option<Reply>, ChannelError> {
+        match event {
+            "chat_message" => {
+                let msg = payload["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_lowercase();
+
+                let response = if msg.contains("hour") || msg.contains("open") || msg.contains("close") {
+                    "🕐 We're open Mon-Wed 10am-9pm, Thu 10am-10pm, Fri 10am-11pm, Sat 9am-11pm, Sun 9am-8pm! 🌞"
+                } else if msg.contains("flavor") || msg.contains("menu") {
+                    "🍦 We have 7 amazing flavors! Check out /menu for the full list! 🌴"
+                } else if msg.contains("price") || msg.contains("cost") {
+                    "💰 Scoops range from $4.00 to $5.25! Check our specials for deals! 🎉"
+                } else if msg.contains("special") || msg.contains("deal") {
+                    "🌟 Mahalo Monday: Buy 2 get 1 free! Tropical Thursday: 20% off! Aloha Hour: Half-price 3-5pm! 🎉"
+                } else if msg.contains("order") {
+                    "🛒 Head to /order to place your order! We'll get scooping right away! 🍨"
+                } else if msg.contains("thank") || msg.contains("mahalo") {
+                    "🤙 Mahalo to YOU! Come back anytime! 🌺✨"
+                } else if msg.contains("hello") || msg.contains("hi") || msg.contains("aloha") {
+                    "🌺 Aloha! Welcome to Mahalo Ice Cream! Ask me about flavors, hours, or specials! 🍦"
+                } else {
+                    "🍦 Great question! Ask me about our flavors, hours, specials, or toppings! 🌴"
+                };
+
+                // Broadcast the reply so all connected clients see it
+                socket.broadcast(
+                    "chat_reply",
+                    serde_json::json!({"message": response}),
+                );
+
+                Ok(Some(Reply::ok(serde_json::json!({"response": response}))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn terminate(&self, reason: &str, socket: &mut ChannelSocket) {
+        let customer = socket
+            .get_assign::<CustomerName>()
+            .cloned()
+            .unwrap_or_else(|| "Unknown".to_string());
+        tracing::info!(customer = %customer, reason = %reason, "Customer left support chat");
     }
 }
 
@@ -634,6 +734,124 @@ fn chrono_now() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap();
     format!("{}s", d.as_secs())
+}
+
+// ---------------------------------------------------------------------------
+// Template Rendering Helpers
+// ---------------------------------------------------------------------------
+
+fn format_price(cents: u64) -> String {
+    format!("${:.2}", cents as f64 / 100.0)
+}
+
+fn format_flavor(f: &Flavor) -> serde_json::Value {
+    serde_json::json!({
+        "id": f.id,
+        "name": f.name,
+        "description": f.description,
+        "price": format_price(f.price_cents),
+        "in_stock": f.in_stock,
+    })
+}
+
+fn render_template(conn: Conn, tera: &Tera, name: &str, context: &Context) -> Conn {
+    match tera.render(name, context) {
+        Ok(html) => conn.put_status(StatusCode::OK).put_resp_body(html),
+        Err(e) => {
+            tracing::error!(template = name, error = %e, "Template render error");
+            conn.put_status(StatusCode::INTERNAL_SERVER_ERROR)
+                .put_resp_body(format!("<h1>500 - Render Error</h1><p>{e}</p>"))
+        }
+    }
+}
+
+fn render_home(conn: Conn, tera: &Tera, store: &Store) -> Conn {
+    let mut context = Context::new();
+    let flavors = store.flavors.lock().unwrap();
+    let featured: Vec<serde_json::Value> = flavors.iter().take(3).map(|f| format_flavor(f)).collect();
+    context.insert("flavors", &featured);
+    render_template(conn, tera, "home.html", &context)
+}
+
+fn render_menu(conn: Conn, tera: &Tera, store: &Store) -> Conn {
+    let mut context = Context::new();
+    let flavors = store.flavors.lock().unwrap();
+    let all_flavors: Vec<serde_json::Value> = flavors.iter().map(|f| format_flavor(f)).collect();
+    context.insert("flavors", &all_flavors);
+
+    let toppings: Vec<serde_json::Value> = vec![
+        serde_json::json!({"name": "Macadamia Nuts", "price": "$0.75"}),
+        serde_json::json!({"name": "Toasted Coconut", "price": "$0.50"}),
+        serde_json::json!({"name": "Mochi Bits", "price": "$1.00"}),
+        serde_json::json!({"name": "Li Hing Mui Powder", "price": "$0.50"}),
+        serde_json::json!({"name": "Hot Fudge", "price": "$0.75"}),
+        serde_json::json!({"name": "Passion Fruit Drizzle", "price": "$0.75"}),
+    ];
+    context.insert("toppings", &toppings);
+
+    let specials: Vec<serde_json::Value> = vec![
+        serde_json::json!({"name": "Mahalo Monday", "description": "Buy 2 scoops, get 1 free!", "days": "Monday"}),
+        serde_json::json!({"name": "Tropical Thursday", "description": "All tropical flavors 20% off", "days": "Thursday"}),
+        serde_json::json!({"name": "Aloha Hour", "description": "Half-price single scoops from 3-5pm daily", "days": "Every day"}),
+    ];
+    context.insert("specials", &specials);
+
+    render_template(conn, tera, "menu.html", &context)
+}
+
+fn render_order(conn: Conn, tera: &Tera, store: &Store) -> Conn {
+    let mut context = Context::new();
+    let flavors = store.flavors.lock().unwrap();
+    let in_stock: Vec<serde_json::Value> = flavors.iter().filter(|f| f.in_stock).map(|f| format_flavor(f)).collect();
+    context.insert("flavors", &in_stock);
+    render_template(conn, tera, "order.html", &context)
+}
+
+fn render_order_status(conn: Conn, tera: &Tera) -> Conn {
+    let order_id = conn.path_params.get("id").cloned().unwrap_or_else(|| "0".to_string());
+    let mut context = Context::new();
+    context.insert("order_id", &order_id);
+    render_template(conn, tera, "order_status.html", &context)
+}
+
+fn render_about(conn: Conn, tera: &Tera) -> Conn {
+    let mut context = Context::new();
+
+    let hours: Vec<serde_json::Value> = vec![
+        serde_json::json!({"day": "Monday", "time": "10:00 AM - 9:00 PM"}),
+        serde_json::json!({"day": "Tuesday", "time": "10:00 AM - 9:00 PM"}),
+        serde_json::json!({"day": "Wednesday", "time": "10:00 AM - 9:00 PM"}),
+        serde_json::json!({"day": "Thursday", "time": "10:00 AM - 10:00 PM"}),
+        serde_json::json!({"day": "Friday", "time": "10:00 AM - 11:00 PM"}),
+        serde_json::json!({"day": "Saturday", "time": "9:00 AM - 11:00 PM"}),
+        serde_json::json!({"day": "Sunday", "time": "9:00 AM - 8:00 PM"}),
+    ];
+    context.insert("hours", &hours);
+
+    let specials: Vec<serde_json::Value> = vec![
+        serde_json::json!({"name": "Mahalo Monday", "description": "Buy 2 scoops, get 1 free!", "days": "Monday"}),
+        serde_json::json!({"name": "Tropical Thursday", "description": "All tropical flavors 20% off", "days": "Thursday"}),
+        serde_json::json!({"name": "Aloha Hour", "description": "Half-price single scoops from 3-5pm daily", "days": "Every day"}),
+    ];
+    context.insert("specials", &specials);
+
+    render_template(conn, tera, "about.html", &context)
+}
+
+fn render_flavor(conn: Conn, tera: &Tera, store: &Store) -> Conn {
+    let id: u64 = conn.path_params.get("id").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let flavors = store.flavors.lock().unwrap();
+    match flavors.iter().find(|f| f.id == id) {
+        Some(flavor) => {
+            let mut context = Context::new();
+            context.insert("flavor", &format_flavor(flavor));
+            render_template(conn, tera, "flavor.html", &context)
+        }
+        None => {
+            conn.put_status(StatusCode::NOT_FOUND)
+                .put_resp_body("<h1>🍦 Flavor not found!</h1><p><a href=\"/menu\">Back to Menu</a></p>")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +938,14 @@ async fn main() {
     // Create the store
     let store = Store::new(telemetry.clone());
 
+    // Initialize Tera templates
+    let template_dir = format!("{}/templates/**/*", env!("CARGO_MANIFEST_DIR"));
+    let tera = Arc::new(Tera::new(&template_dir).expect("Failed to load templates"));
+
+    // Static files plug
+    let static_dir = format!("{}/static", env!("CARGO_MANIFEST_DIR"));
+    let static_files = StaticFiles::new("/static", static_dir);
+
     // Build controllers
     let flavor_controller = Arc::new(FlavorController {
         store: store.clone(),
@@ -767,32 +993,49 @@ async fn main() {
         .pipeline(auth_pipeline)
         // Browser routes
         .scope("/", &["browser"], |s| {
-            s.get(
-                "/",
-                plug_fn(|conn: Conn| async {
-                    let html = r#"<!DOCTYPE html>
-<html>
-<head><title>Mahalo Ice Cream Store</title></head>
-<body>
-<h1>Welcome to the Mahalo Ice Cream Store!</h1>
-<p>Aloha! We serve the finest tropical ice cream on the island.</p>
-<h2>API Endpoints</h2>
-<ul>
-  <li><a href="/api/menu">Menu</a></li>
-  <li><a href="/api/flavors">Flavors</a></li>
-  <li><a href="/api/hours">Hours</a></li>
-  <li><a href="/api/about">About</a></li>
-  <li><a href="/api/toppings">Toppings</a></li>
-  <li><a href="/api/specials">Specials</a></li>
-  <li><a href="/health">Health Check</a></li>
-</ul>
-<h2>WebSocket</h2>
-<p>Connect to <code>ws://localhost:4000/ws</code> for real-time order updates.</p>
-</body>
-</html>"#;
-                    conn.put_status(StatusCode::OK).put_resp_body(html)
-                }),
-            );
+            let tera_home = tera.clone();
+            let store_home = store.clone();
+            s.get("/", plug_fn(move |conn: Conn| {
+                let tera = tera_home.clone();
+                let store = store_home.clone();
+                async move { render_home(conn, &tera, &store) }
+            }));
+
+            let tera_menu = tera.clone();
+            let store_menu = store.clone();
+            s.get("/menu", plug_fn(move |conn: Conn| {
+                let tera = tera_menu.clone();
+                let store = store_menu.clone();
+                async move { render_menu(conn, &tera, &store) }
+            }));
+
+            let tera_order = tera.clone();
+            let store_order = store.clone();
+            s.get("/order", plug_fn(move |conn: Conn| {
+                let tera = tera_order.clone();
+                let store = store_order.clone();
+                async move { render_order(conn, &tera, &store) }
+            }));
+
+            let tera_status = tera.clone();
+            s.get("/orders/:id", plug_fn(move |conn: Conn| {
+                let tera = tera_status.clone();
+                async move { render_order_status(conn, &tera) }
+            }));
+
+            let tera_about = tera.clone();
+            s.get("/about", plug_fn(move |conn: Conn| {
+                let tera = tera_about.clone();
+                async move { render_about(conn, &tera) }
+            }));
+
+            let tera_flavor = tera.clone();
+            let store_flavor = store.clone();
+            s.get("/flavors/:id", plug_fn(move |conn: Conn| {
+                let tera = tera_flavor.clone();
+                let store = store_flavor.clone();
+                async move { render_flavor(conn, &tera, &store) }
+            }));
         })
         .get(
             "/health",
@@ -911,7 +1154,8 @@ async fn main() {
                 store: store.clone(),
             }),
         )
-        .channel("store:lobby", Arc::new(StoreChannel { store: store.clone() }));
+        .channel("store:lobby", Arc::new(StoreChannel { store: store.clone() }))
+        .channel("support:*", Arc::new(SupportChannel));
 
     // --- Start Server ---
 
@@ -920,11 +1164,71 @@ async fn main() {
 
     let endpoint = MahaloEndpoint::new(router, addr, runtime)
         .channel_router(channel_router)
-        .pubsub(pubsub.clone());
+        .pubsub(pubsub.clone())
+        .error_handler(|status: StatusCode, conn: Conn| {
+            conn.put_status(status)
+                .put_resp_header("content-type", "text/html; charset=utf-8")
+                .put_resp_body(format!(
+                    r#"<!DOCTYPE html><html><head><title>{code} - Mahalo Ice Cream</title>
+<link rel="stylesheet" href="/static/css/style.css"></head>
+<body><nav class="nav"><div class="nav-content"><a href="/" class="nav-logo">🍦 Mahalo Ice Cream</a>
+<div class="nav-links"><a href="/">🏠 Home</a><a href="/menu">📋 Menu</a><a href="/order">🛒 Order</a><a href="/about">🌺 About</a></div></div></nav>
+<div class="container" style="text-align:center;padding:4rem 1rem">
+<h1>🏝️ {code}</h1><p>Oops! We couldn't find what you're looking for. 😅</p>
+<a href="/" class="btn">🏠 Back to Home</a></div>
+<footer class="footer"><p>🌴 &copy; 2024 Mahalo Ice Cream Store 🌴</p></footer></body></html>"#,
+                    code = status.as_u16()
+                ))
+        })
+        .after(static_files);
 
-    tracing::info!("Starting Mahalo Ice Cream Store on http://{addr}");
-    tracing::info!("WebSocket available at ws://{addr}/ws");
-    tracing::info!("Try: curl http://{addr}/api/menu");
+    // Background task: fluctuate prices every 15 seconds for real-time demo
+    let price_store = store.clone();
+    let price_pubsub = pubsub.clone();
+    tokio::spawn(async move {
+        let mut tick = 0u64;
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+            tick += 1;
+
+            let update = {
+                let mut flavors = price_store.flavors.lock().unwrap();
+                // Pick a flavor to update based on tick
+                let idx = (tick as usize) % flavors.len();
+                let flavor = &mut flavors[idx];
+
+                // Fluctuate price by -25 to +25 cents
+                let delta = ((tick * 7 + idx as u64 * 13) % 51) as i64 - 25;
+                let new_price = (flavor.price_cents as i64 + delta).max(200) as u64;
+                flavor.price_cents = new_price;
+
+                (flavor.id, flavor.name.clone(), new_price)
+            };
+
+            let price_str = format_price(update.2);
+            tracing::info!(
+                flavor = %update.1,
+                new_price = %price_str,
+                "💰 Price updated!"
+            );
+
+            price_pubsub.broadcast(
+                "store:lobby",
+                "price_updated",
+                serde_json::json!({
+                    "flavor_id": update.0,
+                    "price": price_str,
+                    "flavor_name": update.1,
+                }),
+            );
+        }
+    });
+
+    tracing::info!("🍦 Starting Mahalo Ice Cream Store on http://{addr}");
+    tracing::info!("🔌 WebSocket available at ws://{addr}/ws");
+    tracing::info!("💬 Support chat on the About page!");
+    tracing::info!("💰 Prices update in real-time every 15s!");
+    tracing::info!("🌐 Try: curl http://{addr}/api/menu");
 
     if let Err(e) = endpoint.start().await {
         tracing::error!("Server error: {e}");

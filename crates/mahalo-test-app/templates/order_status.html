@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block title %}📦 Order #{{ order_id }} - Mahalo Ice Cream{% endblock title %}
+
+{% block content %}
+<div class="container" style="text-align: center;">
+    <h2>📦 Order #{{ order_id }}</h2>
+
+    <div class="status-section">
+        <p>Current Status:</p>
+        <div id="order-status" class="badge badge-large pending">⏳ Connecting...</div>
+    </div>
+
+    <div class="status-timeline">
+        <div class="timeline-step" data-status="pending">
+            <div class="timeline-dot"></div>
+            <span>📝 Pending</span>
+        </div>
+        <div class="timeline-step" data-status="preparing">
+            <div class="timeline-dot"></div>
+            <span>👨‍🍳 Preparing</span>
+        </div>
+        <div class="timeline-step" data-status="ready">
+            <div class="timeline-dot"></div>
+            <span>✅ Ready</span>
+        </div>
+        <div class="timeline-step" data-status="delivered">
+            <div class="timeline-dot"></div>
+            <span>🎉 Delivered</span>
+        </div>
+    </div>
+
+    <p id="ws-status" class="ws-connecting">🔌 Connecting to live updates...</p>
+
+    <div id="order-data" data-order-id="{{ order_id }}"></div>
+
+    <div class="cta-buttons">
+        <a href="/order" class="btn btn-secondary">🛒 Place Another Order</a>
+        <a href="/menu" class="btn">📋 View Menu</a>
+    </div>
+</div>
+{% endblock content %}

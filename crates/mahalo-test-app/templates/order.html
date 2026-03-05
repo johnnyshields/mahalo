@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+
+{% block title %}🛒 Order - Mahalo Ice Cream{% endblock title %}
+
+{% block content %}
+<div class="container">
+    <h2>🛒 Place Your Order</h2>
+
+    <form id="order-form">
+        <div class="form-group">
+            <label for="customer_name">👤 Your Name</label>
+            <input type="text" id="customer_name" name="customer_name" required placeholder="Enter your name">
+        </div>
+
+        <h3>🍦 Items</h3>
+        <div id="items-container">
+            <div class="item-row">
+                <select name="flavor_id" required>
+                    <option value="">🍨 Select a flavor...</option>
+                    {% for flavor in flavors %}
+                    <option value="{{ flavor.id }}">{{ flavor.name }} - {{ flavor.price }}</option>
+                    {% endfor %}
+                </select>
+                <input type="number" name="scoops" min="1" max="5" value="1" placeholder="Scoops">
+                <select name="topping">
+                    <option value="">No topping</option>
+                    <option value="Macadamia Nuts">🥜 Macadamia Nuts</option>
+                    <option value="Toasted Coconut">🥥 Toasted Coconut</option>
+                    <option value="Mochi Bits">🍡 Mochi Bits</option>
+                    <option value="Li Hing Mui Powder">🌸 Li Hing Mui Powder</option>
+                    <option value="Hot Fudge">🍫 Hot Fudge</option>
+                    <option value="Passion Fruit Drizzle">🍈 Passion Fruit Drizzle</option>
+                </select>
+            </div>
+        </div>
+
+        <button type="button" id="add-item-btn" class="btn btn-secondary btn-small">➕ Add Another Item</button>
+
+        <div class="form-actions">
+            <button type="submit" class="btn btn-large">🎉 Place Order!</button>
+        </div>
+    </form>
+</div>
+{% endblock content %}

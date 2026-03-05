@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+
+{% block title %}📋 Menu - Mahalo Ice Cream{% endblock title %}
+
+{% block content %}
+<div class="container">
+    <h2>🍨 Our Flavors</h2>
+    <div class="grid">
+        {% for flavor in flavors %}
+        <a href="/flavors/{{ flavor.id }}" class="card card-link">
+            <h3>🍦 {{ flavor.name }}</h3>
+            <p>{{ flavor.description }}</p>
+            <div class="card-footer">
+                <span class="price" data-flavor-id="{{ flavor.id }}">{{ flavor.price }}</span>
+                {% if flavor.in_stock %}
+                <span class="badge in-stock">✅ Available</span>
+                {% else %}
+                <span class="badge sold-out">❌ Sold Out</span>
+                {% endif %}
+            </div>
+        </a>
+        {% endfor %}
+    </div>
+
+    <h2>🧁 Toppings</h2>
+    <div class="grid">
+        {% for topping in toppings %}
+        <div class="card">
+            <h3>{{ topping.name }}</h3>
+            <span class="price">{{ topping.price }}</span>
+        </div>
+        {% endfor %}
+    </div>
+
+    <h2>🎉 Specials</h2>
+    <div class="grid">
+        {% for special in specials %}
+        <div class="card specials-card">
+            <h3>🌟 {{ special.name }}</h3>
+            <p>{{ special.description }}</p>
+            <span class="badge">📅 {{ special.days }}</span>
+        </div>
+        {% endfor %}
+    </div>
+
+    <div class="cta-buttons">
+        <a href="/order" class="btn">🛒 Order Now!</a>
+    </div>
+</div>
+
+<div id="price-update-toast" class="toast hidden">💰 Prices updated in real-time!</div>
+{% endblock content %}
