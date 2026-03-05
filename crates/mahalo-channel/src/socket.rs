@@ -905,4 +905,172 @@ mod tests {
 
         pubsub.shutdown();
     }
+
+    // -- handle_websocket integration test ------------------------------------
+
+    /// A channel that echoes back events for testing handle_websocket end-to-end.
+    struct EchoChannel;
+
+    #[async_trait]
+    impl Channel for EchoChannel {
+        async fn join(
+            &self,
+            _topic: &str,
+            _payload: &Value,
+            _socket: &mut ChannelSocket,
+        ) -> Result<Value, crate::channel::ChannelError> {
+            Ok(serde_json::json!({"status": "connected"}))
+        }
+
+        async fn handle_in(
+            &self,
+            event: &str,
+            payload: &Value,
+            _socket: &mut ChannelSocket,
+        ) -> Result<Option<Reply>, crate::channel::ChannelError> {
+            Ok(Some(Reply::ok(serde_json::json!({
+                "echo_event": event,
+                "echo_payload": payload,
+            }))))
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_websocket_full_lifecycle() {
+        use axum::extract::ws::WebSocketUpgrade;
+        use axum::routing::get;
+        use axum::Router;
+        use tokio_tungstenite::tungstenite::Message as TungsteniteMsg;
+
+        let pubsub = PubSub::start();
+        let channel_router = Arc::new(
+            ChannelRouter::new().channel("room:*", Arc::new(EchoChannel)),
+        );
+
+        let pubsub_clone = pubsub.clone();
+        let router_clone = channel_router.clone();
+
+        let app = Router::new().route(
+            "/ws",
+            get(move |ws: WebSocketUpgrade| {
+                let cr = router_clone.clone();
+                let ps = pubsub_clone.clone();
+                async move { ws.on_upgrade(move |socket| handle_websocket(socket, cr, ps)) }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Connect via tokio-tungstenite
+        let (mut ws_stream, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+                .await
+                .expect("WebSocket connect failed");
+
+        use futures::{SinkExt, StreamExt};
+
+        // 1. Send heartbeat
+        let heartbeat = serde_json::json!({
+            "topic": "phoenix",
+            "event": "heartbeat",
+            "payload": {},
+            "ref": "hb-1"
+        });
+        ws_stream
+            .send(TungsteniteMsg::Text(heartbeat.to_string().into()))
+            .await
+            .unwrap();
+
+        let reply = ws_stream.next().await.unwrap().unwrap();
+        let parsed: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["ref"], "hb-1");
+
+        // 2. Join a channel
+        let join_msg = serde_json::json!({
+            "topic": "room:lobby",
+            "event": "phx_join",
+            "payload": {},
+            "ref": "join-1"
+        });
+        ws_stream
+            .send(TungsteniteMsg::Text(join_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        let reply = ws_stream.next().await.unwrap().unwrap();
+        let parsed: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["payload"]["response"]["status"], "connected");
+        assert_eq!(parsed["ref"], "join-1");
+
+        // 3. Send a custom event
+        let custom_msg = serde_json::json!({
+            "topic": "room:lobby",
+            "event": "new_msg",
+            "payload": {"text": "hello"},
+            "ref": "msg-1"
+        });
+        ws_stream
+            .send(TungsteniteMsg::Text(custom_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        let reply = ws_stream.next().await.unwrap().unwrap();
+        let parsed: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["payload"]["response"]["echo_event"], "new_msg");
+        assert_eq!(parsed["payload"]["response"]["echo_payload"]["text"], "hello");
+        assert_eq!(parsed["ref"], "msg-1");
+
+        // 4. Send invalid JSON (should be ignored, no crash)
+        ws_stream
+            .send(TungsteniteMsg::Text("not json".to_string().into()))
+            .await
+            .unwrap();
+
+        // 5. Leave the channel
+        let leave_msg = serde_json::json!({
+            "topic": "room:lobby",
+            "event": "phx_leave",
+            "payload": {},
+            "ref": "leave-1"
+        });
+        ws_stream
+            .send(TungsteniteMsg::Text(leave_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        let reply = ws_stream.next().await.unwrap().unwrap();
+        let parsed: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+        assert_eq!(parsed["event"], "phx_reply");
+        assert_eq!(parsed["payload"]["status"], "ok");
+        assert_eq!(parsed["ref"], "leave-1");
+
+        // 6. Send event to unmatched topic (no crash)
+        let unmatched = serde_json::json!({
+            "topic": "nonexistent:topic",
+            "event": "phx_join",
+            "payload": {},
+            "ref": "x"
+        });
+        ws_stream
+            .send(TungsteniteMsg::Text(unmatched.to_string().into()))
+            .await
+            .unwrap();
+
+        // 7. Close
+        ws_stream.close(None).await.unwrap();
+
+        server.abort();
+        pubsub.shutdown();
+    }
 }
