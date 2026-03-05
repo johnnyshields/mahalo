@@ -96,6 +96,16 @@ impl Conn {
         self
     }
 
+    /// Create a test Conn with GET / defaults.
+    pub fn test() -> Self {
+        Self::new(Method::GET, Uri::from_static("/"))
+    }
+
+    /// Get a response header value as a &str, for convenience in tests.
+    pub fn get_resp_header(&self, name: &str) -> Option<&str> {
+        self.resp_headers.get(name).and_then(|v| v.to_str().ok())
+    }
+
     /// Parse the query string from the URI into `query_params`.
     /// Keys and values are percent-decoded.
     pub fn parse_query_params(&mut self) {
