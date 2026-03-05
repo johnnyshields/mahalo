@@ -24,12 +24,9 @@
                 <input type="number" name="scoops" min="1" max="5" value="1" placeholder="Scoops">
                 <select name="topping">
                     <option value="">No topping</option>
-                    <option value="Macadamia Nuts">🥜 Macadamia Nuts</option>
-                    <option value="Toasted Coconut">🥥 Toasted Coconut</option>
-                    <option value="Mochi Bits">🍡 Mochi Bits</option>
-                    <option value="Li Hing Mui Powder">🌸 Li Hing Mui Powder</option>
-                    <option value="Hot Fudge">🍫 Hot Fudge</option>
-                    <option value="Passion Fruit Drizzle">🍈 Passion Fruit Drizzle</option>
+                    {% for topping in toppings %}
+                    <option value="{{ topping.name }}">{{ topping.name }} ({{ topping.price }})</option>
+                    {% endfor %}
                 </select>
             </div>
         </div>

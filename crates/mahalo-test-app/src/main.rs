@@ -124,11 +124,7 @@ impl Controller for FlavorController {
 
     fn show(&self, conn: Conn) -> BoxFuture<'_, Conn> {
         Box::pin(async {
-            let id: u64 = conn
-                .path_params
-                .get("id")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let id = parse_id_param(&conn);
 
             let flavors = self.store.flavors.lock().unwrap();
             match flavors.iter().find(|f| f.id == id) {
@@ -186,11 +182,7 @@ impl Controller for FlavorController {
 
     fn update(&self, conn: Conn) -> BoxFuture<'_, Conn> {
         Box::pin(async {
-            let id: u64 = conn
-                .path_params
-                .get("id")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let id = parse_id_param(&conn);
 
             let body: serde_json::Value = match serde_json::from_slice(&conn.body) {
                 Ok(v) => v,
@@ -228,11 +220,7 @@ impl Controller for FlavorController {
 
     fn delete(&self, conn: Conn) -> BoxFuture<'_, Conn> {
         Box::pin(async {
-            let id: u64 = conn
-                .path_params
-                .get("id")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let id = parse_id_param(&conn);
 
             let mut flavors = self.store.flavors.lock().unwrap();
             let len_before = flavors.len();
@@ -269,11 +257,7 @@ impl Controller for OrderController {
 
     fn show(&self, conn: Conn) -> BoxFuture<'_, Conn> {
         Box::pin(async {
-            let id: u64 = conn
-                .path_params
-                .get("id")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let id = parse_id_param(&conn);
 
             let orders = self.store.orders.lock().unwrap();
             match orders.iter().find(|o| o.id == id) {
@@ -362,11 +346,7 @@ impl Controller for OrderController {
 
     fn update(&self, conn: Conn) -> BoxFuture<'_, Conn> {
         Box::pin(async {
-            let id: u64 = conn
-                .path_params
-                .get("id")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let id = parse_id_param(&conn);
 
             let body: serde_json::Value = match serde_json::from_slice(&conn.body) {
                 Ok(v) => v,
@@ -395,11 +375,7 @@ impl Controller for OrderController {
 
     fn delete(&self, conn: Conn) -> BoxFuture<'_, Conn> {
         Box::pin(async {
-            let id: u64 = conn
-                .path_params
-                .get("id")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let id = parse_id_param(&conn);
 
             let mut orders = self.store.orders.lock().unwrap();
             let len_before = orders.len();
@@ -511,7 +487,7 @@ impl Channel for OrderChannel {
                     Ok(Some(Reply::ok(serde_json::json!({"added": true}))))
                 } else {
                     Ok(Some(Reply::error(
-                        serde_json::json!({"reason": "order not found"}),
+                        serde_json::json!({"error": "order not found"}),
                     )))
                 }
             }
@@ -623,7 +599,7 @@ impl Channel for StoreChannel {
 
                     Ok(Some(Reply::ok(serde_json::json!({"updated": true}))))
                 } else {
-                    Ok(Some(Reply::error(serde_json::json!({"reason": "flavor not found"}))))
+                    Ok(Some(Reply::error(serde_json::json!({"error": "flavor not found"}))))
                 }
             }
             _ => Ok(None),
@@ -640,6 +616,31 @@ impl Channel for StoreChannel {
             reason = %reason,
             "Customer left the store"
         );
+    }
+}
+
+struct ChatResponder;
+
+impl ChatResponder {
+    fn respond(&self, message: &str) -> &'static str {
+        let msg = message.to_lowercase();
+        if msg.contains("hour") || msg.contains("open") || msg.contains("close") {
+            "🕐 We're open Mon-Wed 10am-9pm, Thu 10am-10pm, Fri 10am-11pm, Sat 9am-11pm, Sun 9am-8pm! 🌞"
+        } else if msg.contains("flavor") || msg.contains("menu") {
+            "🍦 We have 7 amazing flavors! Check out /menu for the full list! 🌴"
+        } else if msg.contains("price") || msg.contains("cost") {
+            "💰 Scoops range from $4.00 to $5.25! Check our specials for deals! 🎉"
+        } else if msg.contains("special") || msg.contains("deal") {
+            "🌟 Mahalo Monday: Buy 2 get 1 free! Tropical Thursday: 20% off! Aloha Hour: Half-price 3-5pm! 🎉"
+        } else if msg.contains("order") {
+            "🛒 Head to /order to place your order! We'll get scooping right away! 🍨"
+        } else if msg.contains("thank") || msg.contains("mahalo") {
+            "🤙 Mahalo to YOU! Come back anytime! 🌺✨"
+        } else if msg.contains("hello") || msg.contains("hi") || msg.contains("aloha") {
+            "🌺 Aloha! Welcome to Mahalo Ice Cream! Ask me about flavors, hours, or specials! 🍦"
+        } else {
+            "🍦 Great question! Ask me about our flavors, hours, specials, or toppings! 🌴"
+        }
     }
 }
 
@@ -673,28 +674,9 @@ impl Channel for SupportChannel {
     ) -> Result<Option<Reply>, ChannelError> {
         match event {
             "chat_message" => {
-                let msg = payload["message"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_lowercase();
-
-                let response = if msg.contains("hour") || msg.contains("open") || msg.contains("close") {
-                    "🕐 We're open Mon-Wed 10am-9pm, Thu 10am-10pm, Fri 10am-11pm, Sat 9am-11pm, Sun 9am-8pm! 🌞"
-                } else if msg.contains("flavor") || msg.contains("menu") {
-                    "🍦 We have 7 amazing flavors! Check out /menu for the full list! 🌴"
-                } else if msg.contains("price") || msg.contains("cost") {
-                    "💰 Scoops range from $4.00 to $5.25! Check our specials for deals! 🎉"
-                } else if msg.contains("special") || msg.contains("deal") {
-                    "🌟 Mahalo Monday: Buy 2 get 1 free! Tropical Thursday: 20% off! Aloha Hour: Half-price 3-5pm! 🎉"
-                } else if msg.contains("order") {
-                    "🛒 Head to /order to place your order! We'll get scooping right away! 🍨"
-                } else if msg.contains("thank") || msg.contains("mahalo") {
-                    "🤙 Mahalo to YOU! Come back anytime! 🌺✨"
-                } else if msg.contains("hello") || msg.contains("hi") || msg.contains("aloha") {
-                    "🌺 Aloha! Welcome to Mahalo Ice Cream! Ask me about flavors, hours, or specials! 🍦"
-                } else {
-                    "🍦 Great question! Ask me about our flavors, hours, specials, or toppings! 🌴"
-                };
+                let msg = payload["message"].as_str().unwrap_or("");
+                let responder = ChatResponder;
+                let response = responder.respond(msg);
 
                 // Broadcast the reply so all connected clients see it
                 socket.broadcast(
@@ -720,6 +702,13 @@ impl Channel for SupportChannel {
 // ---------------------------------------------------------------------------
 // Helper: simple timestamp
 // ---------------------------------------------------------------------------
+
+fn parse_id_param(conn: &Conn) -> u64 {
+    conn.path_params
+        .get("id")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
 
 /// Extract order ID from a topic string like "order:42".
 fn parse_order_id(topic: &str) -> u64 {
@@ -779,21 +768,16 @@ fn render_menu(conn: Conn, tera: &Tera, store: &Store) -> Conn {
     let all_flavors: Vec<serde_json::Value> = flavors.iter().map(|f| format_flavor(f)).collect();
     context.insert("flavors", &all_flavors);
 
-    let toppings: Vec<serde_json::Value> = vec![
-        serde_json::json!({"name": "Macadamia Nuts", "price": "$0.75"}),
-        serde_json::json!({"name": "Toasted Coconut", "price": "$0.50"}),
-        serde_json::json!({"name": "Mochi Bits", "price": "$1.00"}),
-        serde_json::json!({"name": "Li Hing Mui Powder", "price": "$0.50"}),
-        serde_json::json!({"name": "Hot Fudge", "price": "$0.75"}),
-        serde_json::json!({"name": "Passion Fruit Drizzle", "price": "$0.75"}),
-    ];
+    let toppings: Vec<serde_json::Value> = toppings_data()
+        .iter()
+        .map(|t| serde_json::json!({"name": t.name, "price": format_price(t.price_cents)}))
+        .collect();
     context.insert("toppings", &toppings);
 
-    let specials: Vec<serde_json::Value> = vec![
-        serde_json::json!({"name": "Mahalo Monday", "description": "Buy 2 scoops, get 1 free!", "days": "Monday"}),
-        serde_json::json!({"name": "Tropical Thursday", "description": "All tropical flavors 20% off", "days": "Thursday"}),
-        serde_json::json!({"name": "Aloha Hour", "description": "Half-price single scoops from 3-5pm daily", "days": "Every day"}),
-    ];
+    let specials: Vec<serde_json::Value> = specials_data()
+        .iter()
+        .map(|s| serde_json::json!({"name": s.name, "description": s.description, "days": s.days}))
+        .collect();
     context.insert("specials", &specials);
 
     render_template(conn, tera, "menu.html", &context)
@@ -804,6 +788,11 @@ fn render_order(conn: Conn, tera: &Tera, store: &Store) -> Conn {
     let flavors = store.flavors.lock().unwrap();
     let in_stock: Vec<serde_json::Value> = flavors.iter().filter(|f| f.in_stock).map(|f| format_flavor(f)).collect();
     context.insert("flavors", &in_stock);
+    let toppings: Vec<serde_json::Value> = toppings_data()
+        .iter()
+        .map(|t| serde_json::json!({"name": t.name, "price": format_price(t.price_cents)}))
+        .collect();
+    context.insert("toppings", &toppings);
     render_template(conn, tera, "order.html", &context)
 }
 
@@ -828,18 +817,17 @@ fn render_about(conn: Conn, tera: &Tera) -> Conn {
     ];
     context.insert("hours", &hours);
 
-    let specials: Vec<serde_json::Value> = vec![
-        serde_json::json!({"name": "Mahalo Monday", "description": "Buy 2 scoops, get 1 free!", "days": "Monday"}),
-        serde_json::json!({"name": "Tropical Thursday", "description": "All tropical flavors 20% off", "days": "Thursday"}),
-        serde_json::json!({"name": "Aloha Hour", "description": "Half-price single scoops from 3-5pm daily", "days": "Every day"}),
-    ];
+    let specials: Vec<serde_json::Value> = specials_data()
+        .iter()
+        .map(|s| serde_json::json!({"name": s.name, "description": s.description, "days": s.days}))
+        .collect();
     context.insert("specials", &specials);
 
     render_template(conn, tera, "about.html", &context)
 }
 
 fn render_flavor(conn: Conn, tera: &Tera, store: &Store) -> Conn {
-    let id: u64 = conn.path_params.get("id").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let id = parse_id_param(&conn);
     let flavors = store.flavors.lock().unwrap();
     match flavors.iter().find(|f| f.id == id) {
         Some(flavor) => {
@@ -855,44 +843,53 @@ fn render_flavor(conn: Conn, tera: &Tera, store: &Store) -> Conn {
 }
 
 // ---------------------------------------------------------------------------
-// Toppings & specials data
+// Toppings & specials data (single source of truth)
 // ---------------------------------------------------------------------------
 
+struct Topping {
+    name: &'static str,
+    price_cents: u64,
+}
+
+fn toppings_data() -> Vec<Topping> {
+    vec![
+        Topping { name: "Macadamia Nuts", price_cents: 75 },
+        Topping { name: "Toasted Coconut", price_cents: 50 },
+        Topping { name: "Mochi Bits", price_cents: 100 },
+        Topping { name: "Li Hing Mui Powder", price_cents: 50 },
+        Topping { name: "Hot Fudge", price_cents: 75 },
+        Topping { name: "Passion Fruit Drizzle", price_cents: 75 },
+    ]
+}
+
+struct Special {
+    name: &'static str,
+    description: &'static str,
+    days: &'static str,
+}
+
+fn specials_data() -> Vec<Special> {
+    vec![
+        Special { name: "Mahalo Monday", description: "Buy 2 scoops, get 1 free!", days: "Monday" },
+        Special { name: "Tropical Thursday", description: "All tropical flavors 20% off", days: "Thursday" },
+        Special { name: "Aloha Hour", description: "Half-price single scoops from 3-5pm daily", days: "Every day" },
+    ]
+}
+
 fn toppings_json() -> String {
-    serde_json::json!({
-        "toppings": [
-            {"name": "Macadamia Nuts", "price_cents": 75},
-            {"name": "Toasted Coconut", "price_cents": 50},
-            {"name": "Mochi Bits", "price_cents": 100},
-            {"name": "Li Hing Mui Powder", "price_cents": 50},
-            {"name": "Hot Fudge", "price_cents": 75},
-            {"name": "Passion Fruit Drizzle", "price_cents": 75},
-        ]
-    })
-    .to_string()
+    let toppings: Vec<serde_json::Value> = toppings_data()
+        .iter()
+        .map(|t| serde_json::json!({"name": t.name, "price_cents": t.price_cents}))
+        .collect();
+    serde_json::json!({"toppings": toppings}).to_string()
 }
 
 fn specials_json() -> String {
-    serde_json::json!({
-        "specials": [
-            {
-                "name": "Mahalo Monday",
-                "description": "Buy 2 scoops, get 1 free!",
-                "days": ["Monday"]
-            },
-            {
-                "name": "Tropical Thursday",
-                "description": "All tropical flavors 20% off",
-                "days": ["Thursday"]
-            },
-            {
-                "name": "Aloha Hour",
-                "description": "Half-price single scoops from 3-5pm daily",
-                "days": ["Every day"]
-            }
-        ]
-    })
-    .to_string()
+    let specials: Vec<serde_json::Value> = specials_data()
+        .iter()
+        .map(|s| serde_json::json!({"name": s.name, "description": s.description, "days": [s.days]}))
+        .collect();
+    serde_json::json!({"specials": specials}).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -993,49 +990,31 @@ async fn main() {
         .pipeline(auth_pipeline)
         // Browser routes
         .scope("/", &["browser"], |s| {
-            let tera_home = tera.clone();
-            let store_home = store.clone();
-            s.get("/", plug_fn(move |conn: Conn| {
-                let tera = tera_home.clone();
-                let store = store_home.clone();
-                async move { render_home(conn, &tera, &store) }
-            }));
+            macro_rules! tera_route {
+                ($s:expr, $path:expr, $tera:expr, $store:expr, |$c:ident, $t:ident, $st:ident| $body:expr) => {{
+                    let tera_c = $tera.clone();
+                    let store_c = $store.clone();
+                    $s.get($path, plug_fn(move |$c: Conn| {
+                        let $t = tera_c.clone();
+                        let $st = store_c.clone();
+                        async move { $body }
+                    }));
+                }};
+                ($s:expr, $path:expr, $tera:expr, |$c:ident, $t:ident| $body:expr) => {{
+                    let tera_c = $tera.clone();
+                    $s.get($path, plug_fn(move |$c: Conn| {
+                        let $t = tera_c.clone();
+                        async move { $body }
+                    }));
+                }};
+            }
 
-            let tera_menu = tera.clone();
-            let store_menu = store.clone();
-            s.get("/menu", plug_fn(move |conn: Conn| {
-                let tera = tera_menu.clone();
-                let store = store_menu.clone();
-                async move { render_menu(conn, &tera, &store) }
-            }));
-
-            let tera_order = tera.clone();
-            let store_order = store.clone();
-            s.get("/order", plug_fn(move |conn: Conn| {
-                let tera = tera_order.clone();
-                let store = store_order.clone();
-                async move { render_order(conn, &tera, &store) }
-            }));
-
-            let tera_status = tera.clone();
-            s.get("/orders/:id", plug_fn(move |conn: Conn| {
-                let tera = tera_status.clone();
-                async move { render_order_status(conn, &tera) }
-            }));
-
-            let tera_about = tera.clone();
-            s.get("/about", plug_fn(move |conn: Conn| {
-                let tera = tera_about.clone();
-                async move { render_about(conn, &tera) }
-            }));
-
-            let tera_flavor = tera.clone();
-            let store_flavor = store.clone();
-            s.get("/flavors/:id", plug_fn(move |conn: Conn| {
-                let tera = tera_flavor.clone();
-                let store = store_flavor.clone();
-                async move { render_flavor(conn, &tera, &store) }
-            }));
+            tera_route!(s, "/", tera, store, |conn, tera, store| render_home(conn, &tera, &store));
+            tera_route!(s, "/menu", tera, store, |conn, tera, store| render_menu(conn, &tera, &store));
+            tera_route!(s, "/order", tera, store, |conn, tera, store| render_order(conn, &tera, &store));
+            tera_route!(s, "/orders/:id", tera, |conn, tera| render_order_status(conn, &tera));
+            tera_route!(s, "/about", tera, |conn, tera| render_about(conn, &tera));
+            tera_route!(s, "/flavors/:id", tera, store, |conn, tera, store| render_flavor(conn, &tera, &store));
         })
         .get(
             "/health",
@@ -1185,6 +1164,10 @@ async fn main() {
     // Background task: fluctuate prices every 15 seconds for real-time demo
     let price_store = store.clone();
     let price_pubsub = pubsub.clone();
+    let startup_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     tokio::spawn(async move {
         let mut tick = 0u64;
         loop {
@@ -1197,8 +1180,8 @@ async fn main() {
                 let idx = (tick as usize) % flavors.len();
                 let flavor = &mut flavors[idx];
 
-                // Fluctuate price by -25 to +25 cents
-                let delta = ((tick * 7 + idx as u64 * 13) % 51) as i64 - 25;
+                // Fluctuate price by -25 to +25 cents (seed adds per-session variance)
+                let delta = ((tick * 7 + idx as u64 * 13 + startup_seed) % 51) as i64 - 25;
                 let new_price = (flavor.price_cents as i64 + delta).max(200) as u64;
                 flavor.price_cents = new_price;
 
@@ -1242,4 +1225,156 @@ fn rand_id() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
     d.as_nanos() as u64 ^ (d.as_secs() << 32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- format_price --
+
+    #[test]
+    fn test_format_price_basic() {
+        assert_eq!(format_price(450), "$4.50");
+        assert_eq!(format_price(100), "$1.00");
+        assert_eq!(format_price(0), "$0.00");
+        assert_eq!(format_price(525), "$5.25");
+        assert_eq!(format_price(99), "$0.99");
+    }
+
+    // -- format_flavor --
+
+    #[test]
+    fn test_format_flavor() {
+        let f = Flavor {
+            id: 1,
+            name: "Test".into(),
+            description: "Desc".into(),
+            price_cents: 450,
+            in_stock: true,
+        };
+        let v = format_flavor(&f);
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["name"], "Test");
+        assert_eq!(v["price"], "$4.50");
+        assert_eq!(v["in_stock"], true);
+    }
+
+    // -- parse_order_id --
+
+    #[test]
+    fn test_parse_order_id() {
+        assert_eq!(parse_order_id("order:42"), 42);
+        assert_eq!(parse_order_id("order:1"), 1);
+        assert_eq!(parse_order_id("order:0"), 0);
+        assert_eq!(parse_order_id("order:abc"), 0);
+        assert_eq!(parse_order_id("invalid"), 0);
+        assert_eq!(parse_order_id(""), 0);
+    }
+
+    // -- parse_id_param --
+
+    #[test]
+    fn test_parse_id_param() {
+        let mut conn = Conn::test();
+        conn.path_params.insert("id".to_string(), "7".to_string());
+        assert_eq!(parse_id_param(&conn), 7);
+
+        let mut conn2 = Conn::test();
+        conn2.path_params.insert("id".to_string(), "abc".to_string());
+        assert_eq!(parse_id_param(&conn2), 0);
+
+        let conn3 = Conn::test();
+        assert_eq!(parse_id_param(&conn3), 0);
+    }
+
+    // -- ChatResponder --
+
+    #[test]
+    fn test_chat_responder_hours() {
+        let r = ChatResponder;
+        assert!(r.respond("What are your hours?").contains("open"));
+        assert!(r.respond("when do you open").contains("open"));
+        assert!(r.respond("when do you close").contains("open"));
+    }
+
+    #[test]
+    fn test_chat_responder_flavors() {
+        let r = ChatResponder;
+        assert!(r.respond("what flavors do you have").contains("flavors"));
+        assert!(r.respond("show me the menu").contains("menu"));
+    }
+
+    #[test]
+    fn test_chat_responder_prices() {
+        let r = ChatResponder;
+        assert!(r.respond("how much does it cost").contains("$4.00"));
+        assert!(r.respond("what are the prices").contains("$4.00"));
+    }
+
+    #[test]
+    fn test_chat_responder_specials() {
+        let r = ChatResponder;
+        assert!(r.respond("any specials today?").contains("Mahalo Monday"));
+        assert!(r.respond("got any deals?").contains("Mahalo Monday"));
+    }
+
+    #[test]
+    fn test_chat_responder_order() {
+        let r = ChatResponder;
+        assert!(r.respond("how do I order").contains("/order"));
+    }
+
+    #[test]
+    fn test_chat_responder_thanks() {
+        let r = ChatResponder;
+        assert!(r.respond("thank you!").contains("Mahalo"));
+        assert!(r.respond("mahalo!").contains("Mahalo"));
+    }
+
+    #[test]
+    fn test_chat_responder_greeting() {
+        let r = ChatResponder;
+        assert!(r.respond("hello there").contains("Aloha"));
+        assert!(r.respond("hi").contains("Aloha"));
+        assert!(r.respond("aloha!").contains("Aloha"));
+    }
+
+    #[test]
+    fn test_chat_responder_fallback() {
+        let r = ChatResponder;
+        assert!(r.respond("tell me about your logo").contains("Great question"));
+    }
+
+    // -- toppings_data / specials_data --
+
+    #[test]
+    fn test_toppings_data_count() {
+        let toppings = toppings_data();
+        assert_eq!(toppings.len(), 6);
+        assert!(toppings.iter().all(|t| t.price_cents > 0));
+    }
+
+    #[test]
+    fn test_specials_data_count() {
+        let specials = specials_data();
+        assert_eq!(specials.len(), 3);
+        assert!(specials.iter().all(|s| !s.name.is_empty()));
+    }
+
+    #[test]
+    fn test_toppings_json_parses() {
+        let json: serde_json::Value = serde_json::from_str(&toppings_json()).unwrap();
+        let arr = json["toppings"].as_array().unwrap();
+        assert_eq!(arr.len(), 6);
+        assert_eq!(arr[0]["name"], "Macadamia Nuts");
+    }
+
+    #[test]
+    fn test_specials_json_parses() {
+        let json: serde_json::Value = serde_json::from_str(&specials_json()).unwrap();
+        let arr = json["specials"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["name"], "Mahalo Monday");
+    }
 }
