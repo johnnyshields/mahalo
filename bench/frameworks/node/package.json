@@ -1,0 +1,7 @@
+{
+  "name": "mahalo-bench-node",
+  "private": true,
+  "dependencies": {
+    "express": "^5"
+  }
+}

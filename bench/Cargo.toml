@@ -1,0 +1,25 @@
+[package]
+name = "mahalo-bench"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "bench-mahalo"
+path = "src/bin/mahalo.rs"
+
+[[bin]]
+name = "bench-axum"
+path = "src/bin/axum_raw.rs"
+
+[[bin]]
+name = "bench-actix"
+path = "src/bin/actix.rs"
+
+[dependencies]
+mahalo = { path = "../crates/mahalo" }
+rebar-core.workspace = true
+tokio.workspace = true
+axum.workspace = true
+http.workspace = true
+serde.workspace = true
+actix-web = "4"
