@@ -13,7 +13,7 @@
 # Requirements:
 #   - oha (HTTP benchmarking tool): cargo install oha
 #   - Rust toolchain (for Mahalo, Axum, Actix servers)
-#   - Optional: Node.js (for Express, Fastify)
+#   - Optional: Node.js (for Express)
 #   - Optional: Ruby + Bundler (for Rack/Puma)
 #   - Optional: Elixir + Mix (for Plug/Cowboy)
 
@@ -38,7 +38,6 @@ PORT_MAHALO=3000
 PORT_AXUM=3001
 PORT_ACTIX=3002
 PORT_EXPRESS=3003
-PORT_FASTIFY=3004
 PORT_PUMA=3005
 PORT_ELIXIR=3007
 
@@ -180,11 +179,21 @@ run_benchmark() {
         echo ""
     } >> "$RESULTS_FILE"
 
-    # Build JSON entry manually
+    # Build JSON entry with jq for proper escaping
     local rps_num="${rps//,/}"
-    cat >> "${RESULTS_JSON}.tmp" <<JSONEOF
-{"framework":"$name","endpoint":"$endpoint","rps":$rps_num,"avg_latency":"$avg_latency","fastest":"$fastest","slowest":"$slowest","p50":"$p50","p90":"$p90","p99":"$p99","responses":"$status_line"}
-JSONEOF
+    jq -n \
+        --arg fw "$name" \
+        --arg ep "$endpoint" \
+        --argjson rps "${rps_num:-0}" \
+        --arg avg "$avg_latency" \
+        --arg fast "$fastest" \
+        --arg slow "$slowest" \
+        --arg p50v "$p50" \
+        --arg p90v "$p90" \
+        --arg p99v "$p99" \
+        --arg resp "$status_line" \
+        '{framework:$fw,endpoint:$ep,rps:$rps,avg_latency:$avg,fastest:$fast,slowest:$slow,p50:$p50v,p90:$p90v,p99:$p99v,responses:$resp}' \
+        >> "${RESULTS_JSON}.tmp"
 }
 
 # Framework launchers
@@ -196,11 +205,13 @@ should_run() {
     return 0
 }
 
-start_mahalo() {
-    should_run "mahalo" || return 0
+build_rust() {
     log "Building Rust servers (release)..."
     (cd "$BENCH_DIR/.." && cargo build -p mahalo-bench --release 2>&1 | tail -1)
+}
 
+start_mahalo() {
+    should_run "mahalo" || return 0
     log "Starting Mahalo..."
     PORT=$PORT_MAHALO "$BENCH_DIR/../target/release/bench-mahalo" &
     PIDS+=($!)
@@ -237,11 +248,6 @@ start_express() {
     (cd "$BENCH_DIR/frameworks/node" && PORT=$PORT_EXPRESS node express.js) &
     PIDS+=($!)
     wait_for_server $PORT_EXPRESS "Express"
-}
-
-start_fastify() {
-    # Fastify v4/v5 hangs on require() with Node.js v24+; skipped
-    skip "Fastify (incompatible with Node.js v24+)"
 }
 
 start_puma() {
@@ -332,6 +338,9 @@ main() {
         echo ""
     } > "$RESULTS_FILE"
 
+    # Build Rust binaries once before starting any server
+    build_rust
+
     # Start all servers
     log "Starting servers..."
     start_mahalo
@@ -340,7 +349,6 @@ main() {
 
     if [ "$RUST_ONLY" = false ]; then
         start_express
-        start_fastify
         start_puma
         start_elixir
     fi
@@ -354,9 +362,15 @@ main() {
     should_run "actix"   && bench_framework "Actix-web"    $PORT_ACTIX
 
     if [ "$RUST_ONLY" = false ]; then
-        should_run "express" && curl -sf "http://127.0.0.1:${PORT_EXPRESS}/plaintext" > /dev/null 2>&1 && bench_framework "Express"      $PORT_EXPRESS  || true
-        should_run "puma"    && curl -sf "http://127.0.0.1:${PORT_PUMA}/plaintext" > /dev/null 2>&1    && bench_framework "Puma (Rack)"  $PORT_PUMA    || true
-        should_run "elixir"  && curl -sf "http://127.0.0.1:${PORT_ELIXIR}/plaintext" > /dev/null 2>&1 && bench_framework "Plug/Cowboy" $PORT_ELIXIR  || true
+        if should_run "express" && curl -sf "http://127.0.0.1:${PORT_EXPRESS}/plaintext" > /dev/null 2>&1; then
+            bench_framework "Express" $PORT_EXPRESS
+        fi
+        if should_run "puma" && curl -sf "http://127.0.0.1:${PORT_PUMA}/plaintext" > /dev/null 2>&1; then
+            bench_framework "Puma (Rack)" $PORT_PUMA
+        fi
+        if should_run "elixir" && curl -sf "http://127.0.0.1:${PORT_ELIXIR}/plaintext" > /dev/null 2>&1; then
+            bench_framework "Plug/Cowboy" $PORT_ELIXIR
+        fi
     fi
 
     print_summary

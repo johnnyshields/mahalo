@@ -22,6 +22,4 @@ tokio.workspace = true
 axum.workspace = true
 http.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 actix-web = "4"
-actix-rt = "2"
