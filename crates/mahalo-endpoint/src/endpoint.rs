@@ -10,10 +10,10 @@ use axum::Router;
 use http::StatusCode;
 use rebar_core::process::ExitReason;
 use rebar_core::runtime::Runtime;
-use rebar_core::supervisor::engine::ChildEntry;
-use rebar_core::supervisor::spec::ChildSpec;
+use rebar_core::supervisor::engine::{ChildEntry, SupervisorHandle, start_supervisor};
+use rebar_core::supervisor::spec::{ChildSpec, RestartStrategy, SupervisorSpec};
 
-use mahalo_channel::socket::{ChannelRouter, handle_websocket};
+use mahalo_channel::socket::{ChannelRouter, handle_websocket_with_runtime};
 use mahalo_core::conn::Conn;
 use mahalo_core::plug::Plug;
 use mahalo_pubsub::PubSub;
@@ -167,6 +167,24 @@ impl MahaloEndpoint {
             }
         })
     }
+
+    /// Start the endpoint as a supervised process tree with PubSub and HTTP server.
+    pub async fn start_supervised(self) -> SupervisorHandle {
+        let runtime = Arc::clone(&self.runtime);
+        let spec = SupervisorSpec::new(RestartStrategy::OneForOne);
+
+        let mut children = Vec::new();
+
+        // Add PubSub child if configured
+        if let Some(ref pubsub) = self.pubsub {
+            children.push(PubSub::child_entry(Arc::new(pubsub.clone())));
+        }
+
+        // Add HTTP server child
+        children.push(self.child_entry());
+
+        start_supervisor(runtime, spec, children).await
+    }
 }
 
 /// Axum handler for WebSocket upgrades, delegating to the channel system.
@@ -176,7 +194,10 @@ async fn ws_handler(
 ) -> impl IntoResponse {
     let channel_router = state.channel_router.expect("ws route requires channel_router");
     let pubsub = state.pubsub.expect("ws route requires pubsub");
-    ws.on_upgrade(move |socket| handle_websocket(socket, channel_router, pubsub))
+    let runtime = state.runtime;
+    ws.on_upgrade(move |socket| {
+        handle_websocket_with_runtime(socket, channel_router, pubsub, runtime)
+    })
 }
 
 /// Axum fallback handler that routes all requests through MahaloRouter.

@@ -5,6 +5,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, trace};
 
 use rebar_core::process::ExitReason;
+use rebar_core::runtime::Runtime;
 use rebar_core::supervisor::{ChildEntry, ChildSpec};
 
 /// A message delivered through the PubSub system.
@@ -89,6 +90,20 @@ impl PubSub {
                 }
             }
         }
+    }
+
+    /// Start the PubSub server as a rebar process. Returns a handle for interacting with it.
+    pub async fn start_with_runtime(runtime: &Runtime) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+
+        runtime
+            .spawn(move |_ctx| async move {
+                Self::run_server(cmd_rx).await;
+            })
+            .await;
+
+        debug!("PubSub server started as rebar process");
+        PubSub { cmd_tx }
     }
 
     /// Subscribe to a topic. Returns a broadcast receiver that will receive
@@ -289,6 +304,26 @@ mod tests {
         // After shutdown, subscribe may return None since the server has stopped
         let result = pubsub.subscribe("test").await;
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_with_runtime_creates_working_pubsub() {
+        let runtime = rebar_core::runtime::Runtime::new(1);
+        let pubsub = PubSub::start_with_runtime(&runtime).await;
+        let mut rx = pubsub.subscribe("test:topic").await.unwrap();
+
+        pubsub.broadcast("test:topic", "hello", serde_json::json!({"msg": "hi"}));
+
+        let msg = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out")
+            .expect("recv error");
+
+        assert_eq!(msg.topic, "test:topic");
+        assert_eq!(msg.event, "hello");
+        assert_eq!(msg.payload, serde_json::json!({"msg": "hi"}));
+
+        pubsub.shutdown();
     }
 
     #[tokio::test]

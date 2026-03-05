@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use async_trait::async_trait;
+use rebar_core::gen_server::{self, CastReply, CallReply, GenServer, GenServerContext, InfoReply, From as GsFrom};
+use rebar_core::runtime::Runtime;
+
 use mahalo_core::conn::AssignKey;
 use mahalo_pubsub::PubSub;
 
@@ -309,6 +313,146 @@ pub async fn handle_websocket(
         channel.terminate("disconnect", &mut socket).await;
     }
 
+    send_task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// GenServer-based WebSocket connection
+// ---------------------------------------------------------------------------
+
+struct ChannelConnectionServer {
+    channel_router: Arc<ChannelRouter>,
+    pubsub: PubSub,
+    ws_tx: mpsc::UnboundedSender<WsMessage>,
+}
+
+struct ChannelConnectionState {
+    joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)>,
+}
+
+#[async_trait]
+impl GenServer for ChannelConnectionServer {
+    type State = ChannelConnectionState;
+
+    async fn init(
+        &self,
+        _args: rmpv::Value,
+        _ctx: &GenServerContext,
+    ) -> Result<Self::State, String> {
+        Ok(ChannelConnectionState {
+            joined_channels: HashMap::new(),
+        })
+    }
+
+    async fn handle_call(
+        &self,
+        _request: rmpv::Value,
+        _from: GsFrom,
+        state: Self::State,
+        _ctx: &GenServerContext,
+    ) -> CallReply<Self::State> {
+        CallReply::Reply(rmpv::Value::Nil, state)
+    }
+
+    async fn handle_cast(
+        &self,
+        request: rmpv::Value,
+        mut state: Self::State,
+        _ctx: &GenServerContext,
+    ) -> CastReply<Self::State> {
+        if let Some(text) = request.as_str() {
+            if let Ok(phoenix_msg) = serde_json::from_str::<PhoenixMessage>(text) {
+                match phoenix_msg.event.as_str() {
+                    "phx_join" => {
+                        if let Some(channel) = self.channel_router.find(&phoenix_msg.topic) {
+                            handle_join(
+                                &phoenix_msg,
+                                channel,
+                                &self.ws_tx,
+                                &self.pubsub,
+                                &mut state.joined_channels,
+                            )
+                            .await;
+                        }
+                    }
+                    "phx_leave" => {
+                        handle_leave(&phoenix_msg, &mut state.joined_channels).await;
+                    }
+                    "heartbeat" => {
+                        handle_heartbeat(&phoenix_msg, &self.ws_tx);
+                    }
+                    _ => {
+                        dispatch_event(&phoenix_msg, &mut state.joined_channels).await;
+                    }
+                }
+            }
+        }
+        CastReply::NoReply(state)
+    }
+
+    async fn handle_info(
+        &self,
+        _msg: rmpv::Value,
+        state: Self::State,
+        _ctx: &GenServerContext,
+    ) -> InfoReply<Self::State> {
+        InfoReply::NoReply(state)
+    }
+
+    async fn terminate(&self, _reason: &str, _state: &Self::State) {
+        // Channel cleanup happens when the WebSocket connection drops and
+        // handle_websocket_with_runtime terminates the joined channels.
+    }
+}
+
+/// Handle a WebSocket connection as a GenServer process.
+///
+/// Each incoming WebSocket message is cast to a GenServer that manages the
+/// per-connection channel state. The send-forwarder task remains a plain
+/// tokio task since it is purely I/O.
+pub async fn handle_websocket_with_runtime(
+    ws: WebSocket,
+    channel_router: Arc<ChannelRouter>,
+    pubsub: PubSub,
+    runtime: Arc<Runtime>,
+) {
+    let (ws_sender, mut ws_receiver) = ws.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
+
+    // Spawn send-forwarder task
+    let send_task = tokio::spawn(async move {
+        let mut ws_sender = ws_sender;
+        while let Some(msg) = rx.recv().await {
+            if ws_sender.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Start GenServer for this connection
+    let server = ChannelConnectionServer {
+        channel_router,
+        pubsub,
+        ws_tx: tx,
+    };
+    let pid = gen_server::start(&runtime, server, rmpv::Value::Nil).await;
+
+    // Read WebSocket messages and cast them to the GenServer
+    while let Some(Ok(msg)) = ws_receiver.next().await {
+        match msg {
+            WsMessage::Text(ref text) => {
+                let cast_val = rmpv::Value::String(text.to_string().into());
+                if gen_server::cast_from_runtime(&runtime, pid, cast_val).await.is_err() {
+                    break;
+                }
+            }
+            WsMessage::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    // Kill the GenServer process on disconnect
+    runtime.kill(pid);
     send_task.abort();
 }
 
