@@ -96,6 +96,16 @@ impl Conn {
         self
     }
 
+    /// Create a test Conn with GET / defaults.
+    pub fn test() -> Self {
+        Self::new(Method::GET, Uri::from_static("/"))
+    }
+
+    /// Get a response header value as a &str, for convenience in tests.
+    pub fn get_resp_header(&self, name: &str) -> Option<&str> {
+        self.resp_headers.get(name).and_then(|v| v.to_str().ok())
+    }
+
     /// Parse the query string from the URI into `query_params`.
     /// Keys and values are percent-decoded.
     pub fn parse_query_params(&mut self) {
@@ -208,5 +218,20 @@ mod tests {
         conn.parse_query_params();
         // percent-encoding does not decode '+' as space (that's form-urlencoded)
         assert_eq!(conn.query_params.get("q").unwrap(), "a+b");
+    }
+
+    #[test]
+    fn with_runtime() {
+        let runtime = Arc::new(Runtime::new(1));
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .with_runtime(runtime);
+        assert!(conn.runtime.is_some());
+    }
+
+    #[test]
+    fn put_resp_header_invalid() {
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .put_resp_header("", "value");
+        assert!(conn.resp_headers.is_empty());
     }
 }

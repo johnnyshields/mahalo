@@ -26,6 +26,8 @@ struct Route {
     handler: Handler,
     /// Names of pipelines to run before this route's handler.
     pipeline_names: Vec<String>,
+    /// Optional name for reverse routing (URL helpers).
+    name: Option<String>,
 }
 
 /// The result of resolving an incoming request to a route.
@@ -86,6 +88,19 @@ impl ScopeBuilder {
             segments,
             handler,
             pipeline_names: self.pipeline_names.clone(),
+            name: None,
+        });
+    }
+
+    fn add_named_route(&mut self, method: Method, path: &str, name: &str, handler: Handler) {
+        let mut segments = self.prefix_segments.clone();
+        segments.extend(parse_segments(path));
+        self.routes.push(Route {
+            method,
+            segments,
+            handler,
+            pipeline_names: self.pipeline_names.clone(),
+            name: Some(name.to_string()),
         });
     }
 
@@ -109,6 +124,26 @@ impl ScopeBuilder {
         self.add_route(Method::DELETE, path, Handler::Plug(Box::new(plug)));
     }
 
+    pub fn get_named(&mut self, path: &str, name: &str, plug: impl Plug) {
+        self.add_named_route(Method::GET, path, name, Handler::Plug(Box::new(plug)));
+    }
+
+    pub fn post_named(&mut self, path: &str, name: &str, plug: impl Plug) {
+        self.add_named_route(Method::POST, path, name, Handler::Plug(Box::new(plug)));
+    }
+
+    pub fn put_named(&mut self, path: &str, name: &str, plug: impl Plug) {
+        self.add_named_route(Method::PUT, path, name, Handler::Plug(Box::new(plug)));
+    }
+
+    pub fn patch_named(&mut self, path: &str, name: &str, plug: impl Plug) {
+        self.add_named_route(Method::PATCH, path, name, Handler::Plug(Box::new(plug)));
+    }
+
+    pub fn delete_named(&mut self, path: &str, name: &str, plug: impl Plug) {
+        self.add_named_route(Method::DELETE, path, name, Handler::Plug(Box::new(plug)));
+    }
+
     /// Register standard CRUD routes for a controller:
     ///   GET    /path       -> index
     ///   GET    /path/:id   -> show
@@ -118,42 +153,48 @@ impl ScopeBuilder {
     pub fn resources(&mut self, path: &str, controller: Arc<dyn Controller>) {
         let base = path;
         let with_id = format!("{}/:id", path);
+        let prefix = path.trim_start_matches('/');
 
-        self.add_route(
+        self.add_named_route(
             Method::GET,
             base,
+            &format!("{}_index", prefix),
             Handler::Controller {
                 controller: Arc::clone(&controller),
                 action: "index".to_string(),
             },
         );
-        self.add_route(
+        self.add_named_route(
             Method::GET,
             &with_id,
+            &format!("{}_show", prefix),
             Handler::Controller {
                 controller: Arc::clone(&controller),
                 action: "show".to_string(),
             },
         );
-        self.add_route(
+        self.add_named_route(
             Method::POST,
             base,
+            &format!("{}_create", prefix),
             Handler::Controller {
                 controller: Arc::clone(&controller),
                 action: "create".to_string(),
             },
         );
-        self.add_route(
+        self.add_named_route(
             Method::PUT,
             &with_id,
+            &format!("{}_update", prefix),
             Handler::Controller {
                 controller: Arc::clone(&controller),
                 action: "update".to_string(),
             },
         );
-        self.add_route(
+        self.add_named_route(
             Method::DELETE,
             &with_id,
+            &format!("{}_delete", prefix),
             Handler::Controller {
                 controller: Arc::clone(&controller),
                 action: "delete".to_string(),
@@ -166,6 +207,7 @@ impl ScopeBuilder {
 pub struct MahaloRouter {
     pipelines: HashMap<String, Pipeline>,
     routes: Vec<Route>,
+    name_index: HashMap<String, usize>,
 }
 
 impl MahaloRouter {
@@ -173,6 +215,7 @@ impl MahaloRouter {
         Self {
             pipelines: HashMap::new(),
             routes: Vec::new(),
+            name_index: HashMap::new(),
         }
     }
 
@@ -193,7 +236,13 @@ impl MahaloRouter {
         let names: Vec<String> = pipeline_names.iter().map(|s| s.to_string()).collect();
         let mut builder = ScopeBuilder::new(prefix_segments, names);
         f(&mut builder);
+        let start = self.routes.len();
         self.routes.extend(builder.routes);
+        for i in start..self.routes.len() {
+            if let Some(ref name) = self.routes[i].name {
+                self.name_index.insert(name.clone(), i);
+            }
+        }
         self
     }
 
@@ -204,6 +253,7 @@ impl MahaloRouter {
             segments: parse_segments(path),
             handler: Handler::Plug(Box::new(plug)),
             pipeline_names: Vec::new(),
+            name: None,
         });
         self
     }
@@ -215,8 +265,143 @@ impl MahaloRouter {
             segments: parse_segments(path),
             handler: Handler::Plug(Box::new(plug)),
             pipeline_names: Vec::new(),
+            name: None,
         });
         self
+    }
+
+    /// Add a top-level named GET route.
+    pub fn get_named(mut self, path: &str, name: &str, plug: impl Plug) -> Self {
+        let idx = self.routes.len();
+        self.routes.push(Route {
+            method: Method::GET,
+            segments: parse_segments(path),
+            handler: Handler::Plug(Box::new(plug)),
+            pipeline_names: Vec::new(),
+            name: Some(name.to_string()),
+        });
+        self.name_index.insert(name.to_string(), idx);
+        self
+    }
+
+    /// Add a top-level named POST route.
+    pub fn post_named(mut self, path: &str, name: &str, plug: impl Plug) -> Self {
+        let idx = self.routes.len();
+        self.routes.push(Route {
+            method: Method::POST,
+            segments: parse_segments(path),
+            handler: Handler::Plug(Box::new(plug)),
+            pipeline_names: Vec::new(),
+            name: Some(name.to_string()),
+        });
+        self.name_index.insert(name.to_string(), idx);
+        self
+    }
+
+    /// Add a top-level PUT route.
+    pub fn put(mut self, path: &str, plug: impl Plug) -> Self {
+        self.routes.push(Route {
+            method: Method::PUT,
+            segments: parse_segments(path),
+            handler: Handler::Plug(Box::new(plug)),
+            pipeline_names: Vec::new(),
+            name: None,
+        });
+        self
+    }
+
+    /// Add a top-level PATCH route.
+    pub fn patch(mut self, path: &str, plug: impl Plug) -> Self {
+        self.routes.push(Route {
+            method: Method::PATCH,
+            segments: parse_segments(path),
+            handler: Handler::Plug(Box::new(plug)),
+            pipeline_names: Vec::new(),
+            name: None,
+        });
+        self
+    }
+
+    /// Add a top-level DELETE route.
+    pub fn delete(mut self, path: &str, plug: impl Plug) -> Self {
+        self.routes.push(Route {
+            method: Method::DELETE,
+            segments: parse_segments(path),
+            handler: Handler::Plug(Box::new(plug)),
+            pipeline_names: Vec::new(),
+            name: None,
+        });
+        self
+    }
+
+    /// Add a top-level named PUT route.
+    pub fn put_named(mut self, path: &str, name: &str, plug: impl Plug) -> Self {
+        let idx = self.routes.len();
+        self.routes.push(Route {
+            method: Method::PUT,
+            segments: parse_segments(path),
+            handler: Handler::Plug(Box::new(plug)),
+            pipeline_names: Vec::new(),
+            name: Some(name.to_string()),
+        });
+        self.name_index.insert(name.to_string(), idx);
+        self
+    }
+
+    /// Add a top-level named PATCH route.
+    pub fn patch_named(mut self, path: &str, name: &str, plug: impl Plug) -> Self {
+        let idx = self.routes.len();
+        self.routes.push(Route {
+            method: Method::PATCH,
+            segments: parse_segments(path),
+            handler: Handler::Plug(Box::new(plug)),
+            pipeline_names: Vec::new(),
+            name: Some(name.to_string()),
+        });
+        self.name_index.insert(name.to_string(), idx);
+        self
+    }
+
+    /// Add a top-level named DELETE route.
+    pub fn delete_named(mut self, path: &str, name: &str, plug: impl Plug) -> Self {
+        let idx = self.routes.len();
+        self.routes.push(Route {
+            method: Method::DELETE,
+            segments: parse_segments(path),
+            handler: Handler::Plug(Box::new(plug)),
+            pipeline_names: Vec::new(),
+            name: Some(name.to_string()),
+        });
+        self.name_index.insert(name.to_string(), idx);
+        self
+    }
+
+    /// Reverse-route: build a path string from a named route and params.
+    pub fn path_for(&self, name: &str, params: &[(&str, &str)]) -> Option<String> {
+        let idx = self.name_index.get(name)?;
+        let route = &self.routes[*idx];
+        let mut parts = Vec::with_capacity(route.segments.len());
+        for seg in &route.segments {
+            if let Some(param_name) = seg.strip_prefix(':') {
+                let value = params.iter().find(|(k, _)| *k == param_name)?.1;
+                parts.push(value.to_string());
+            } else {
+                parts.push(seg.clone());
+            }
+        }
+        Some(format!("/{}", parts.join("/")))
+    }
+
+    /// Return all named routes for introspection: (name, method, path_pattern).
+    pub fn named_routes(&self) -> Vec<(String, Method, String)> {
+        let mut result = Vec::new();
+        for (name, idx) in &self.name_index {
+            let route = &self.routes[*idx];
+            let pattern = format!("/{}", route.segments.join("/"));
+            result.push((name.clone(), route.method.clone(), pattern));
+        }
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
     }
 
     /// Resolve an incoming request method + path to a route.
@@ -224,7 +409,7 @@ impl MahaloRouter {
         let request_segments = parse_segments(path);
 
         for route in &self.routes {
-            if &route.method != method {
+            if route.method != *method {
                 continue;
             }
             if let Some(params) = match_segments(&route.segments, &request_segments) {
@@ -495,6 +680,60 @@ mod tests {
         assert_eq!(conn.get_assign::<AuthApplied>(), Some(&true));
     }
 
+    #[test]
+    fn router_default() {
+        let router = MahaloRouter::default();
+        assert!(router.resolve(&Method::GET, "/anything").is_none());
+    }
+
+    #[test]
+    fn top_level_post() {
+        let router = MahaloRouter::new().post(
+            "/submit",
+            plug_fn(|conn: Conn| async { conn.put_status(StatusCode::OK) }),
+        );
+
+        let resolved = router.resolve(&Method::POST, "/submit");
+        assert!(resolved.is_some());
+        assert!(resolved.unwrap().path_params.is_empty());
+        // GET should not match
+        assert!(router.resolve(&Method::GET, "/submit").is_none());
+    }
+
+    #[test]
+    fn scope_post() {
+        let router = MahaloRouter::new().scope("/api", &[], |s| {
+            s.post("/items", plug_fn(|conn: Conn| async { conn.put_status(StatusCode::OK) }));
+        });
+        assert!(router.resolve(&Method::POST, "/api/items").is_some());
+    }
+
+    #[test]
+    fn scope_put() {
+        let router = MahaloRouter::new().scope("/api", &[], |s| {
+            s.put("/items/:id", plug_fn(|conn: Conn| async { conn.put_status(StatusCode::OK) }));
+        });
+        let resolved = router.resolve(&Method::PUT, "/api/items/5").unwrap();
+        assert_eq!(resolved.path_params.get("id").unwrap(), "5");
+    }
+
+    #[test]
+    fn scope_patch() {
+        let router = MahaloRouter::new().scope("/api", &[], |s| {
+            s.patch("/items/:id", plug_fn(|conn: Conn| async { conn.put_status(StatusCode::OK) }));
+        });
+        let resolved = router.resolve(&Method::PATCH, "/api/items/3").unwrap();
+        assert_eq!(resolved.path_params.get("id").unwrap(), "3");
+    }
+
+    #[test]
+    fn scope_delete() {
+        let router = MahaloRouter::new().scope("/api", &[], |s| {
+            s.delete("/items/:id", plug_fn(|conn: Conn| async { conn.put_status(StatusCode::OK) }));
+        });
+        assert!(router.resolve(&Method::DELETE, "/api/items/1").is_some());
+    }
+
     #[tokio::test]
     async fn pipeline_halt_skips_handler() {
         let auth_pipeline = Pipeline::new("auth").plug(plug_fn(|conn: Conn| async {
@@ -518,5 +757,71 @@ mod tests {
         let conn = resolved.execute(conn).await;
         assert_eq!(conn.status, StatusCode::UNAUTHORIZED);
         assert!(conn.resp_body.is_empty());
+    }
+
+    #[test]
+    fn path_for_with_params() {
+        let router = MahaloRouter::new()
+            .scope("/api", &[], |s| {
+                s.get_named("/rooms/:id", "room_show", plug_fn(|conn: Conn| async { conn }));
+            });
+
+        let path = router.path_for("room_show", &[("id", "42")]);
+        assert_eq!(path, Some("/api/rooms/42".to_string()));
+    }
+
+    #[test]
+    fn path_for_unknown_name_returns_none() {
+        let router = MahaloRouter::new();
+        assert_eq!(router.path_for("nonexistent", &[]), None);
+    }
+
+    #[test]
+    fn scoped_named_routes_include_prefix() {
+        let router = MahaloRouter::new()
+            .scope("/api/v1", &[], |s| {
+                s.get_named("/health", "api_health", plug_fn(|conn: Conn| async { conn }));
+            });
+
+        let path = router.path_for("api_health", &[]);
+        assert_eq!(path, Some("/api/v1/health".to_string()));
+    }
+
+    #[test]
+    fn resources_auto_naming() {
+        let router = MahaloRouter::new()
+            .scope("/api", &[], |s| {
+                s.resources("/rooms", Arc::new(TestController));
+            });
+
+        assert!(router.path_for("rooms_index", &[]).is_some());
+        assert_eq!(router.path_for("rooms_index", &[]), Some("/api/rooms".to_string()));
+        assert_eq!(
+            router.path_for("rooms_show", &[("id", "7")]),
+            Some("/api/rooms/7".to_string())
+        );
+        assert_eq!(router.path_for("rooms_create", &[]), Some("/api/rooms".to_string()));
+        assert_eq!(
+            router.path_for("rooms_update", &[("id", "7")]),
+            Some("/api/rooms/7".to_string())
+        );
+        assert_eq!(
+            router.path_for("rooms_delete", &[("id", "7")]),
+            Some("/api/rooms/7".to_string())
+        );
+    }
+
+    #[test]
+    fn named_routes_returns_expected_entries() {
+        let router = MahaloRouter::new()
+            .get_named("/health", "health", plug_fn(|conn: Conn| async { conn }))
+            .scope("/api", &[], |s| {
+                s.post_named("/login", "login", plug_fn(|conn: Conn| async { conn }));
+            });
+
+        let named = router.named_routes();
+        assert_eq!(named.len(), 2);
+        assert!(named.iter().any(|(n, m, p)| n == "health" && *m == Method::GET && p == "/health"));
+        assert!(named.iter().any(|(n, m, p)| n == "login" && *m == Method::POST && p == "/api/login"));
     }
 }

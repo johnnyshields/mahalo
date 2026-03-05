@@ -113,4 +113,76 @@ mod tests {
         fn assert_error<T: std::error::Error>() {}
         assert_error::<ChannelError>();
     }
+
+    // -- Channel default trait methods -----------------------------------------
+
+    struct MinimalChannel;
+
+    #[async_trait]
+    impl Channel for MinimalChannel {
+        async fn join(
+            &self,
+            _topic: &str,
+            _payload: &Value,
+            _socket: &mut ChannelSocket,
+        ) -> Result<Value, ChannelError> {
+            Ok(serde_json::json!({}))
+        }
+
+        async fn handle_in(
+            &self,
+            _event: &str,
+            _payload: &Value,
+            _socket: &mut ChannelSocket,
+        ) -> Result<Option<Reply>, ChannelError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_info_default_pushes_to_client() {
+        use mahalo_pubsub::{PubSub, PubSubMessage};
+        use tokio::sync::mpsc;
+
+        let pubsub = PubSub::start();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
+
+        let msg = PubSubMessage {
+            topic: "test:topic".into(),
+            event: "greeting".into(),
+            payload: serde_json::json!({"hello": "world"}),
+        };
+
+        let ch = MinimalChannel;
+        ch.handle_info(&msg, &mut socket).await.unwrap();
+
+        let ws_msg = rx.try_recv().expect("should have received a message");
+        match ws_msg {
+            axum::extract::ws::Message::Text(text) => {
+                let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(parsed["event"], "greeting");
+                assert_eq!(parsed["payload"]["hello"], "world");
+            }
+            other => panic!("expected Text, got {:?}", other),
+        }
+
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn terminate_default_does_nothing() {
+        use mahalo_pubsub::PubSub;
+        use tokio::sync::mpsc;
+
+        let pubsub = PubSub::start();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
+
+        let ch = MinimalChannel;
+        ch.terminate("test", &mut socket).await;
+        // no panic = success
+
+        pubsub.shutdown();
+    }
 }

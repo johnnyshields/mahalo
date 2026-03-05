@@ -1,0 +1,21 @@
+[package]
+name = "mahalo-plug"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Built-in plugs for the Mahalo web framework"
+
+[dependencies]
+mahalo-core = { path = "../mahalo-core" }
+http = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

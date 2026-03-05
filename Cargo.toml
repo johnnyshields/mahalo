@@ -7,6 +7,7 @@ members = [
     "crates/mahalo-pubsub",
     "crates/mahalo-channel",
     "crates/mahalo-telemetry",
+    "crates/mahalo-plug",
     "crates/mahalo",
     "crates/cargo-mahalo",
     "crates/mahalo-test-app",
@@ -30,3 +31,8 @@ async-trait = "0.1"
 tower-http = { version = "0.6", features = ["cors"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+hmac = "0.12"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.9"
+base64 = "0.22"

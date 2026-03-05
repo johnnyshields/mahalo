@@ -362,6 +362,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn telemetry_default() {
+        let telemetry = Telemetry::default();
+        let _rx = telemetry.subscribe();
+    }
+
+    #[test]
+    fn event_matches_short_name() {
+        let name = vec!["a".to_string()];
+        let prefix = vec!["a".to_string(), "b".to_string()];
+        assert!(!event_matches(&name, &prefix));
+    }
+
+    #[test]
+    fn now_ms_returns_reasonable_value() {
+        let ts = now_ms();
+        assert!(ts > 1_700_000_000_000, "now_ms() returned {ts}, expected > 1_700_000_000_000");
+    }
+
+    #[tokio::test]
     async fn span_measures_duration() {
         let telemetry = Telemetry::new(64);
         let mut rx = telemetry.subscribe();
