@@ -1,0 +1,8 @@
+target/
+results/
+node_modules/
+frameworks/ruby/Gemfile.lock
+frameworks/ruby/.bundle/
+frameworks/elixir/deps/
+frameworks/elixir/_build/
+frameworks/elixir/mix.lock

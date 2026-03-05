@@ -11,6 +11,7 @@ members = [
     "crates/mahalo",
     "crates/cargo-mahalo",
     "crates/mahalo-test-app",
+    "bench",
 ]
 
 [workspace.package]
