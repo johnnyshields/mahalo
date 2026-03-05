@@ -2,9 +2,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, Request, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::response::Response;
+use axum::routing;
 use axum::Router;
 use http::StatusCode;
 use rebar_core::process::ExitReason;
@@ -12,7 +13,9 @@ use rebar_core::runtime::Runtime;
 use rebar_core::supervisor::engine::ChildEntry;
 use rebar_core::supervisor::spec::ChildSpec;
 
+use mahalo_channel::socket::{ChannelRouter, handle_websocket};
 use mahalo_core::conn::Conn;
+use mahalo_pubsub::PubSub;
 use mahalo_router::MahaloRouter;
 
 /// Default maximum request body size (2 MB).
@@ -23,6 +26,8 @@ const DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 struct EndpointState {
     router: Arc<MahaloRouter>,
     runtime: Arc<Runtime>,
+    channel_router: Option<Arc<ChannelRouter>>,
+    pubsub: Option<PubSub>,
 }
 
 /// Bridges MahaloRouter to an Axum HTTP server with rebar supervision support.
@@ -30,6 +35,8 @@ pub struct MahaloEndpoint {
     router: Arc<MahaloRouter>,
     addr: SocketAddr,
     runtime: Arc<Runtime>,
+    channel_router: Option<Arc<ChannelRouter>>,
+    pubsub: Option<PubSub>,
 }
 
 impl MahaloEndpoint {
@@ -38,7 +45,21 @@ impl MahaloEndpoint {
             router: Arc::new(router),
             addr,
             runtime,
+            channel_router: None,
+            pubsub: None,
         }
+    }
+
+    /// Set a ChannelRouter for WebSocket support.
+    pub fn channel_router(mut self, channel_router: ChannelRouter) -> Self {
+        self.channel_router = Some(Arc::new(channel_router));
+        self
+    }
+
+    /// Set a PubSub instance for WebSocket channel broadcasting.
+    pub fn pubsub(mut self, pubsub: PubSub) -> Self {
+        self.pubsub = Some(pubsub);
+        self
     }
 
     /// Convert into an Axum Router that delegates all requests to MahaloRouter.
@@ -46,11 +67,18 @@ impl MahaloEndpoint {
         let state = EndpointState {
             router: Arc::clone(&self.router),
             runtime: Arc::clone(&self.runtime),
+            channel_router: self.channel_router.clone(),
+            pubsub: self.pubsub.clone(),
         };
 
-        Router::new()
-            .fallback(fallback_handler)
-            .with_state(state)
+        let mut router = Router::new();
+
+        // Add WebSocket route if channel_router and pubsub are configured
+        if self.channel_router.is_some() && self.pubsub.is_some() {
+            router = router.route("/ws", routing::get(ws_handler));
+        }
+
+        router.fallback(fallback_handler).with_state(state)
     }
 
     /// Start the HTTP server, blocking until shutdown.
@@ -72,15 +100,21 @@ impl MahaloEndpoint {
         let router = self.router;
         let addr = self.addr;
         let runtime = self.runtime;
+        let channel_router = self.channel_router;
+        let pubsub = self.pubsub;
 
         ChildEntry::new(spec, move || {
             let router = Arc::clone(&router);
             let runtime = Arc::clone(&runtime);
+            let channel_router = channel_router.clone();
+            let pubsub = pubsub.clone();
             async move {
                 let endpoint = MahaloEndpoint {
                     router,
                     addr,
                     runtime,
+                    channel_router,
+                    pubsub,
                 };
                 match endpoint.start().await {
                     Ok(()) => ExitReason::Normal,
@@ -89,6 +123,16 @@ impl MahaloEndpoint {
             }
         })
     }
+}
+
+/// Axum handler for WebSocket upgrades, delegating to the channel system.
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<EndpointState>,
+) -> impl IntoResponse {
+    let channel_router = state.channel_router.unwrap();
+    let pubsub = state.pubsub.unwrap();
+    ws.on_upgrade(move |socket| handle_websocket(socket, channel_router, pubsub))
 }
 
 /// Axum fallback handler that routes all requests through MahaloRouter.
