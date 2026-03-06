@@ -8,6 +8,8 @@ description = "io_uring HTTP server and supervised lifecycle for Mahalo"
 [dependencies]
 mahalo-core = { path = "../mahalo-core" }
 mahalo-router = { path = "../mahalo-router" }
+mahalo-channel = { path = "../mahalo-channel" }
+mahalo-pubsub = { path = "../mahalo-pubsub" }
 rebar-core = { workspace = true }
 tokio = { workspace = true }
 http = { workspace = true }

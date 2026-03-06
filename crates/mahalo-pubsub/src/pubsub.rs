@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, trace};
@@ -160,22 +160,30 @@ impl PubSub {
         self.cmd_tx.send(PubSubCommand::Shutdown).ok();
     }
 
-    /// Create a [`ChildEntry`] so this PubSub server can be supervised by a
-    /// rebar supervisor tree.
-    pub fn child_entry(pubsub: Arc<PubSub>) -> ChildEntry {
-        ChildEntry::new(ChildSpec::new("mahalo_pubsub"), move || {
-            let pubsub = Arc::clone(&pubsub);
+    /// Create a properly supervised `(PubSub, ChildEntry)` pair.
+    ///
+    /// The channel is pre-allocated so the handle and the supervised factory
+    /// each own their respective end. The supervised process *is* the server
+    /// loop — if it crashes the supervisor will restart it correctly.
+    pub fn new_supervised() -> (Self, ChildEntry) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<PubSubCommand>();
+        let cmd_rx = Arc::new(Mutex::new(Some(cmd_rx)));
+        let handle = PubSub { cmd_tx };
+        let entry = ChildEntry::new(ChildSpec::new("mahalo_pubsub"), move || {
+            let cmd_rx = Arc::clone(&cmd_rx);
             async move {
-                // The PubSub server is already running as a tokio task.
-                // This supervised process simply holds the handle alive and
-                // waits for a ctrl-c or until the unbounded sender is closed
-                // (which would happen if all PubSub clones are dropped).
-                tokio::signal::ctrl_c().await.ok();
-                pubsub.shutdown();
+                let rx = cmd_rx
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("PubSub factory called twice");
+                Self::run_server(rx).await;
                 ExitReason::Normal
             }
-        })
+        });
+        (handle, entry)
     }
+
 }
 
 #[cfg(test)]
@@ -287,15 +295,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn child_entry_creates_entry() {
-        let pubsub = PubSub::start();
-        let pubsub_arc = Arc::new(pubsub.clone());
-        let entry = PubSub::child_entry(pubsub_arc);
-        assert_eq!(entry.spec.id, "mahalo_pubsub");
-        pubsub.shutdown();
-    }
-
-    #[tokio::test]
     async fn subscribe_returns_none_after_shutdown() {
         let pubsub = PubSub::start();
         pubsub.shutdown();
@@ -330,5 +329,37 @@ mod tests {
     async fn pubsub_handle_is_clone_send_sync() {
         fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
         assert_clone_send_sync::<PubSub>();
+    }
+
+    #[tokio::test]
+    async fn new_supervised_subscribe_and_broadcast() {
+        use rebar_core::runtime::Runtime;
+        use rebar_core::supervisor::spec::{RestartStrategy, SupervisorSpec};
+        use rebar_core::supervisor::engine::start_supervisor;
+
+        let runtime = Arc::new(Runtime::new(1));
+        let (pubsub, entry) = PubSub::new_supervised();
+
+        assert_eq!(entry.spec.id, "mahalo_pubsub");
+
+        // Start the supervisor which will start the actual server loop.
+        let _supervisor = start_supervisor(
+            Arc::clone(&runtime),
+            SupervisorSpec::new(RestartStrategy::OneForOne),
+            vec![entry],
+        )
+        .await;
+
+        // Give the server loop a moment to start.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut rx = pubsub.subscribe("supervised:topic").await.unwrap();
+        pubsub.broadcast("supervised:topic", "hello", serde_json::json!({"ok": true}));
+
+        let msg = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out")
+            .expect("recv error");
+        assert_eq!(msg.event, "hello");
     }
 }
