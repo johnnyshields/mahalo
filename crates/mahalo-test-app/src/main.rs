@@ -1177,8 +1177,8 @@ async fn main() {
 
     let addr: std::net::SocketAddr = "127.0.0.1:4000".parse().unwrap();
 
-    // Note: WebSocket channel support is deferred (io_uring migration).
-    // channel_router and pubsub are configured separately.
+    // TODO: Wire channel_router and pubsub into MahaloEndpoint once WebSocket
+    // support is added to the io_uring server. Until then, suppress unused warnings.
     let _channel_router = channel_router;
     let _pubsub_ref = pubsub.clone();
 
