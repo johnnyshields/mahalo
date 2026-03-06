@@ -13,6 +13,8 @@ mahalo-pubsub = { path = "../mahalo-pubsub" }
 mahalo-channel = { path = "../mahalo-channel" }
 mahalo-telemetry = { path = "../mahalo-telemetry" }
 mahalo-plug = { path = "../mahalo-plug" }
+mahalo-cluster = { path = "../mahalo-cluster" }
+mahalo-presence = { path = "../mahalo-presence" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

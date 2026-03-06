@@ -1,6 +1,7 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use futures::{SinkExt, StreamExt};
@@ -10,6 +11,7 @@ use tokio::sync::mpsc;
 
 use async_trait::async_trait;
 use rebar_core::gen_server::{self, CastReply, CallReply, GenServer, GenServerContext, InfoReply, From as GsFrom};
+use rebar_core::process::ProcessId;
 use rebar_core::runtime::Runtime;
 
 use mahalo_core::conn::AssignKey;
@@ -27,12 +29,42 @@ pub struct PhoenixMessage {
     pub msg_ref: Option<String>,
 }
 
+/// A typed handle to a channel's GenServer process that can be used for
+/// inter-channel messaging. Actix equivalent: `Addr<A>`.
+#[derive(Clone)]
+pub struct ChannelAddr {
+    pid: ProcessId,
+    runtime: Arc<Runtime>,
+}
+
+impl ChannelAddr {
+    /// Send a synthetic event to the channel as if it came from a PubSub message.
+    pub async fn send_event(&self, topic: &str, event: &str, payload: Value) {
+        let msg = PhoenixMessage {
+            topic: topic.to_string(),
+            event: event.to_string(),
+            payload,
+            msg_ref: None,
+        };
+        if let Ok(json) = serde_json::to_string(&msg) {
+            let cast_val = rmpv::Value::String(json.into());
+            let _ = gen_server::cast_from_runtime(&self.runtime, self.pid, cast_val).await;
+        }
+    }
+}
+
+/// Prefix for timer messages routed through the GenServer mailbox.
+const TIMER_PREFIX: &str = "__timer:";
+
 /// State for a single channel connection.
 pub struct ChannelSocket {
     pub topic: String,
     assigns: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     sender: mpsc::UnboundedSender<WsMessage>,
     pubsub: PubSub,
+    /// Set when running inside a GenServer process — enables timer scheduling.
+    self_pid: Option<ProcessId>,
+    runtime: Option<Arc<Runtime>>,
 }
 
 impl ChannelSocket {
@@ -42,6 +74,77 @@ impl ChannelSocket {
             assigns: HashMap::new(),
             sender,
             pubsub,
+            self_pid: None,
+            runtime: None,
+        }
+    }
+
+    /// Create a ChannelSocket with GenServer context for timer scheduling.
+    pub fn new_with_pid(
+        topic: String,
+        sender: mpsc::UnboundedSender<WsMessage>,
+        pubsub: PubSub,
+        self_pid: ProcessId,
+        runtime: Arc<Runtime>,
+    ) -> Self {
+        Self {
+            topic,
+            assigns: HashMap::new(),
+            sender,
+            pubsub,
+            self_pid: Some(self_pid),
+            runtime: Some(runtime),
+        }
+    }
+
+    /// Schedule a one-shot synthetic `handle_info` with the given event after `delay`.
+    /// Actix equivalent: `Context::run_later()`.
+    ///
+    /// The event is delivered to the channel as a timer info message. No-op if
+    /// the socket is not backed by a GenServer process.
+    pub fn run_later(&self, delay: Duration, event: impl Into<String>) {
+        if let (Some(pid), Some(runtime)) = (self.self_pid, &self.runtime) {
+            let runtime = Arc::clone(runtime);
+            let key = format!("{TIMER_PREFIX}{}:{}", self.topic, event.into());
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let msg = rmpv::Value::String(rmpv::Utf8String::from(key));
+                let _ = runtime.send(pid, msg).await;
+            });
+        }
+    }
+
+    /// Schedule a recurring synthetic `handle_info` with the given event every `interval`.
+    /// Actix equivalent: `Context::run_interval()`.
+    ///
+    /// Continues until the GenServer is stopped or the runtime is dropped. No-op if
+    /// the socket is not backed by a GenServer process.
+    pub fn run_interval(&self, interval: Duration, event: impl Into<String>) {
+        if let (Some(pid), Some(runtime)) = (self.self_pid, &self.runtime) {
+            let runtime = Arc::clone(runtime);
+            let key = format!("{TIMER_PREFIX}{}:{}", self.topic, event.into());
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let msg = rmpv::Value::String(rmpv::Utf8String::from(key.clone()));
+                    if runtime.send(pid, msg).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    /// Returns a typed handle to this channel's GenServer process.
+    /// Available for inter-channel messaging from within channel callbacks.
+    /// Returns `None` when not backed by a GenServer process.
+    pub fn addr(&self) -> Option<ChannelAddr> {
+        match (self.self_pid, &self.runtime) {
+            (Some(pid), Some(runtime)) => Some(ChannelAddr {
+                pid,
+                runtime: Arc::clone(runtime),
+            }),
+            _ => None,
         }
     }
 
@@ -199,10 +302,16 @@ async fn handle_join_genserver(
     tx: &mpsc::UnboundedSender<WsMessage>,
     pubsub: &PubSub,
     joined_channels: &mut HashMap<String, (Arc<dyn Channel>, ChannelSocket)>,
-    self_pid: rebar_core::process::ProcessId,
+    self_pid: ProcessId,
     runtime: &Arc<Runtime>,
 ) {
-    let mut socket = ChannelSocket::new(phoenix_msg.topic.clone(), tx.clone(), pubsub.clone());
+    let mut socket = ChannelSocket::new_with_pid(
+        phoenix_msg.topic.clone(),
+        tx.clone(),
+        pubsub.clone(),
+        self_pid,
+        Arc::clone(runtime),
+    );
     match channel
         .join(&phoenix_msg.topic, &phoenix_msg.payload, &mut socket)
         .await
@@ -213,6 +322,9 @@ async fn handle_join_genserver(
                 socket.reply(r, &reply).await;
             }
 
+            // Call started() lifecycle hook after join reply is sent.
+            channel.started(&mut socket).await;
+
             // Subscribe to PubSub and spawn forwarder that sends to GenServer mailbox
             if let Some(mut pubsub_rx) = pubsub.subscribe(&phoenix_msg.topic).await {
                 let runtime = Arc::clone(runtime);
@@ -220,7 +332,7 @@ async fn handle_join_genserver(
                 tokio::spawn(async move {
                     while let Ok(pubsub_msg) = pubsub_rx.recv().await {
                         if let Ok(json) = serde_json::to_string(&pubsub_msg) {
-                            let msg = rmpv::Value::String(json.into());
+                            let msg = rmpv::Value::String(rmpv::Utf8String::from(json));
                             if runtime.send(pid, msg).await.is_err() {
                                 break;
                             }
@@ -465,9 +577,25 @@ impl GenServer for ChannelConnectionServer {
         mut state: Self::State,
         _ctx: &GenServerContext,
     ) -> InfoReply<Self::State> {
-        // Messages from PubSub forwarder are JSON-encoded PubSubMessage strings
         if let Some(json_str) = msg.as_str() {
-            if let Ok(pubsub_msg) = serde_json::from_str::<mahalo_pubsub::PubSubMessage>(json_str) {
+            if let Some(rest) = json_str.strip_prefix(TIMER_PREFIX) {
+                // Timer message: __timer:{topic}:{event}
+                if let Some(colon_pos) = rest.find(':') {
+                    let topic = &rest[..colon_pos];
+                    let event = &rest[colon_pos + 1..];
+                    if let Some((channel, socket)) = state.joined_channels.get_mut(topic) {
+                        let synthetic = mahalo_pubsub::PubSubMessage {
+                            topic: topic.to_string(),
+                            event: event.to_string(),
+                            payload: Value::Null,
+                        };
+                        let _ = channel.handle_info(&synthetic, socket).await;
+                    }
+                }
+            } else if let Ok(pubsub_msg) =
+                serde_json::from_str::<mahalo_pubsub::PubSubMessage>(json_str)
+            {
+                // PubSub broadcast message
                 if let Some((channel, socket)) = state.joined_channels.get_mut(&pubsub_msg.topic) {
                     let _ = channel.handle_info(&pubsub_msg, socket).await;
                 }
@@ -476,9 +604,13 @@ impl GenServer for ChannelConnectionServer {
         InfoReply::NoReply(state)
     }
 
-    async fn terminate(&self, _reason: &str, mut state: Self::State) {
+    async fn terminate(&self, reason: &str, mut state: Self::State) {
+        use crate::channel::ShouldStop;
         for (_, (channel, mut socket)) in state.joined_channels.drain() {
-            channel.terminate("disconnect", &mut socket).await;
+            // Two-pass shutdown: stopping() veto, then unconditional terminate().
+            if channel.stopping(&mut socket).await == ShouldStop::Yes {
+                channel.terminate(reason, &mut socket).await;
+            }
         }
     }
 }
@@ -512,7 +644,7 @@ pub async fn handle_websocket_with_runtime(
     while let Some(Ok(msg)) = ws_receiver.next().await {
         match msg {
             WsMessage::Text(ref text) => {
-                let cast_val = rmpv::Value::String(text.to_string().into());
+                let cast_val = rmpv::Value::String(rmpv::Utf8String::from(text.to_string()));
                 if gen_server::cast_from_runtime(&runtime, pid, cast_val).await.is_err() {
                     break;
                 }
@@ -525,6 +657,37 @@ pub async fn handle_websocket_with_runtime(
     // Kill the GenServer process on disconnect
     runtime.kill(pid);
     send_task.abort();
+}
+
+/// Handle a WebSocket connection via a supervised `ChannelSupervisor`.
+///
+/// The connection GenServer is started as a `Temporary` child of the supervisor,
+/// so crashes are isolated and don't affect other connections.
+pub async fn handle_websocket_supervised(
+    ws: WebSocket,
+    channel_router: Arc<ChannelRouter>,
+    pubsub: PubSub,
+    runtime: Arc<Runtime>,
+    supervisor: &crate::supervisor::ChannelSupervisor,
+) {
+    use crate::supervisor::connection_child_entry;
+    use rebar_core::process::ExitReason;
+
+    let entry = connection_child_entry({
+        let channel_router = Arc::clone(&channel_router);
+        let pubsub = pubsub.clone();
+        let runtime = Arc::clone(&runtime);
+        move || {
+            Box::pin(async move {
+                handle_websocket_with_runtime(ws, channel_router, pubsub, runtime).await;
+                ExitReason::Normal
+            })
+        }
+    });
+
+    if let Err(e) = supervisor.add_connection(entry).await {
+        tracing::warn!("failed to add WebSocket connection to supervisor: {}", e);
+    }
 }
 
 #[cfg(test)]

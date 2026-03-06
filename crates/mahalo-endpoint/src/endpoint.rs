@@ -13,7 +13,8 @@ use rebar_core::runtime::Runtime;
 use rebar_core::supervisor::engine::{ChildEntry, SupervisorHandle, start_supervisor};
 use rebar_core::supervisor::spec::{ChildSpec, RestartStrategy, SupervisorSpec};
 
-use mahalo_channel::socket::{ChannelRouter, handle_websocket_with_runtime};
+use mahalo_channel::socket::{ChannelRouter, handle_websocket_supervised, handle_websocket_with_runtime};
+use mahalo_channel::supervisor::ChannelSupervisor;
 use mahalo_core::conn::Conn;
 use mahalo_core::plug::Plug;
 use mahalo_pubsub::PubSub;
@@ -32,6 +33,7 @@ struct EndpointState {
     runtime: Arc<Runtime>,
     channel_router: Option<Arc<ChannelRouter>>,
     pubsub: Option<PubSub>,
+    channel_supervisor: Option<Arc<ChannelSupervisor>>,
     error_handler: Option<ErrorHandler>,
     after_plugs: Arc<Vec<Box<dyn Plug>>>,
 }
@@ -43,6 +45,7 @@ pub struct MahaloEndpoint {
     runtime: Arc<Runtime>,
     channel_router: Option<Arc<ChannelRouter>>,
     pubsub: Option<PubSub>,
+    channel_supervisor: Option<Arc<ChannelSupervisor>>,
     error_handler: Option<ErrorHandler>,
     after_plugs: Vec<Box<dyn Plug>>,
 }
@@ -55,9 +58,16 @@ impl MahaloEndpoint {
             runtime,
             channel_router: None,
             pubsub: None,
+            channel_supervisor: None,
             error_handler: None,
             after_plugs: Vec::new(),
         }
+    }
+
+    /// Set a ChannelSupervisor for supervised WebSocket connection management.
+    pub fn channel_supervisor(mut self, supervisor: ChannelSupervisor) -> Self {
+        self.channel_supervisor = Some(Arc::new(supervisor));
+        self
     }
 
     /// Set a ChannelRouter for WebSocket support.
@@ -96,6 +106,7 @@ impl MahaloEndpoint {
             runtime: self.runtime,
             channel_router: self.channel_router,
             pubsub: self.pubsub,
+            channel_supervisor: self.channel_supervisor,
             error_handler: self.error_handler,
             after_plugs: Arc::new(self.after_plugs),
         };
@@ -134,6 +145,7 @@ impl MahaloEndpoint {
             runtime: self.runtime,
             channel_router: self.channel_router,
             pubsub: self.pubsub,
+            channel_supervisor: self.channel_supervisor,
             error_handler: self.error_handler,
             after_plugs: Arc::new(self.after_plugs),
         };
@@ -145,9 +157,7 @@ impl MahaloEndpoint {
                 if has_ws {
                     axum_router = axum_router.route("/ws", routing::get(ws_handler));
                 }
-                let axum_router = axum_router
-                    .fallback(fallback_handler)
-                    .with_state(state);
+                let axum_router = axum_router.fallback(fallback_handler).with_state(state);
                 let listener = match tokio::net::TcpListener::bind(addr).await {
                     Ok(l) => l,
                     Err(e) => {
@@ -168,20 +178,38 @@ impl MahaloEndpoint {
         })
     }
 
-    /// Start the endpoint as a supervised process tree with PubSub and HTTP server.
+    /// Start the endpoint as a supervised process tree with PubSub, ChannelSupervisor,
+    /// and HTTP server.
+    ///
+    /// Supervision tree:
+    /// ```text
+    /// MahaloSupervisor (OneForOne)
+    ///   ├── mahalo_pubsub (Permanent)
+    ///   ├── mahalo_channel_supervisor (Permanent)
+    ///   └── mahalo_endpoint (Permanent)
+    /// ```
     pub async fn start_supervised(self) -> SupervisorHandle {
         let runtime = Arc::clone(&self.runtime);
         let spec = SupervisorSpec::new(RestartStrategy::OneForOne);
 
         let mut children = Vec::new();
+        let mut endpoint = self;
 
-        // Add PubSub child if configured
-        if let Some(ref pubsub) = self.pubsub {
-            children.push(PubSub::child_entry(Arc::new(pubsub.clone())));
+        // Replace configured PubSub with a properly supervised instance.
+        if endpoint.pubsub.is_some() {
+            let (pubsub, entry) = PubSub::new_supervised();
+            endpoint.pubsub = Some(pubsub);
+            children.push(entry);
+        }
+
+        // Start a ChannelSupervisor if WebSocket support is configured.
+        if endpoint.channel_router.is_some() && endpoint.channel_supervisor.is_none() {
+            let supervisor = ChannelSupervisor::start(Arc::clone(&runtime)).await;
+            endpoint.channel_supervisor = Some(Arc::new(supervisor));
         }
 
         // Add HTTP server child
-        children.push(self.child_entry());
+        children.push(endpoint.child_entry());
 
         start_supervisor(runtime, spec, children).await
     }
@@ -195,8 +223,17 @@ async fn ws_handler(
     let channel_router = state.channel_router.expect("ws route requires channel_router");
     let pubsub = state.pubsub.expect("ws route requires pubsub");
     let runtime = state.runtime;
-    ws.on_upgrade(move |socket| {
-        handle_websocket_with_runtime(socket, channel_router, pubsub, runtime)
+    let channel_supervisor = state.channel_supervisor;
+    ws.on_upgrade(move |socket| async move {
+        match channel_supervisor {
+            Some(supervisor) => {
+                handle_websocket_supervised(socket, channel_router, pubsub, runtime, &supervisor)
+                    .await
+            }
+            None => {
+                handle_websocket_with_runtime(socket, channel_router, pubsub, runtime).await
+            }
+        }
     })
 }
 
