@@ -1,7 +1,10 @@
 pub mod application;
 pub mod date;
 pub mod endpoint;
+pub mod handler;
 pub mod http_parse;
+pub mod tcp_server;
+
 #[cfg(target_os = "linux")]
 pub mod uring;
 #[cfg(target_os = "linux")]
