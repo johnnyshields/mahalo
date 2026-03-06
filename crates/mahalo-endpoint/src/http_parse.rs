@@ -10,6 +10,7 @@ pub struct ParsedRequest {
     pub conn: Conn,
     pub keep_alive: bool,
     pub bytes_consumed: usize,
+    pub ws_key: Option<String>,
 }
 
 /// Errors that can occur during HTTP request parsing.
@@ -58,6 +59,8 @@ pub fn try_parse_request(
     let mut header_map = HeaderMap::with_capacity(req.headers.len());
     let mut content_length: Option<usize> = None;
     let mut connection_header: Option<&str> = None;
+    let mut upgrade_websocket = false;
+    let mut ws_key: Option<String> = None;
 
     for h in req.headers.iter() {
         let name = http::header::HeaderName::from_bytes(h.name.as_bytes())
@@ -72,6 +75,18 @@ pub fn try_parse_request(
         }
         if h.name.eq_ignore_ascii_case("connection") {
             connection_header = std::str::from_utf8(h.value).ok();
+        }
+        if h.name.eq_ignore_ascii_case("upgrade") {
+            if let Ok(v) = std::str::from_utf8(h.value) {
+                if v.eq_ignore_ascii_case("websocket") {
+                    upgrade_websocket = true;
+                }
+            }
+        }
+        if h.name.eq_ignore_ascii_case("sec-websocket-key") {
+            if let Ok(v) = std::str::from_utf8(h.value) {
+                ws_key = Some(v.trim().to_string());
+            }
         }
 
         header_map.append(name, value);
@@ -119,6 +134,7 @@ pub fn try_parse_request(
         conn,
         keep_alive,
         bytes_consumed: total,
+        ws_key: if upgrade_websocket { ws_key } else { None },
     }))
 }
 
@@ -239,6 +255,28 @@ pub fn serialize_response_into(conn: &Conn, keep_alive: bool, buf: &mut Vec<u8>)
     buf.extend_from_slice(body);
 }
 
+
+/// Serialize a WebSocket upgrade response (HTTP 101 Switching Protocols).
+///
+/// Computes the `Sec-WebSocket-Accept` value per RFC 6455 §4.2.2:
+/// Base64(SHA-1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+pub fn serialize_ws_accept_response(ws_key: &str, buf: &mut Vec<u8>) {
+    use sha1::{Sha1, Digest};
+    use base64::Engine;
+
+    let mut hasher = Sha1::new();
+    hasher.update(ws_key.as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let hash = hasher.finalize();
+    let accept = base64::engine::general_purpose::STANDARD.encode(hash);
+
+    buf.extend_from_slice(b"HTTP/1.1 101 Switching Protocols\r\n");
+    buf.extend_from_slice(b"Upgrade: websocket\r\n");
+    buf.extend_from_slice(b"Connection: Upgrade\r\n");
+    buf.extend_from_slice(b"Sec-WebSocket-Accept: ");
+    buf.extend_from_slice(accept.as_bytes());
+    buf.extend_from_slice(b"\r\n\r\n");
+}
 
 #[cfg(test)]
 mod tests {
@@ -421,5 +459,31 @@ mod tests {
         let r503 = std::str::from_utf8(RESPONSE_503).unwrap();
         assert!(r503.starts_with("HTTP/1.1 503"));
         assert!(r503.ends_with("Service Unavailable"));
+    }
+
+    #[test]
+    fn parse_websocket_upgrade_request() {
+        let raw = b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        let result = try_parse_request(raw, 1024, addr()).unwrap().unwrap();
+        assert_eq!(result.ws_key, Some("dGhlIHNhbXBsZSBub25jZQ==".to_string()));
+    }
+
+    #[test]
+    fn parse_normal_request_no_ws_key() {
+        let raw = b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let result = try_parse_request(raw, 1024, addr()).unwrap().unwrap();
+        assert_eq!(result.ws_key, None);
+    }
+
+    #[test]
+    fn ws_accept_response_rfc6455_vector() {
+        // RFC 6455 §4.2.2 example: key "dGhlIHNhbXBsZSBub25jZQ==" → accept "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        let mut buf = Vec::new();
+        serialize_ws_accept_response("dGhlIHNhbXBsZSBub25jZQ==", &mut buf);
+        let response = String::from_utf8(buf).unwrap();
+        assert!(response.contains("101 Switching Protocols"));
+        assert!(response.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+        assert!(response.contains("Upgrade: websocket"));
+        assert!(response.contains("Connection: Upgrade"));
     }
 }

@@ -8,6 +8,9 @@ use mahalo_router::MahaloRouter;
 use rebar_core::runtime::Runtime;
 use socket2::{Domain, Protocol, Socket, Type};
 
+use mahalo_channel::socket::ChannelRouter;
+use mahalo_pubsub::PubSub;
+
 use crate::endpoint::ErrorHandler;
 use crate::uring::{BufferPool, ConnectionPool, run_event_loop};
 
@@ -23,6 +26,8 @@ pub fn start_uring_server(
     after_plugs: Arc<Vec<Box<dyn Plug>>>,
     runtime: Arc<Runtime>,
     body_limit: usize,
+    channel_router: Option<Arc<ChannelRouter>>,
+    pubsub: Option<PubSub>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -37,6 +42,8 @@ pub fn start_uring_server(
         let error_handler = Arc::clone(&error_handler);
         let after_plugs = Arc::clone(&after_plugs);
         let runtime = Arc::clone(&runtime);
+        let channel_router = channel_router.clone();
+        let pubsub = pubsub.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("uring-worker-{i}"))
@@ -99,6 +106,8 @@ pub fn start_uring_server(
                     .build()?;
 
                 let error_handler_ref: &Option<ErrorHandler> = &*error_handler;
+                let cr_ref = channel_router.as_ref();
+                let ps_ref = pubsub.as_ref();
 
                 // Run the event loop (blocks forever).
                 run_event_loop(
@@ -112,6 +121,8 @@ pub fn start_uring_server(
                     &runtime,
                     body_limit,
                     &tokio_rt,
+                    cr_ref,
+                    ps_ref,
                 );
 
                 // Keep socket alive so the fd isn't closed during the event loop.

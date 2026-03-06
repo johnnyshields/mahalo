@@ -68,8 +68,11 @@ impl MahaloApplication {
             None
         };
 
-        // 3. HTTP Endpoint (Permanent)
-        let endpoint = MahaloEndpoint::new(self.router, self.addr, Arc::clone(&runtime));
+        // 3. HTTP Endpoint (Permanent) — with optional WebSocket support
+        let mut endpoint = MahaloEndpoint::new(self.router, self.addr, Arc::clone(&runtime));
+        if let Some(cr) = self.channel_router {
+            endpoint = endpoint.channels(cr, pubsub.clone());
+        }
         children.push(endpoint.child_entry());
 
         let handle = start_supervisor(runtime, spec, children).await;

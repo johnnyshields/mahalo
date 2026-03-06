@@ -2,6 +2,7 @@ pub mod application;
 pub mod endpoint;
 pub mod handler;
 pub mod http_parse;
+pub mod ws_parse;
 
 #[cfg(target_os = "linux")]
 pub mod uring;

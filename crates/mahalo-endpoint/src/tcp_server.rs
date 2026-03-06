@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use mahalo_channel::socket::ChannelRouter;
 use mahalo_core::plug::Plug;
+use mahalo_pubsub::PubSub;
 use mahalo_router::MahaloRouter;
 use rebar_core::runtime::Runtime;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -24,6 +26,8 @@ pub fn start_tcp_server(
     after_plugs: Arc<Vec<Box<dyn Plug>>>,
     runtime: Arc<Runtime>,
     body_limit: usize,
+    channel_router: Option<Arc<ChannelRouter>>,
+    pubsub: Option<PubSub>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -48,6 +52,8 @@ pub fn start_tcp_server(
         let error_handler = Arc::clone(&error_handler);
         let after_plugs = Arc::clone(&after_plugs);
         let runtime = Arc::clone(&runtime);
+        let channel_router = channel_router.clone();
+        let pubsub = pubsub.clone();
 
         #[cfg(target_os = "windows")]
         let shared_listener = shared_listener.clone();
@@ -93,6 +99,8 @@ pub fn start_tcp_server(
                         let error_handler = Arc::clone(&error_handler);
                         let after_plugs = Arc::clone(&after_plugs);
                         let runtime = Arc::clone(&runtime);
+                        let channel_router = channel_router.clone();
+                        let pubsub = pubsub.clone();
 
                         tokio::spawn(async move {
                             handle_connection(
@@ -103,6 +111,8 @@ pub fn start_tcp_server(
                                 &after_plugs,
                                 &runtime,
                                 body_limit,
+                                channel_router.as_ref(),
+                                pubsub.as_ref(),
                             )
                             .await;
                         });
@@ -148,7 +158,7 @@ fn bind_socket(
     Ok(socket)
 }
 
-/// Handle a single TCP connection, supporting keep-alive.
+/// Handle a single TCP connection, supporting keep-alive and WebSocket upgrade.
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
@@ -157,6 +167,8 @@ async fn handle_connection(
     after_plugs: &[Box<dyn Plug>],
     runtime: &Arc<Runtime>,
     body_limit: usize,
+    channel_router: Option<&Arc<ChannelRouter>>,
+    pubsub: Option<&PubSub>,
 ) {
     let mut buf = vec![0u8; 8192];
     let mut filled = 0;
@@ -173,6 +185,22 @@ async fn handle_connection(
         loop {
             match http_parse::try_parse_request(&buf[..filled], body_limit, peer_addr) {
                 Ok(Some(parsed)) => {
+                    // Check for WebSocket upgrade.
+                    if let (Some(ws_key), Some(cr), Some(ps)) =
+                        (parsed.ws_key, channel_router, pubsub)
+                    {
+                        // Write the 101 response manually.
+                        let mut resp_buf = Vec::new();
+                        http_parse::serialize_ws_accept_response(&ws_key, &mut resp_buf);
+                        if stream.write_all(&resp_buf).await.is_err() {
+                            return;
+                        }
+
+                        // Upgrade the raw TCP stream to a WebSocket using tokio-tungstenite.
+                        handle_ws_upgraded(stream, cr, ps, runtime).await;
+                        return;
+                    }
+
                     let keep_alive = parsed.keep_alive;
                     let bytes_consumed = parsed.bytes_consumed;
 
@@ -226,6 +254,70 @@ async fn handle_connection(
             }
         }
     }
+}
+
+/// Handle an upgraded WebSocket connection on the tokio TCP path.
+///
+/// Uses tokio-tungstenite to wrap the raw TcpStream, then bridges to
+/// the mahalo-channel GenServer via the same mpsc-based ChannelSocket.
+async fn handle_ws_upgraded(
+    stream: tokio::net::TcpStream,
+    channel_router: &Arc<ChannelRouter>,
+    pubsub: &PubSub,
+    runtime: &Arc<Runtime>,
+) {
+    use futures::{SinkExt, StreamExt};
+    use rebar_core::gen_server;
+    use tokio::sync::mpsc;
+    use tokio_tungstenite::WebSocketStream;
+    use tungstenite::protocol::Role;
+
+    let ws_stream = WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<mahalo_channel::WsSendItem>();
+
+    // Start GenServer for this connection
+    let server = mahalo_channel::ChannelConnectionServer::new(
+        Arc::clone(channel_router),
+        pubsub.clone(),
+        tx,
+        Arc::clone(runtime),
+    );
+    let pid = gen_server::start(runtime, server, rmpv::Value::Nil).await;
+
+    // Spawn forwarder: mpsc String → tungstenite Text frame
+    let send_task = tokio::spawn(async move {
+        while let Some(json) = rx.recv().await {
+            if ws_sender
+                .send(tungstenite::Message::Text(json.into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Read loop: tungstenite → GenServer cast
+    while let Some(Ok(msg)) = ws_receiver.next().await {
+        match msg {
+            tungstenite::Message::Text(ref text) => {
+                let cast_val = rmpv::Value::String(rmpv::Utf8String::from(text.to_string()));
+                if gen_server::cast_from_runtime(runtime, pid, cast_val)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            tungstenite::Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    runtime.kill(pid);
+    send_task.abort();
 }
 
 #[cfg(test)]

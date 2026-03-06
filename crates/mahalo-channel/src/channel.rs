@@ -188,15 +188,10 @@ mod tests {
         let ch = MinimalChannel;
         ch.handle_info(&msg, &mut socket).await.unwrap();
 
-        let ws_msg = rx.try_recv().expect("should have received a message");
-        match ws_msg {
-            axum::extract::ws::Message::Text(text) => {
-                let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(parsed["event"], "greeting");
-                assert_eq!(parsed["payload"]["hello"], "world");
-            }
-            other => panic!("expected Text, got {:?}", other),
-        }
+        let json = rx.try_recv().expect("should have received a message");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "greeting");
+        assert_eq!(parsed["payload"]["hello"], "world");
 
         pubsub.shutdown();
     }

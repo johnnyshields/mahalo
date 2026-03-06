@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+/// The type carried over the internal channel from ChannelSocket → WebSocket sink.
+/// Decoupled from any specific WebSocket library (axum, tungstenite, etc.).
+pub type WsSendItem = String;
+
 use async_trait::async_trait;
 use rebar_core::gen_server::{self, CastReply, CallReply, GenServer, GenServerContext, InfoReply, From as GsFrom};
 use rebar_core::process::ProcessId;
@@ -72,7 +76,7 @@ const TIMER_SEP: char = '\0';
 pub struct ChannelSocket {
     pub topic: String,
     assigns: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
-    sender: mpsc::UnboundedSender<WsMessage>,
+    sender: mpsc::UnboundedSender<WsSendItem>,
     pubsub: PubSub,
     /// Set when running inside a GenServer process — enables timer scheduling.
     self_pid: Option<ProcessId>,
@@ -80,7 +84,7 @@ pub struct ChannelSocket {
 }
 
 impl ChannelSocket {
-    pub fn new(topic: String, sender: mpsc::UnboundedSender<WsMessage>, pubsub: PubSub) -> Self {
+    pub fn new(topic: String, sender: mpsc::UnboundedSender<WsSendItem>, pubsub: PubSub) -> Self {
         Self {
             topic,
             assigns: HashMap::new(),
@@ -94,7 +98,7 @@ impl ChannelSocket {
     /// Create a ChannelSocket with GenServer context for timer scheduling.
     pub fn new_with_pid(
         topic: String,
-        sender: mpsc::UnboundedSender<WsMessage>,
+        sender: mpsc::UnboundedSender<WsSendItem>,
         pubsub: PubSub,
         self_pid: ProcessId,
         runtime: Arc<Runtime>,
@@ -169,7 +173,7 @@ impl ChannelSocket {
             msg_ref: None,
         };
         if let Ok(json) = serde_json::to_string(&msg)
-            && self.sender.send(WsMessage::Text(json.into())).is_err()
+            && self.sender.send(json).is_err()
         {
             tracing::warn!(topic = %self.topic, event = %event, "push failed, client disconnected");
         }
@@ -192,7 +196,7 @@ impl ChannelSocket {
             msg_ref: Some(msg_ref.to_string()),
         };
         if let Ok(json) = serde_json::to_string(&msg)
-            && self.sender.send(WsMessage::Text(json.into())).is_err()
+            && self.sender.send(json).is_err()
         {
             tracing::warn!(topic = %self.topic, msg_ref = %msg_ref, "reply failed, client disconnected");
         }
@@ -256,7 +260,7 @@ fn topic_matches(pattern: &str, topic: &str) -> bool {
 async fn handle_join(
     phoenix_msg: &PhoenixMessage,
     channel: &Arc<dyn Channel>,
-    tx: &mpsc::UnboundedSender<WsMessage>,
+    tx: &mpsc::UnboundedSender<WsSendItem>,
     pubsub: &PubSub,
     joined_channels: &mut HashMap<String, (Arc<dyn Channel>, ChannelSocket)>,
     self_pid: ProcessId,
@@ -329,7 +333,7 @@ async fn handle_leave(
 }
 
 /// Handle a heartbeat event: reply with an ok status.
-fn handle_heartbeat(phoenix_msg: &PhoenixMessage, tx: &mpsc::UnboundedSender<WsMessage>) {
+fn handle_heartbeat(phoenix_msg: &PhoenixMessage, tx: &mpsc::UnboundedSender<WsSendItem>) {
     let reply_msg = PhoenixMessage {
         topic: "phoenix".to_string(),
         event: PHX_REPLY.to_string(),
@@ -337,7 +341,7 @@ fn handle_heartbeat(phoenix_msg: &PhoenixMessage, tx: &mpsc::UnboundedSender<WsM
         msg_ref: phoenix_msg.msg_ref.clone(),
     };
     if let Ok(json) = serde_json::to_string(&reply_msg)
-        && tx.send(WsMessage::Text(json.into())).is_err()
+        && tx.send(json).is_err()
     {
         tracing::warn!("failed to send heartbeat reply, client disconnected");
     }
@@ -369,17 +373,18 @@ async fn dispatch_event(
     }
 }
 
-/// Spawn a task that forwards messages from an unbounded channel to a WebSocket sink.
+/// Spawn a task that forwards JSON strings from an unbounded channel to a WebSocket sink.
+/// Wraps each `String` as `WsMessage::Text` before sending.
 /// Returns a JoinHandle that can be aborted on disconnect.
 fn spawn_ws_forwarder(
     ws_sender: futures::stream::SplitSink<WebSocket, WsMessage>,
-    rx: mpsc::UnboundedReceiver<WsMessage>,
+    rx: mpsc::UnboundedReceiver<WsSendItem>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ws_sender = ws_sender;
         let mut rx = rx;
-        while let Some(msg) = rx.recv().await {
-            if ws_sender.send(msg).await.is_err() {
+        while let Some(json) = rx.recv().await {
+            if ws_sender.send(WsMessage::Text(json.into())).await.is_err() {
                 break;
             }
         }
@@ -390,14 +395,36 @@ fn spawn_ws_forwarder(
 // GenServer-based WebSocket connection
 // ---------------------------------------------------------------------------
 
-struct ChannelConnectionServer {
+/// GenServer implementation for a single WebSocket channel connection.
+///
+/// Public so that alternative transports (e.g. io_uring raw TCP) can start
+/// the same GenServer without going through the axum WebSocket path.
+pub struct ChannelConnectionServer {
     channel_router: Arc<ChannelRouter>,
     pubsub: PubSub,
-    ws_tx: mpsc::UnboundedSender<WsMessage>,
+    ws_tx: mpsc::UnboundedSender<WsSendItem>,
     runtime: Arc<Runtime>,
 }
 
-struct ChannelConnectionState {
+impl ChannelConnectionServer {
+    /// Create a new ChannelConnectionServer.
+    pub fn new(
+        channel_router: Arc<ChannelRouter>,
+        pubsub: PubSub,
+        ws_tx: mpsc::UnboundedSender<WsSendItem>,
+        runtime: Arc<Runtime>,
+    ) -> Self {
+        Self {
+            channel_router,
+            pubsub,
+            ws_tx,
+            runtime,
+        }
+    }
+}
+
+/// Internal state for the ChannelConnectionServer GenServer.
+pub struct ChannelConnectionState {
     joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)>,
     self_pid: rebar_core::process::ProcessId,
     runtime: Arc<Runtime>,
@@ -523,7 +550,7 @@ pub async fn handle_websocket(
     runtime: Arc<Runtime>,
 ) {
     let (ws_sender, mut ws_receiver) = ws.split();
-    let (tx, rx) = mpsc::unbounded_channel::<WsMessage>();
+    let (tx, rx) = mpsc::unbounded_channel::<WsSendItem>();
 
     let send_task = spawn_ws_forwarder(ws_sender, rx);
 
@@ -591,16 +618,13 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
 
-    /// Parse a WsMessage as JSON, panicking on non-Text variants.
-    fn parse_ws_json(msg: WsMessage) -> Value {
-        match msg {
-            WsMessage::Text(text) => serde_json::from_str(&text).unwrap(),
-            other => panic!("expected Text, got {:?}", other),
-        }
+    /// Parse a JSON string, panicking on invalid JSON.
+    fn parse_ws_json(msg: WsSendItem) -> Value {
+        serde_json::from_str(&msg).unwrap()
     }
 
     /// Create a ChannelSocket with a fresh PubSub and unbounded channel.
-    fn test_socket(topic: &str) -> (ChannelSocket, mpsc::UnboundedReceiver<WsMessage>, PubSub) {
+    fn test_socket(topic: &str) -> (ChannelSocket, mpsc::UnboundedReceiver<WsSendItem>, PubSub) {
         let pubsub = PubSub::start();
         let (tx, rx) = mpsc::unbounded_channel();
         let socket = ChannelSocket::new(topic.into(), tx, pubsub.clone());
@@ -612,8 +636,8 @@ mod tests {
         topic: &str,
     ) -> (
         ChannelSocket,
-        mpsc::UnboundedSender<WsMessage>,
-        mpsc::UnboundedReceiver<WsMessage>,
+        mpsc::UnboundedSender<WsSendItem>,
+        mpsc::UnboundedReceiver<WsSendItem>,
         PubSub,
     ) {
         let pubsub = PubSub::start();

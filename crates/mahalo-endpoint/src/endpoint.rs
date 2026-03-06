@@ -7,8 +7,10 @@ use rebar_core::runtime::Runtime;
 use rebar_core::supervisor::engine::{ChildEntry, SupervisorHandle, start_supervisor};
 use rebar_core::supervisor::spec::{ChildSpec, RestartStrategy, SupervisorSpec};
 
+use mahalo_channel::socket::ChannelRouter;
 use mahalo_core::conn::Conn;
 use mahalo_core::plug::Plug;
+use mahalo_pubsub::PubSub;
 use mahalo_router::MahaloRouter;
 
 /// A custom error handler that receives a status code and a Conn, and returns a modified Conn.
@@ -27,6 +29,8 @@ pub struct MahaloEndpoint {
     runtime: Arc<Runtime>,
     error_handler: Option<ErrorHandler>,
     after_plugs: Vec<Box<dyn Plug>>,
+    channel_router: Option<Arc<ChannelRouter>>,
+    pubsub: Option<PubSub>,
 }
 
 impl MahaloEndpoint {
@@ -37,6 +41,8 @@ impl MahaloEndpoint {
             runtime,
             error_handler: None,
             after_plugs: Vec::new(),
+            channel_router: None,
+            pubsub: None,
         }
     }
 
@@ -46,6 +52,13 @@ impl MahaloEndpoint {
         handler: impl Fn(StatusCode, Conn) -> Conn + Send + Sync + 'static,
     ) -> Self {
         self.error_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Configure WebSocket channel support.
+    pub fn channels(mut self, channel_router: ChannelRouter, pubsub: PubSub) -> Self {
+        self.channel_router = Some(Arc::new(channel_router));
+        self.pubsub = Some(pubsub);
         self
     }
 
@@ -71,6 +84,8 @@ impl MahaloEndpoint {
                 Arc::new(self.after_plugs),
                 self.runtime,
                 DEFAULT_BODY_LIMIT,
+                self.channel_router,
+                self.pubsub,
             )
         }
 
@@ -83,6 +98,8 @@ impl MahaloEndpoint {
                 Arc::new(self.after_plugs),
                 self.runtime,
                 DEFAULT_BODY_LIMIT,
+                self.channel_router,
+                self.pubsub,
             )
         }
     }
@@ -95,12 +112,16 @@ impl MahaloEndpoint {
         let runtime = self.runtime;
         let error_handler = self.error_handler;
         let after_plugs = Arc::new(self.after_plugs);
+        let channel_router = self.channel_router;
+        let pubsub = self.pubsub;
 
         ChildEntry::new(spec, move || {
             let router = Arc::clone(&router);
             let runtime = Arc::clone(&runtime);
             let error_handler = error_handler.clone();
             let after_plugs = Arc::clone(&after_plugs);
+            let channel_router = channel_router.clone();
+            let pubsub = pubsub.clone();
             async move {
                 tracing::info!("Mahalo endpoint listening on {}", addr);
 
@@ -112,6 +133,8 @@ impl MahaloEndpoint {
                     after_plugs,
                     runtime,
                     DEFAULT_BODY_LIMIT,
+                    channel_router,
+                    pubsub,
                 );
 
                 #[cfg(not(target_os = "linux"))]
@@ -122,6 +145,8 @@ impl MahaloEndpoint {
                     after_plugs,
                     runtime,
                     DEFAULT_BODY_LIMIT,
+                    channel_router,
+                    pubsub,
                 );
 
                 match result {

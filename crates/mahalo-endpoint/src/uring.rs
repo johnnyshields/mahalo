@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
@@ -7,10 +8,17 @@ use mahalo_core::conn::Conn;
 use mahalo_core::plug::Plug;
 use mahalo_router::MahaloRouter;
 use nix::libc;
+use rebar_core::gen_server;
+use rebar_core::process::ProcessId;
 use rebar_core::runtime::Runtime;
+use tokio::sync::mpsc;
+
+use mahalo_channel::socket::{ChannelRouter, WsSendItem};
+use mahalo_pubsub::PubSub;
 
 use crate::endpoint::ErrorHandler;
 use crate::http_parse::{self, ParseError};
+use crate::ws_parse;
 
 /// Default peer address used when the actual peer address isn't captured.
 fn default_peer_addr() -> SocketAddr {
@@ -61,6 +69,9 @@ const STATE_ACCEPTING: u8 = 0;
 const STATE_READING: u8 = 1;
 const STATE_WRITING: u8 = 2;
 const STATE_CLOSING: u8 = 3;
+const STATE_WS_UPGRADING: u8 = 4;
+const STATE_WS_READING: u8 = 5;
+const STATE_WS_WRITING: u8 = 6;
 
 // ---------------------------------------------------------------------------
 // ConnSlot
@@ -74,6 +85,24 @@ pub(crate) struct ConnSlot {
     pub write_buf: Vec<u8>,
     pub write_offset: usize,
     pub keep_alive: bool,
+    /// WebSocket state, set after HTTP upgrade completes.
+    pub ws: Option<Box<WsState>>,
+}
+
+/// Per-connection WebSocket state.
+pub(crate) struct WsState {
+    /// GenServer process for this connection.
+    gen_pid: ProcessId,
+    /// Receiver for outbound JSON strings (from ChannelSocket to WS frame serialization).
+    ws_rx: mpsc::UnboundedReceiver<WsSendItem>,
+    /// Buffered read data that's accumulated across reads (dynamically grown).
+    read_buf: Vec<u8>,
+    /// Serialized WS frames queued for writing.
+    outbox: VecDeque<Vec<u8>>,
+    /// Whether a write SQE is currently in-flight.
+    writing: bool,
+    /// Whether the connection is shutting down (close frame sent).
+    closing: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +282,45 @@ fn submit_close(ring: &mut IoUring, fd: RawFd, slot_idx: u32, generation: u32) {
     }
 }
 
+#[inline]
+fn submit_ws_read(
+    ring: &mut IoUring,
+    fd: RawFd,
+    buf_ptr: *mut u8,
+    len: u32,
+    offset: usize,
+    slot_idx: u32,
+    generation: u32,
+) {
+    let entry = opcode::Read::new(
+        types::Fd(fd),
+        buf_ptr.wrapping_add(offset),
+        len.saturating_sub(offset as u32),
+    )
+    .build()
+    .user_data(encode_user_data(STATE_WS_READING, slot_idx, generation));
+    unsafe {
+        ring.submission().push(&entry).ok();
+    }
+}
+
+#[inline]
+fn submit_ws_write(
+    ring: &mut IoUring,
+    fd: RawFd,
+    buf_ptr: *const u8,
+    len: u32,
+    slot_idx: u32,
+    generation: u32,
+) {
+    let entry = opcode::Write::new(types::Fd(fd), buf_ptr, len)
+        .build()
+        .user_data(encode_user_data(STATE_WS_WRITING, slot_idx, generation));
+    unsafe {
+        ring.submission().push(&entry).ok();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // write_static_error – queue a canned error response and close
 // ---------------------------------------------------------------------------
@@ -291,6 +359,13 @@ struct PendingRequest {
     keep_alive: bool,
 }
 
+/// A WebSocket message to dispatch through the channel GenServer.
+struct WsPendingDispatch {
+    slot_idx: u32,
+    generation: u32,
+    text: String,
+}
+
 /// Synchronously write a 503 response and close the fd, then re-arm accept.
 /// Used when the server is out of connection or buffer slots.
 #[inline]
@@ -321,6 +396,8 @@ pub(crate) fn run_event_loop(
     runtime: &Arc<Runtime>,
     body_limit: usize,
     tokio_rt: &tokio::runtime::Runtime,
+    channel_router: Option<&Arc<ChannelRouter>>,
+    pubsub: Option<&PubSub>,
 ) {
     let peer_addr = default_peer_addr();
     submit_accept(ring, listen_fd);
@@ -330,6 +407,9 @@ pub(crate) fn run_event_loop(
     let mut pending_conns: Vec<Conn> = Vec::with_capacity(64);
     let mut results: Vec<Conn> = Vec::with_capacity(64);
     let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::with_capacity(256);
+    let mut ws_dispatches: Vec<WsPendingDispatch> = Vec::with_capacity(64);
+    // Track slots that have active WS connections for outbox polling.
+    let mut ws_active_slots: Vec<(u32, u32)> = Vec::with_capacity(256); // (slot_idx, generation)
 
     loop {
         if let Err(e) = ring.submit_and_wait(1) {
@@ -339,6 +419,7 @@ pub(crate) fn run_event_loop(
 
         pending_meta.clear();
         pending_conns.clear();
+        ws_dispatches.clear();
 
         // Drain CQEs into reusable vec (avoids allocation after first iteration).
         cqes.clear();
@@ -389,6 +470,7 @@ pub(crate) fn run_event_loop(
                             write_buf: Vec::with_capacity(256),
                             write_offset: 0,
                             keep_alive: true,
+                            ws: None,
                         },
                     );
 
@@ -428,15 +510,38 @@ pub(crate) fn run_event_loop(
 
                     match http_parse::try_parse_request(buf, body_limit, peer_addr) {
                         Ok(Some(parsed)) => {
-                            // Defer execution — collect for batched block_on.
-                            let conn = parsed.conn.with_runtime(Arc::clone(runtime));
-                            pending_meta.push(PendingRequest {
-                                slot_idx,
-                                generation,
-                                fd,
-                                keep_alive: parsed.keep_alive,
-                            });
-                            pending_conns.push(conn);
+                            // Check for WebSocket upgrade
+                            if let (Some(ws_key), Some(_cr), Some(_ps)) =
+                                (parsed.ws_key, channel_router, pubsub)
+                            {
+                                // WebSocket upgrade: serialize 101 response into write_buf
+                                let slot = conn_pool.get_mut(slot_idx).unwrap();
+                                buf_pool.free(slot.read_buf_idx);
+                                slot.write_buf.clear();
+                                http_parse::serialize_ws_accept_response(&ws_key, &mut slot.write_buf);
+                                slot.write_offset = 0;
+                                slot.keep_alive = false; // not used for WS
+
+                                let ptr = slot.write_buf.as_ptr();
+                                let len = slot.write_buf.len() as u32;
+                                // Write the 101 response, then transition to WS
+                                let entry = opcode::Write::new(types::Fd(fd), ptr, len)
+                                    .build()
+                                    .user_data(encode_user_data(STATE_WS_UPGRADING, slot_idx, generation));
+                                unsafe {
+                                    ring.submission().push(&entry).ok();
+                                }
+                            } else {
+                                // Normal HTTP request — defer for batched execution.
+                                let conn = parsed.conn.with_runtime(Arc::clone(runtime));
+                                pending_meta.push(PendingRequest {
+                                    slot_idx,
+                                    generation,
+                                    fd,
+                                    keep_alive: parsed.keep_alive,
+                                });
+                                pending_conns.push(conn);
+                            }
                         }
                         Ok(None) => {
                             if read_len >= chunk_size {
@@ -464,6 +569,199 @@ pub(crate) fn run_event_loop(
                                 slot_idx, generation, conn_pool, buf_pool,
                             );
                         }
+                    }
+                }
+
+                STATE_WS_UPGRADING => {
+                    // 101 response has been written. Initialize WS state.
+                    let slot_gen = conn_pool.get(slot_idx).map(|s| s.generation);
+                    if slot_gen != Some(generation & 0x00FF_FFFF) {
+                        continue;
+                    }
+
+                    if result <= 0 {
+                        if let Some(slot) = conn_pool.get(slot_idx) {
+                            let fd = slot.fd;
+                            submit_close(ring, fd, slot_idx, generation);
+                        }
+                        continue;
+                    }
+
+                    let slot = match conn_pool.get_mut(slot_idx) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    slot.write_offset += result as usize;
+
+                    // Partial write of 101 — continue writing.
+                    if slot.write_offset < slot.write_buf.len() {
+                        let fd = slot.fd;
+                        let ptr = unsafe { slot.write_buf.as_ptr().add(slot.write_offset) };
+                        let remaining = (slot.write_buf.len() - slot.write_offset) as u32;
+                        let entry = opcode::Write::new(types::Fd(fd), ptr, remaining)
+                            .build()
+                            .user_data(encode_user_data(STATE_WS_UPGRADING, slot_idx, generation));
+                        unsafe {
+                            ring.submission().push(&entry).ok();
+                        }
+                        continue;
+                    }
+
+                    // 101 fully written. Initialize WS state.
+                    let cr = channel_router.unwrap();
+                    let ps = pubsub.unwrap();
+                    let (tx, rx) = mpsc::unbounded_channel::<WsSendItem>();
+
+                    // Start GenServer for this connection
+                    let gen_pid = tokio_rt.block_on(async {
+                        let server = mahalo_channel::socket::ChannelConnectionServer::new(
+                            Arc::clone(cr),
+                            ps.clone(),
+                            tx.clone(),
+                            Arc::clone(runtime),
+                        );
+                        gen_server::start(runtime, server, rmpv::Value::Nil).await
+                    });
+
+                    slot.ws = Some(Box::new(WsState {
+                        gen_pid,
+                        ws_rx: rx,
+                        read_buf: Vec::with_capacity(8192),
+                        outbox: VecDeque::new(),
+                        writing: false,
+                        closing: false,
+                    }));
+
+                    // Re-use the read buffer for WS reads. Allocate a new one from the pool.
+                    let new_buf_idx = match buf_pool.alloc() {
+                        Some(idx) => idx,
+                        None => {
+                            // No buffer available — close the connection.
+                            let fd = slot.fd;
+                            runtime.kill(gen_pid);
+                            submit_close(ring, fd, slot_idx, generation);
+                            continue;
+                        }
+                    };
+                    slot.read_buf_idx = new_buf_idx;
+                    slot.read_len = 0;
+
+                    let fd = slot.fd;
+                    let buf_ptr = buf_pool.slice_mut(new_buf_idx).as_mut_ptr();
+                    let chunk_len = buf_pool.chunk_size() as u32;
+                    submit_ws_read(ring, fd, buf_ptr, chunk_len, 0, slot_idx, generation);
+
+                    ws_active_slots.push((slot_idx, generation));
+                }
+
+                STATE_WS_READING => {
+                    let slot_gen = conn_pool.get(slot_idx).map(|s| s.generation);
+                    if slot_gen != Some(generation & 0x00FF_FFFF) {
+                        continue;
+                    }
+
+                    if result <= 0 {
+                        // Client disconnected. Kill GenServer and close.
+                        if let Some(slot) = conn_pool.get_mut(slot_idx) {
+                            if let Some(ws) = slot.ws.take() {
+                                runtime.kill(ws.gen_pid);
+                            }
+                            let fd = slot.fd;
+                            buf_pool.free(slot.read_buf_idx);
+                            submit_close(ring, fd, slot_idx, generation);
+                        }
+                        continue;
+                    }
+
+                    let n = result as usize;
+                    let slot = match conn_pool.get_mut(slot_idx) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let fd = slot.fd;
+
+                    // Append new data to WS read buffer.
+                    let ws = slot.ws.as_mut().unwrap();
+                    let buf_idx = slot.read_buf_idx;
+                    let new_data = &buf_pool.slice(buf_idx)[..n];
+                    ws.read_buf.extend_from_slice(new_data);
+
+                    // Parse all complete frames.
+                    loop {
+                        match ws_parse::try_parse_frame(&ws.read_buf) {
+                            Ok(Some((frame, consumed))) => {
+                                match frame.opcode {
+                                    ws_parse::OPCODE_TEXT => {
+                                        if let Ok(text) = String::from_utf8(frame.payload) {
+                                            ws_dispatches.push(WsPendingDispatch {
+                                                slot_idx,
+                                                generation,
+                                                text,
+                                            });
+                                        }
+                                    }
+                                    ws_parse::OPCODE_BINARY => {
+                                        // Treat binary as text for Phoenix compat.
+                                        if let Ok(text) = String::from_utf8(frame.payload) {
+                                            ws_dispatches.push(WsPendingDispatch {
+                                                slot_idx,
+                                                generation,
+                                                text,
+                                            });
+                                        }
+                                    }
+                                    ws_parse::OPCODE_PING => {
+                                        // Reply with pong (same payload).
+                                        let mut pong_buf = Vec::new();
+                                        ws_parse::serialize_frame(ws_parse::OPCODE_PONG, &frame.payload, &mut pong_buf);
+                                        ws.outbox.push_back(pong_buf);
+                                    }
+                                    ws_parse::OPCODE_PONG => {
+                                        // Ignore unsolicited pongs.
+                                    }
+                                    ws_parse::OPCODE_CLOSE => {
+                                        if !ws.closing {
+                                            ws.closing = true;
+                                            // Echo close frame back.
+                                            let code = if frame.payload.len() >= 2 {
+                                                u16::from_be_bytes([frame.payload[0], frame.payload[1]])
+                                            } else {
+                                                1000
+                                            };
+                                            let reason = if frame.payload.len() > 2 {
+                                                &frame.payload[2..]
+                                            } else {
+                                                b""
+                                            };
+                                            let mut close_buf = Vec::new();
+                                            ws_parse::serialize_close_frame(code, reason, &mut close_buf);
+                                            ws.outbox.push_back(close_buf);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                // Remove consumed bytes from read_buf.
+                                ws.read_buf.drain(..consumed);
+                            }
+                            Ok(None) => break, // Need more data.
+                            Err(_) => {
+                                // Protocol error — close connection.
+                                ws.closing = true;
+                                let mut close_buf = Vec::new();
+                                ws_parse::serialize_close_frame(1002, b"protocol error", &mut close_buf);
+                                ws.outbox.push_back(close_buf);
+                                break;
+                            }
+                        }
+                    }
+
+                    // Re-arm the read if not closing.
+                    let ws = slot.ws.as_ref().unwrap();
+                    if !ws.closing || !ws.outbox.is_empty() {
+                        // Continue reading.
+                        let buf_ptr = buf_pool.slice_mut(buf_idx).as_mut_ptr();
+                        let chunk_len = buf_pool.chunk_size() as u32;
+                        submit_ws_read(ring, fd, buf_ptr, chunk_len, 0, slot_idx, generation);
                     }
                 }
 
@@ -508,7 +806,57 @@ pub(crate) fn run_event_loop(
                     }
                 }
 
+                STATE_WS_WRITING => {
+                    let slot_gen = conn_pool.get(slot_idx).map(|s| s.generation);
+                    if slot_gen != Some(generation & 0x00FF_FFFF) {
+                        continue;
+                    }
+
+                    if result <= 0 {
+                        // Write error — close.
+                        if let Some(slot) = conn_pool.get_mut(slot_idx) {
+                            if let Some(ws) = slot.ws.take() {
+                                runtime.kill(ws.gen_pid);
+                            }
+                            let fd = slot.fd;
+                            buf_pool.free(slot.read_buf_idx);
+                            submit_close(ring, fd, slot_idx, generation);
+                        }
+                        continue;
+                    }
+
+                    let slot = match conn_pool.get_mut(slot_idx) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    slot.write_offset += result as usize;
+                    let fd = slot.fd;
+
+                    if slot.write_offset < slot.write_buf.len() {
+                        // Partial write — continue.
+                        let ptr = unsafe { slot.write_buf.as_ptr().add(slot.write_offset) };
+                        let remaining = (slot.write_buf.len() - slot.write_offset) as u32;
+                        submit_ws_write(ring, fd, ptr, remaining, slot_idx, generation);
+                    } else {
+                        // Write complete. Check for more outbox data.
+                        let ws = slot.ws.as_mut().unwrap();
+                        ws.writing = false;
+
+                        if ws.closing && ws.outbox.is_empty() {
+                            // Close frame sent. Kill GenServer and close fd.
+                            let gen_pid = ws.gen_pid;
+                            slot.ws = None;
+                            runtime.kill(gen_pid);
+                            buf_pool.free(slot.read_buf_idx);
+                            submit_close(ring, fd, slot_idx, generation);
+                        }
+                        // If outbox has more, it'll be flushed in the outbox flush phase below.
+                    }
+                }
+
                 STATE_CLOSING => {
+                    // Remove from ws_active_slots if present.
+                    ws_active_slots.retain(|&(si, _)| si != slot_idx);
                     conn_pool.free(slot_idx);
                 }
 
@@ -516,8 +864,7 @@ pub(crate) fn run_event_loop(
             }
         }
 
-        // ---- Batched handler execution ----
-        // Execute all parsed requests in a single block_on call.
+        // ---- Batched HTTP handler execution ----
         if !pending_conns.is_empty() {
             results.clear();
             let r = &mut results;
@@ -533,7 +880,6 @@ pub(crate) fn run_event_loop(
                     Some(s) => s,
                     None => continue,
                 };
-                // Serialize directly into the slot's existing write_buf (reuses capacity).
                 http_parse::serialize_response_into(&conn, meta.keep_alive, &mut slot.write_buf);
                 slot.write_offset = 0;
                 slot.keep_alive = meta.keep_alive;
@@ -541,6 +887,72 @@ pub(crate) fn run_event_loop(
                 let ptr = slot.write_buf.as_ptr();
                 let len = slot.write_buf.len() as u32;
                 submit_write(ring, meta.fd, ptr, len, meta.slot_idx, meta.generation);
+            }
+        }
+
+        // ---- Batched WebSocket dispatch ----
+        if !ws_dispatches.is_empty() {
+            tokio_rt.block_on(async {
+                for dispatch in ws_dispatches.drain(..) {
+                    let slot = match conn_pool.get(dispatch.slot_idx) {
+                        Some(s) if s.generation == (dispatch.generation & 0x00FF_FFFF) => s,
+                        _ => continue,
+                    };
+                    if let Some(ws) = &slot.ws {
+                        let cast_val = rmpv::Value::String(rmpv::Utf8String::from(dispatch.text));
+                        let _ = gen_server::cast_from_runtime(runtime, ws.gen_pid, cast_val).await;
+                    }
+                }
+            });
+        }
+
+        // ---- Drain WS outbound channels + flush outboxes ----
+        // For each active WS connection, drain the mpsc receiver and serialize frames.
+        let mut slots_to_close: Vec<(u32, u32)> = Vec::new();
+        for &(si, sg) in ws_active_slots.iter() {
+            let slot = match conn_pool.get_mut(si) {
+                Some(s) if s.generation == (sg & 0x00FF_FFFF) => s,
+                _ => continue,
+            };
+            let fd = slot.fd;
+            let ws = match slot.ws.as_mut() {
+                Some(ws) => ws,
+                None => continue,
+            };
+
+            // Drain ChannelSocket mpsc → serialize to WS text frames.
+            while let Ok(json) = ws.ws_rx.try_recv() {
+                let mut frame_buf = Vec::new();
+                ws_parse::serialize_frame(ws_parse::OPCODE_TEXT, json.as_bytes(), &mut frame_buf);
+                ws.outbox.push_back(frame_buf);
+            }
+
+            // Flush outbox if not currently writing.
+            if !ws.writing && !ws.outbox.is_empty() {
+                slot.write_buf.clear();
+                slot.write_offset = 0;
+                // Concatenate all outbox frames into write_buf.
+                for frame_data in ws.outbox.drain(..) {
+                    slot.write_buf.extend_from_slice(&frame_data);
+                }
+                ws.writing = true;
+                let ptr = slot.write_buf.as_ptr();
+                let len = slot.write_buf.len() as u32;
+                submit_ws_write(ring, fd, ptr, len, si, sg);
+            } else if ws.closing && ws.outbox.is_empty() && !ws.writing {
+                // Closing and nothing left to write.
+                let gen_pid = ws.gen_pid;
+                slots_to_close.push((si, sg));
+                runtime.kill(gen_pid);
+            }
+        }
+
+        for (si, sg) in slots_to_close {
+            if let Some(slot) = conn_pool.get_mut(si) {
+                slot.ws = None;
+                let fd = slot.fd;
+                buf_pool.free(slot.read_buf_idx);
+                submit_close(ring, fd, si, sg);
             }
         }
     }
@@ -624,6 +1036,7 @@ mod tests {
                 write_buf: Vec::new(),
                 write_offset: 0,
                 keep_alive: true,
+                ws: None,
             },
         );
 
@@ -648,6 +1061,7 @@ mod tests {
                 write_buf: Vec::new(),
                 write_offset: 0,
                 keep_alive: false,
+                ws: None,
             },
         );
         assert!(pool.get(idx).is_some());
