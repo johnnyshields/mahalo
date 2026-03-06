@@ -21,6 +21,7 @@ serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
 async-trait = "0.1"
 http = "1"
+mimalloc = "0.1"
 "#
     )
 }
@@ -39,6 +40,7 @@ rebar-core.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+mimalloc.workspace = true
 "#
     )
 }
@@ -46,7 +48,10 @@ tracing-subscriber.workspace = true
 pub fn app_main_rs(name: &str) -> String {
     let web_crate = name.replace('-', "_");
     format!(
-        r#"use std::net::SocketAddr;
+        r#"#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use mahalo::MahaloEndpoint;
