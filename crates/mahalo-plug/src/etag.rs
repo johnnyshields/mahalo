@@ -1,7 +1,6 @@
 use mahalo_core::conn::Conn;
 use mahalo_core::plug::{BoxFuture, Plug};
 use http::StatusCode;
-use sha2::{Sha256, Digest};
 
 pub struct ETag;
 
@@ -9,15 +8,6 @@ impl ETag {
     pub fn new() -> Self {
         ETag
     }
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        write!(s, "{b:02x}").unwrap();
-    }
-    s
 }
 
 impl Default for ETag {
@@ -33,8 +23,11 @@ impl Plug for ETag {
                 return conn;
             }
 
-            let hash = Sha256::digest(&conn.resp_body);
-            let etag_value = format!("W/\"{}\"", to_hex(&hash[..16]));
+            let hash = blake3::hash(&conn.resp_body);
+            let hex = hash.to_hex();
+            // Truncate to 32 hex chars (128-bit) — more than adequate collision
+            // resistance for ETags, and keeps the header compact.
+            let etag_value = format!("W/\"{}\"", &hex[..32]);
 
             let if_none_match = conn
                 .headers
@@ -126,6 +119,18 @@ mod tests {
             .put_resp_body("not found");
         let conn = ETag::new().call(conn).await;
         assert!(conn.resp_headers.get("etag").is_none());
+    }
+
+    #[tokio::test]
+    async fn overwrites_pre_existing_etag_header() {
+        let conn = make_conn("hello world")
+            .put_resp_header("etag", "W/\"old-etag-value\"");
+        let conn = ETag::new().call(conn).await;
+        let etag = conn.resp_headers.get("etag").unwrap().to_str().unwrap();
+        // Should be the freshly computed BLAKE3 ETag, not the old one.
+        assert!(etag.starts_with("W/\""));
+        assert_ne!(etag, "W/\"old-etag-value\"");
+        assert_eq!(etag.len(), 36);
     }
 
     #[tokio::test]

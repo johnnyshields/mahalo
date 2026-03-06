@@ -27,6 +27,8 @@ rmpv = { workspace = true }
 io-uring = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
+itoa = { workspace = true }
+httpdate = { workspace = true }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 tokio-tungstenite = { workspace = true }

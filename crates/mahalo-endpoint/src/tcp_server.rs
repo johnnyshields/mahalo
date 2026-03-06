@@ -6,11 +6,11 @@ use mahalo_core::plug::Plug;
 use mahalo_pubsub::PubSub;
 use mahalo_router::MahaloRouter;
 use rebar_core::runtime::Runtime;
-use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::endpoint::{ErrorHandler, WsConfig};
+use crate::handler::bind_socket;
 use crate::http_parse::{self, ParseError};
 
 /// Start a multi-threaded tokio-based TCP server.
@@ -131,29 +131,6 @@ pub fn start_tcp_server(
     Ok(())
 }
 
-/// Create and bind a TCP socket with optional SO_REUSEPORT.
-fn bind_socket(
-    addr: SocketAddr,
-    reuse_port: bool,
-) -> Result<Socket, Box<dyn std::error::Error + Send + Sync>> {
-    let domain = if addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
-    if reuse_port {
-        #[cfg(not(target_os = "windows"))]
-        socket.set_reuse_port(true)?;
-    }
-    socket.set_nodelay(true)?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(8192)?;
-    Ok(socket)
-}
-
 /// Handle a single TCP connection, supporting keep-alive and WebSocket upgrade.
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
@@ -167,6 +144,7 @@ async fn handle_connection(
 ) {
     let mut buf = vec![0u8; 8192];
     let mut filled = 0;
+    let mut resp_buf = Vec::with_capacity(256);
 
     loop {
         // Read data from the stream.
@@ -185,7 +163,7 @@ async fn handle_connection(
                         (parsed.ws_key, ws_config)
                     {
                         // Write the 101 response manually.
-                        let mut resp_buf = Vec::new();
+                        resp_buf.clear();
                         http_parse::serialize_ws_accept_response(&ws_key, &mut resp_buf);
                         if stream.write_all(&resp_buf).await.is_err() {
                             return;
@@ -208,8 +186,8 @@ async fn handle_connection(
                     )
                     .await;
 
-                    let response = http_parse::serialize_response(&conn, keep_alive);
-                    if stream.write_all(&response).await.is_err() {
+                    http_parse::serialize_response_into(&conn, keep_alive, &mut resp_buf);
+                    if stream.write_all(&resp_buf).await.is_err() {
                         return;
                     }
 
@@ -324,11 +302,151 @@ async fn handle_ws_upgraded(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::StatusCode;
+    use mahalo_core::conn::Conn;
+    use mahalo_core::plug::plug_fn;
+    use rebar_core::runtime::Runtime;
+    use tokio::net::TcpListener;
 
     #[test]
     fn bind_socket_creates_listener() {
-        let socket = bind_socket("127.0.0.1:0".parse().unwrap(), false).unwrap();
+        let socket = crate::handler::bind_socket("127.0.0.1:0".parse().unwrap(), false).unwrap();
         let local_addr = socket.local_addr().unwrap().as_socket().unwrap();
         assert_ne!(local_addr.port(), 0);
+    }
+
+    /// Helper: spawn `handle_connection` on one side of a TCP pair, return the client side.
+    async fn setup_conn(
+        router: mahalo_router::MahaloRouter,
+        body_limit: usize,
+    ) -> tokio::net::TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let router = Arc::new(router);
+        let error_handler: Option<ErrorHandler> = None;
+        let after_plugs: Arc<Vec<Box<dyn mahalo_core::plug::Plug>>> = Arc::new(vec![]);
+        let runtime = Arc::new(Runtime::new(1));
+
+        tokio::spawn(async move {
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            handle_connection(
+                stream,
+                peer_addr,
+                &router,
+                &error_handler,
+                &after_plugs,
+                &runtime,
+                body_limit,
+                None,
+            )
+            .await;
+        });
+
+        tokio::net::TcpStream::connect(addr).await.unwrap()
+    }
+
+    fn hello_router() -> mahalo_router::MahaloRouter {
+        mahalo_router::MahaloRouter::new().get(
+            "/hello",
+            plug_fn(|conn: Conn| async {
+                conn.put_status(StatusCode::OK).put_resp_body("world")
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn handle_connection_basic_request() {
+        let mut client = setup_conn(hello_router(), 1024 * 1024).await;
+
+        client
+            .write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let resp = String::from_utf8(resp).unwrap();
+
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp.ends_with("world"));
+    }
+
+    #[tokio::test]
+    async fn handle_connection_keep_alive_pipelining() {
+        let mut client = setup_conn(hello_router(), 1024 * 1024).await;
+
+        // Send two requests back-to-back on the same connection.
+        client
+            .write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\nGET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let resp = String::from_utf8(resp).unwrap();
+
+        // Should see two responses.
+        let count = resp.matches("HTTP/1.1 200 OK").count();
+        assert_eq!(count, 2, "expected 2 responses, got:\n{resp}");
+    }
+
+    #[tokio::test]
+    async fn handle_connection_404_for_unknown_route() {
+        let mut client = setup_conn(hello_router(), 1024 * 1024).await;
+
+        client
+            .write_all(b"GET /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let resp = String::from_utf8(resp).unwrap();
+
+        assert!(resp.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    }
+
+    #[tokio::test]
+    async fn handle_connection_400_on_invalid_request() {
+        let mut client = setup_conn(hello_router(), 1024 * 1024).await;
+
+        client.write_all(b"NOT A VALID HTTP REQUEST\r\n\r\n").await.unwrap();
+
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+
+        assert_eq!(&resp, http_parse::RESPONSE_400);
+    }
+
+    #[tokio::test]
+    async fn handle_connection_413_on_body_too_large() {
+        let mut client = setup_conn(hello_router(), 16).await; // tiny body limit
+
+        client
+            .write_all(b"POST /hello HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+
+        assert_eq!(&resp, http_parse::RESPONSE_413);
+    }
+
+    #[tokio::test]
+    async fn handle_connection_closes_on_connection_close() {
+        let mut client = setup_conn(hello_router(), 1024 * 1024).await;
+
+        client
+            .write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let resp = String::from_utf8(resp).unwrap();
+
+        assert!(resp.contains("connection: close\r\n"));
     }
 }

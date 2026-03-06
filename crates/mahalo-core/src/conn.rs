@@ -54,6 +54,26 @@ impl Conn {
         }
     }
 
+    /// Reset this Conn for reuse, preserving backing allocations.
+    /// Clears all fields but keeps HashMap/HeaderMap capacity.
+    pub fn reset(&mut self, method: Method, uri: Uri) {
+        self.method = method;
+        self.uri = uri;
+        self.headers.clear();
+        self.path_params.clear();
+        self.query_params.clear();
+        self.remote_addr = None;
+        self.body = Bytes::new();
+        self.status = StatusCode::OK;
+        self.resp_headers.clear();
+        self.resp_body = Bytes::new();
+        self.halted = false;
+        if let Some(ref mut assigns) = self.assigns {
+            assigns.clear();
+        }
+        self.runtime = None;
+    }
+
     pub fn put_status(mut self, status: StatusCode) -> Self {
         self.status = status;
         self
@@ -236,5 +256,55 @@ mod tests {
         let conn = Conn::new(Method::GET, Uri::from_static("/"))
             .put_resp_header("", "value");
         assert!(conn.resp_headers.is_empty());
+    }
+
+    #[test]
+    fn reset_clears_all_fields() {
+        let conn = Conn::new(Method::POST, "/api".parse::<Uri>().unwrap())
+            .put_status(StatusCode::CREATED)
+            .put_resp_header("content-type", "application/json")
+            .put_resp_body("body")
+            .assign::<UserId>(42)
+            .halt();
+
+        let mut conn = conn;
+        conn.headers.insert("host", "example.com".parse().unwrap());
+        conn.path_params.insert("id".into(), "1".into());
+        conn.query_params.insert("q".into(), "test".into());
+        conn.remote_addr = Some("1.2.3.4:80".parse().unwrap());
+
+        conn.reset(Method::GET, Uri::from_static("/new"));
+
+        assert_eq!(conn.method, Method::GET);
+        assert_eq!(conn.uri, "/new");
+        assert!(conn.headers.is_empty());
+        assert!(conn.path_params.is_empty());
+        assert!(conn.query_params.is_empty());
+        assert!(conn.remote_addr.is_none());
+        assert!(conn.body.is_empty());
+        assert_eq!(conn.status, StatusCode::OK);
+        assert!(conn.resp_headers.is_empty());
+        assert!(conn.resp_body.is_empty());
+        assert!(!conn.halted);
+        assert!(conn.get_assign::<UserId>().is_none());
+    }
+
+    #[test]
+    fn reset_preserves_capacity() {
+        let mut conn = Conn::new(Method::GET, Uri::from_static("/"));
+        // Add enough headers to force capacity growth.
+        for i in 0..20 {
+            conn.headers.insert(
+                format!("x-header-{i}").parse::<http::header::HeaderName>().unwrap(),
+                "value".parse().unwrap(),
+            );
+        }
+        let cap_before = conn.headers.capacity();
+
+        conn.reset(Method::POST, Uri::from_static("/other"));
+
+        // HeaderMap capacity should be preserved after clear.
+        assert!(conn.headers.capacity() >= cap_before);
+        assert!(conn.headers.is_empty());
     }
 }

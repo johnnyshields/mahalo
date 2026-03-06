@@ -5,6 +5,11 @@ use bytes::Bytes;
 use http::{HeaderMap, Method, Uri};
 use mahalo_core::conn::Conn;
 
+use crate::date::write_date_header;
+
+/// Static server identification header.
+const SERVER_HEADER: &[u8] = b"server: mahalo\r\n";
+
 /// Result of successfully parsing a complete HTTP/1.1 request.
 pub struct ParsedRequest {
     pub conn: Conn,
@@ -32,19 +37,26 @@ pub const RESPONSE_413: &[u8] =
 pub const RESPONSE_503: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 19\r\nconnection: close\r\n\r\nService Unavailable";
 
-/// Attempt to parse an HTTP/1.1 request from `buf`.
-///
-/// Returns `Ok(None)` if the buffer contains a partial request (need more data).
-/// Returns `Ok(Some(parsed))` on a complete request.
-/// Returns `Err` on invalid input or body exceeding `body_limit`.
-pub fn try_parse_request(
-    buf: &[u8],
-    body_limit: usize,
-    peer_addr: SocketAddr,
-) -> Result<Option<ParsedRequest>, ParseError> {
-    let mut headers_buf = [httparse::EMPTY_HEADER; 64];
-    let mut req = httparse::Request::new(&mut headers_buf);
+/// Internal result of the shared parsing helper — everything extracted from
+/// the raw buffer before Conn population.
+struct RawParsed<'a> {
+    method: Method,
+    uri: Uri,
+    headers: &'a [httparse::Header<'a>],
+    content_length: Option<usize>,
+    connection_header: Option<&'a str>,
+    http_version: Option<u8>,
+    header_len: usize,
+    upgrade_websocket: bool,
+    ws_key: Option<String>,
+}
 
+/// Shared parsing core: runs httparse, extracts method/uri, scans for
+/// content-length and connection headers. Does NOT touch Conn or HeaderMap.
+fn parse_raw<'buf, 'hdr>(
+    req: &'hdr mut httparse::Request<'hdr, 'buf>,
+    buf: &'buf [u8],
+) -> Result<Option<RawParsed<'hdr>>, ParseError> {
     let header_len = match req.parse(buf) {
         Ok(httparse::Status::Partial) => return Ok(None),
         Ok(httparse::Status::Complete(len)) => len,
@@ -56,18 +68,12 @@ pub fn try_parse_request(
     let uri = Uri::from_str(req.path.ok_or(ParseError::InvalidRequest)?)
         .map_err(|_| ParseError::InvalidRequest)?;
 
-    let mut header_map = HeaderMap::with_capacity(req.headers.len());
     let mut content_length: Option<usize> = None;
     let mut connection_header: Option<&str> = None;
     let mut upgrade_websocket = false;
     let mut ws_key: Option<String> = None;
 
     for h in req.headers.iter() {
-        let name = http::header::HeaderName::from_bytes(h.name.as_bytes())
-            .map_err(|_| ParseError::InvalidRequest)?;
-        let value = http::header::HeaderValue::from_bytes(h.value)
-            .map_err(|_| ParseError::InvalidRequest)?;
-
         if h.name.eq_ignore_ascii_case("content-length") {
             if let Ok(s) = std::str::from_utf8(h.value) {
                 content_length = s.trim().parse().ok();
@@ -88,55 +94,132 @@ pub fn try_parse_request(
                 ws_key = Some(v.trim().to_string());
             }
         }
-
-        header_map.append(name, value);
     }
 
-    // Determine if the method carries a body.
-    let body_len = match method {
+    Ok(Some(RawParsed {
+        method,
+        uri,
+        headers: req.headers,
+        content_length,
+        connection_header,
+        http_version: req.version,
+        header_len,
+        upgrade_websocket,
+        ws_key,
+    }))
+}
+
+/// Convert parsed httparse headers into an `http::HeaderMap`.
+fn build_header_map(headers: &[httparse::Header<'_>]) -> Result<HeaderMap, ParseError> {
+    let mut map = HeaderMap::with_capacity(headers.len());
+    for h in headers {
+        let name = http::header::HeaderName::from_bytes(h.name.as_bytes())
+            .map_err(|_| ParseError::InvalidRequest)?;
+        // SAFETY: httparse already validated that header values contain only
+        // visible ASCII characters and spaces/tabs (RFC 7230 field-value).
+        // Skipping re-validation avoids redundant work on the hot path.
+        let value = unsafe {
+            http::header::HeaderValue::from_maybe_shared_unchecked(
+                Bytes::copy_from_slice(h.value),
+            )
+        };
+        map.append(name, value);
+    }
+    Ok(map)
+}
+
+/// Append parsed httparse headers into an existing `HeaderMap`.
+fn append_headers(map: &mut HeaderMap, headers: &[httparse::Header<'_>]) -> Result<(), ParseError> {
+    for h in headers {
+        let name = http::header::HeaderName::from_bytes(h.name.as_bytes())
+            .map_err(|_| ParseError::InvalidRequest)?;
+        // SAFETY: httparse already validated header values.
+        let value = unsafe {
+            http::header::HeaderValue::from_maybe_shared_unchecked(
+                Bytes::copy_from_slice(h.value),
+            )
+        };
+        map.append(name, value);
+    }
+    Ok(())
+}
+
+/// Compute body length, validate against limit, extract body bytes, and
+/// determine keep-alive. Returns `Ok(None)` if the buffer is incomplete.
+fn finalize_body_and_keepalive(
+    raw: &RawParsed<'_>,
+    buf: &[u8],
+    body_limit: usize,
+) -> Result<Option<(Bytes, bool, usize)>, ParseError> {
+    let body_len = match raw.method {
         Method::GET | Method::HEAD | Method::DELETE => 0,
-        _ => content_length.unwrap_or(0),
+        _ => raw.content_length.unwrap_or(0),
     };
 
     if body_len > body_limit {
         return Err(ParseError::BodyTooLarge);
     }
 
-    let total = header_len + body_len;
+    let total = raw.header_len + body_len;
 
-    // Not enough data yet for the full body.
     if buf.len() < total {
         return Ok(None);
     }
 
     let body = if body_len > 0 {
-        Bytes::copy_from_slice(&buf[header_len..total])
+        Bytes::copy_from_slice(&buf[raw.header_len..total])
     } else {
         Bytes::new()
     };
 
     // HTTP/1.1 defaults to keep-alive; HTTP/1.0 defaults to close.
-    let keep_alive = match connection_header {
+    let keep_alive = match raw.connection_header {
         Some(v) if v.eq_ignore_ascii_case("close") => false,
         Some(v) if v.eq_ignore_ascii_case("keep-alive") => true,
-        _ => {
-            // Check HTTP version from httparse (1 = HTTP/1.1, 0 = HTTP/1.0).
-            req.version.unwrap_or(1) >= 1
-        }
+        // Check HTTP version from httparse (1 = HTTP/1.1, 0 = HTTP/1.0).
+        _ => raw.http_version.unwrap_or(1) >= 1,
     };
 
-    let mut conn = Conn::new(method, uri);
+    Ok(Some((body, keep_alive, total)))
+}
+
+/// Attempt to parse an HTTP/1.1 request from `buf`.
+///
+/// Returns `Ok(None)` if the buffer contains a partial request (need more data).
+/// Returns `Ok(Some(parsed))` on a complete request.
+/// Returns `Err` on invalid input or body exceeding `body_limit`.
+pub fn try_parse_request(
+    buf: &[u8],
+    body_limit: usize,
+    peer_addr: SocketAddr,
+) -> Result<Option<ParsedRequest>, ParseError> {
+    let mut headers_buf = [httparse::EMPTY_HEADER; 96];
+    let mut req = httparse::Request::new(&mut headers_buf);
+
+    let raw = match parse_raw(&mut req, buf)? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    let (body, keep_alive, total) = match finalize_body_and_keepalive(&raw, buf, body_limit)? {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    let header_map = build_header_map(raw.headers)?;
+
+    let mut conn = Conn::new(raw.method, raw.uri);
     conn.headers = header_map;
     conn.body = body;
     conn.remote_addr = Some(peer_addr);
 
     // WebSocket upgrade requires GET method and Sec-WebSocket-Version: 13 (RFC 6455 §4.2.1).
-    let ws_key = if upgrade_websocket && method == Method::GET {
+    let ws_key = if raw.upgrade_websocket && raw.method == Method::GET {
         // Check Sec-WebSocket-Version header.
         let version_ok = conn.headers.get("sec-websocket-version")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.trim() == "13");
-        if version_ok { ws_key } else { None }
+        if version_ok { raw.ws_key } else { None }
     } else {
         None
     };
@@ -146,6 +229,44 @@ pub fn try_parse_request(
         keep_alive,
         bytes_consumed: total,
         ws_key,
+    }))
+}
+
+/// Result of parsing into an existing Conn (avoids allocation).
+pub struct ParsedIntoResult {
+    pub keep_alive: bool,
+    pub bytes_consumed: usize,
+}
+
+/// Parse an HTTP request into an existing Conn, reusing its backing allocations.
+/// The Conn is `reset()` before populating.
+pub fn try_parse_into_conn(
+    conn: &mut Conn,
+    buf: &[u8],
+    body_limit: usize,
+    peer_addr: SocketAddr,
+) -> Result<Option<ParsedIntoResult>, ParseError> {
+    let mut headers_buf = [httparse::EMPTY_HEADER; 96];
+    let mut req = httparse::Request::new(&mut headers_buf);
+
+    let raw = match parse_raw(&mut req, buf)? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    let (body, keep_alive, total) = match finalize_body_and_keepalive(&raw, buf, body_limit)? {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    conn.reset(raw.method, raw.uri);
+    append_headers(&mut conn.headers, raw.headers)?;
+    conn.body = body;
+    conn.remote_addr = Some(peer_addr);
+
+    Ok(Some(ParsedIntoResult {
+        keep_alive,
+        bytes_consumed: total,
     }))
 }
 
@@ -169,22 +290,6 @@ fn status_line(code: u16) -> &'static [u8] {
         503 => b"HTTP/1.1 503 Service Unavailable\r\n",
         _ => b"",
     }
-}
-
-/// Write a usize as decimal digits directly into buf (no String allocation).
-#[inline]
-fn write_usize(buf: &mut Vec<u8>, mut n: usize) {
-    if n == 0 {
-        buf.push(b'0');
-        return;
-    }
-    // Max 20 digits for u64.
-    let start = buf.len();
-    while n > 0 {
-        buf.push(b'0' + (n % 10) as u8);
-        n /= 10;
-    }
-    buf[start..].reverse();
 }
 
 /// Write a u16 as 3-digit decimal directly into buf (for HTTP status codes).
@@ -228,7 +333,8 @@ pub fn serialize_response_into(conn: &Conn, keep_alive: bool, buf: &mut Vec<u8>)
     let needed = 128 + header_bytes + body_len;
 
     buf.clear();
-    buf.reserve(needed.saturating_sub(buf.capacity()));
+    let target = needed.next_power_of_two();
+    buf.reserve(target.saturating_sub(buf.len()));
 
     // Status line — try pre-computed, fall back to manual.
     let precomputed = status_line(code);
@@ -251,15 +357,22 @@ pub fn serialize_response_into(conn: &Conn, keep_alive: bool, buf: &mut Vec<u8>)
         buf.extend_from_slice(b"\r\n");
     }
 
-    // Content-length (manual integer formatting, no String alloc).
+    // Content-length (itoa: 2-digit lookup tables, no reverse step).
     if !has_content_length {
         buf.extend_from_slice(b"content-length: ");
-        write_usize(buf, body_len);
+        let mut itoa_buf = itoa::Buffer::new();
+        buf.extend_from_slice(itoa_buf.format(body_len).as_bytes());
         buf.extend_from_slice(b"\r\n");
     }
 
     // Connection header.
     buf.extend_from_slice(connection_hdr);
+
+    // Date header (thread-local cache, refreshed every 500ms).
+    write_date_header(buf);
+
+    // Server header (static bytes, zero cost).
+    buf.extend_from_slice(SERVER_HEADER);
 
     // Separator + body.
     buf.extend_from_slice(b"\r\n");
@@ -455,6 +568,54 @@ mod tests {
         serialize_response_into(&conn, true, &mut buf);
         assert_eq!(buf.len(), first_len);
         assert_eq!(buf.capacity(), cap_after_first);
+    }
+
+    #[test]
+    fn serialize_response_includes_date_and_server() {
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .put_status(StatusCode::OK)
+            .put_resp_body("ok");
+
+        let buf = serialize_response(&conn, true);
+        let response = String::from_utf8(buf).unwrap();
+
+        assert!(response.contains("date: "), "missing date header");
+        assert!(response.contains("server: mahalo\r\n"), "missing server header");
+    }
+
+    #[test]
+    fn try_parse_into_conn_basic() {
+        let raw = b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut conn = Conn::new(Method::POST, Uri::from_static("/old"));
+        conn.resp_headers.insert("x-old", "val".parse().unwrap());
+
+        let result = try_parse_into_conn(&mut conn, raw, 1024, addr())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(conn.method, Method::GET);
+        assert_eq!(conn.uri, "/hello");
+        assert!(conn.body.is_empty());
+        assert!(result.keep_alive);
+        assert_eq!(result.bytes_consumed, raw.len());
+        // Old response headers should be cleared.
+        assert!(conn.resp_headers.is_empty());
+    }
+
+    #[test]
+    fn try_parse_into_conn_partial_returns_none() {
+        let raw = b"GET /hello HT";
+        let mut conn = Conn::new(Method::GET, Uri::from_static("/"));
+        let result = try_parse_into_conn(&mut conn, raw, 1024, addr()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_parse_into_conn_body_too_large() {
+        let raw = b"POST /api HTTP/1.1\r\nContent-Length: 2000\r\n\r\n";
+        let mut conn = Conn::new(Method::GET, Uri::from_static("/"));
+        let result = try_parse_into_conn(&mut conn, raw, 1024, addr());
+        assert!(matches!(result, Err(ParseError::BodyTooLarge)));
     }
 
     #[test]

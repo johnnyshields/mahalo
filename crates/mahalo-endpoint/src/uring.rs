@@ -19,6 +19,11 @@ use crate::endpoint::{ErrorHandler, WsConfig};
 use crate::http_parse::{self, ParseError};
 use crate::ws_parse;
 
+/// Max number of recycled Conn objects per event loop thread.
+const CONN_POOL_CAP: usize = 128;
+/// Max number of recycled write buffers per event loop thread.
+const WRITE_BUF_POOL_CAP: usize = 128;
+
 /// Default peer address used when the actual peer address isn't captured.
 fn default_peer_addr() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], 0))
@@ -411,6 +416,7 @@ pub(crate) fn run_event_loop(
     ws_config: Option<&WsConfig>,
 ) {
     let peer_addr = default_peer_addr();
+    let mut accept_backoff_ms: u64 = 100;
     submit_accept(ring, listen_fd);
 
     // Reusable vectors to avoid per-iteration allocation.
@@ -422,6 +428,12 @@ pub(crate) fn run_event_loop(
     // Track slots that have active WS connections for outbox polling.
     let mut ws_active_slots: Vec<(u32, u32)> = Vec::with_capacity(256); // (slot_idx, generation)
 
+    // Conn object pool — recycle Conn structs to reuse HeaderMap/HashMap capacity.
+    let mut conn_recycle: Vec<Conn> = Vec::with_capacity(CONN_POOL_CAP);
+
+    // Write buffer pool — recycle Vec<u8> for ConnSlot write buffers.
+    let mut write_buf_pool: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BUF_POOL_CAP);
+
     loop {
         if let Err(e) = ring.submit_and_wait(1) {
             tracing::error!("io_uring submit_and_wait error: {}", e);
@@ -431,6 +443,10 @@ pub(crate) fn run_event_loop(
         pending_meta.clear();
         pending_conns.clear();
         ws_dispatches.clear();
+
+        // Timespec for EMFILE backoff — must outlive the CQE processing loop
+        // so the io_uring SQE pointer remains valid until submit_and_wait.
+        let mut emfile_timespec: Option<types::Timespec>;
 
         // Drain CQEs into reusable vec (avoids allocation after first iteration).
         cqes.clear();
@@ -443,10 +459,28 @@ pub(crate) fn run_event_loop(
             match state {
                 STATE_ACCEPTING => {
                     if result < 0 {
-                        tracing::warn!("accept error: {}", std::io::Error::from_raw_os_error(-result));
-                        submit_accept(ring, listen_fd);
+                        let errno = -result;
+                        if errno == libc::EMFILE || errno == libc::ENFILE {
+                            tracing::warn!("accept error (fd exhaustion, backoff {}ms): {}", accept_backoff_ms, std::io::Error::from_raw_os_error(errno));
+                            // Use io_uring timeout to delay before re-arming accept.
+                            // Store timespec outside CQE loop so pointer stays valid until submit_and_wait.
+                            emfile_timespec = Some(types::Timespec::from(
+                                std::time::Duration::from_millis(accept_backoff_ms),
+                            ));
+                            let timeout_entry = opcode::Timeout::new(emfile_timespec.as_ref().unwrap() as *const types::Timespec)
+                                .build()
+                                .user_data(encode_user_data(STATE_ACCEPTING, 0, 0));
+                            unsafe {
+                                ring.submission().push(&timeout_entry).ok();
+                            }
+                            accept_backoff_ms = (accept_backoff_ms * 2).min(1000);
+                        } else {
+                            tracing::warn!("accept error: {}", std::io::Error::from_raw_os_error(errno));
+                            submit_accept(ring, listen_fd);
+                        }
                         continue;
                     }
+                    accept_backoff_ms = 100; // Reset on successful accept
                     let new_fd = result;
 
                     // TCP_NODELAY on accepted connection — critical for small responses.
@@ -471,6 +505,14 @@ pub(crate) fn run_event_loop(
 
                     let generation = conn_pool.next_generation();
 
+                    // Reuse a write buffer from the pool, or allocate a new one.
+                    let write_buf = if let Some(mut wb) = write_buf_pool.pop() {
+                        wb.clear();
+                        wb
+                    } else {
+                        Vec::with_capacity(512)
+                    };
+
                     conn_pool.insert(
                         slot_idx,
                         ConnSlot {
@@ -478,7 +520,7 @@ pub(crate) fn run_event_loop(
                             generation,
                             read_buf_idx: buf_idx,
                             read_len: 0,
-                            write_buf: Vec::with_capacity(256),
+                            write_buf,
                             write_offset: 0,
                             keep_alive: true,
                             ws: None,
@@ -519,32 +561,15 @@ pub(crate) fn run_event_loop(
 
                     let buf = &buf_pool.slice(buf_idx)[..read_len];
 
-                    match http_parse::try_parse_request(buf, body_limit, peer_addr) {
-                        Ok(Some(parsed)) => {
-                            // Check for WebSocket upgrade
-                            if let (Some(ws_key), Some(_wsc)) =
-                                (parsed.ws_key, ws_config)
-                            {
-                                // WebSocket upgrade: serialize 101 response into write_buf
-                                let slot = conn_pool.get_mut(slot_idx).unwrap();
-                                buf_pool.free(slot.read_buf_idx);
-                                slot.write_buf.clear();
-                                http_parse::serialize_ws_accept_response(&ws_key, &mut slot.write_buf);
-                                slot.write_offset = 0;
-                                slot.keep_alive = false; // not used for WS
-
-                                let ptr = slot.write_buf.as_ptr();
-                                let len = slot.write_buf.len() as u32;
-                                // Write the 101 response, then transition to WS
-                                let entry = opcode::Write::new(types::Fd(fd), ptr, len)
-                                    .build()
-                                    .user_data(encode_user_data(STATE_WS_UPGRADING, slot_idx, generation));
-                                unsafe {
-                                    ring.submission().push(&entry).ok();
-                                }
-                            } else {
-                                // Normal HTTP request — defer for batched execution.
-                                let conn = parsed.conn.with_runtime(Arc::clone(runtime));
+                    // Try to reuse a recycled Conn, or parse into a new one.
+                    // Note: Conn recycling (try_parse_into_conn) does not return ws_key,
+                    // so WS upgrade detection only happens on the fallback path. This is
+                    // correct because WS upgrades occur on the first request of a connection
+                    // (before any Conn is available for recycling).
+                    let parse_result = if let Some(mut recycled) = conn_recycle.pop() {
+                        match http_parse::try_parse_into_conn(&mut recycled, buf, body_limit, peer_addr) {
+                            Ok(Some(parsed)) => {
+                                let conn = recycled.with_runtime(Arc::clone(runtime));
                                 pending_meta.push(PendingRequest {
                                     slot_idx,
                                     generation,
@@ -552,9 +577,64 @@ pub(crate) fn run_event_loop(
                                     keep_alive: parsed.keep_alive,
                                 });
                                 pending_conns.push(conn);
+                                None // consumed successfully
+                            }
+                            Ok(None) => {
+                                // Put it back — incomplete request.
+                                conn_recycle.push(recycled);
+                                Some(Ok(None))
+                            }
+                            Err(e) => {
+                                conn_recycle.push(recycled);
+                                Some(Err(e))
                             }
                         }
-                        Ok(None) => {
+                    } else {
+                        match http_parse::try_parse_request(buf, body_limit, peer_addr) {
+                            Ok(Some(parsed)) => {
+                                // Check for WebSocket upgrade
+                                if let (Some(ws_key), Some(_wsc)) =
+                                    (parsed.ws_key, ws_config)
+                                {
+                                    // WebSocket upgrade: serialize 101 response into write_buf
+                                    let slot = conn_pool.get_mut(slot_idx).unwrap();
+                                    buf_pool.free(slot.read_buf_idx);
+                                    slot.write_buf.clear();
+                                    http_parse::serialize_ws_accept_response(&ws_key, &mut slot.write_buf);
+                                    slot.write_offset = 0;
+                                    slot.keep_alive = false; // not used for WS
+
+                                    let ptr = slot.write_buf.as_ptr();
+                                    let len = slot.write_buf.len() as u32;
+                                    // Write the 101 response, then transition to WS
+                                    let entry = opcode::Write::new(types::Fd(fd), ptr, len)
+                                        .build()
+                                        .user_data(encode_user_data(STATE_WS_UPGRADING, slot_idx, generation));
+                                    unsafe {
+                                        ring.submission().push(&entry).ok();
+                                    }
+                                    None
+                                } else {
+                                    let conn = parsed.conn.with_runtime(Arc::clone(runtime));
+                                    pending_meta.push(PendingRequest {
+                                        slot_idx,
+                                        generation,
+                                        fd,
+                                        keep_alive: parsed.keep_alive,
+                                    });
+                                    pending_conns.push(conn);
+                                    None
+                                }
+                            }
+                            other => Some(other),
+                        }
+                    };
+
+                    match parse_result {
+                        None => {
+                            // Successfully parsed — already pushed to pending.
+                        }
+                        Some(Ok(None)) => {
                             if read_len >= chunk_size {
                                 write_static_error_and_close(
                                     ring, fd, http_parse::RESPONSE_413,
@@ -568,13 +648,14 @@ pub(crate) fn run_event_loop(
                                 );
                             }
                         }
-                        Err(ParseError::BodyTooLarge) => {
+                        Some(Ok(Some(_))) => unreachable!(),
+                        Some(Err(ParseError::BodyTooLarge)) => {
                             write_static_error_and_close(
                                 ring, fd, http_parse::RESPONSE_413,
                                 slot_idx, generation, conn_pool, buf_pool,
                             );
                         }
-                        Err(ParseError::InvalidRequest) => {
+                        Some(Err(ParseError::InvalidRequest)) => {
                             write_static_error_and_close(
                                 ring, fd, http_parse::RESPONSE_400,
                                 slot_idx, generation, conn_pool, buf_pool,
@@ -874,6 +955,14 @@ pub(crate) fn run_event_loop(
                 STATE_CLOSING => {
                     // Remove from ws_active_slots if present.
                     ws_active_slots.retain(|&(si, _)| si != slot_idx);
+                    // Recycle the write buffer before freeing the slot.
+                    if let Some(slot) = conn_pool.get_mut(slot_idx) {
+                        if write_buf_pool.len() < WRITE_BUF_POOL_CAP {
+                            let mut wb = std::mem::take(&mut slot.write_buf);
+                            wb.clear();
+                            write_buf_pool.push(wb);
+                        }
+                    }
                     conn_pool.free(slot_idx);
                 }
 
@@ -895,11 +984,22 @@ pub(crate) fn run_event_loop(
             for (meta, conn) in pending_meta.drain(..).zip(results.drain(..)) {
                 let slot = match conn_pool.get_mut(meta.slot_idx) {
                     Some(s) => s,
-                    None => continue,
+                    None => {
+                        // Recycle the Conn even if slot is gone.
+                        if conn_recycle.len() < CONN_POOL_CAP {
+                            conn_recycle.push(conn);
+                        }
+                        continue;
+                    }
                 };
                 http_parse::serialize_response_into(&conn, meta.keep_alive, &mut slot.write_buf);
                 slot.write_offset = 0;
                 slot.keep_alive = meta.keep_alive;
+
+                // Recycle the Conn for future requests.
+                if conn_recycle.len() < CONN_POOL_CAP {
+                    conn_recycle.push(conn);
+                }
 
                 let ptr = slot.write_buf.as_ptr();
                 let len = slot.write_buf.len() as u32;

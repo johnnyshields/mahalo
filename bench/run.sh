@@ -40,6 +40,7 @@ PORT_ACTIX=3002
 PORT_EXPRESS=3003
 PORT_PUMA=3005
 PORT_ELIXIR=3007
+PORT_FERRON=3006
 
 # Colors
 RED='\033[0;31m'
@@ -267,6 +268,19 @@ start_puma() {
     wait_for_server $PORT_PUMA "Puma (Rack)"
 }
 
+start_ferron() {
+    should_run "ferron" || return 0
+    if ! command -v ferron &>/dev/null; then
+        skip "Ferron (binary not found, install with: cargo install ferron)"
+        return 0
+    fi
+    log "Starting Ferron..."
+    local config="$BENCH_DIR/frameworks/ferron/ferron.kdl"
+    ferron --config "$config" &
+    PIDS+=($!)
+    wait_for_server $PORT_FERRON "Ferron"
+}
+
 start_elixir() {
     should_run "elixir" || return 0
     if ! command -v elixir &>/dev/null; then
@@ -348,6 +362,7 @@ main() {
     start_actix
 
     if [ "$RUST_ONLY" = false ]; then
+        start_ferron
         start_express
         start_puma
         start_elixir
@@ -362,6 +377,9 @@ main() {
     should_run "actix"   && bench_framework "Actix-web"    $PORT_ACTIX
 
     if [ "$RUST_ONLY" = false ]; then
+        if should_run "ferron" && curl -sf "http://127.0.0.1:${PORT_FERRON}/plaintext" > /dev/null 2>&1; then
+            bench_framework "Ferron" $PORT_FERRON
+        fi
         if should_run "express" && curl -sf "http://127.0.0.1:${PORT_EXPRESS}/plaintext" > /dev/null 2>&1; then
             bench_framework "Express" $PORT_EXPRESS
         fi

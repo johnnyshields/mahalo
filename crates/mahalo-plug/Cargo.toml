@@ -11,6 +11,7 @@ http = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+blake3 = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 uuid = { workspace = true }
