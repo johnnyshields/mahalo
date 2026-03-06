@@ -11,7 +11,11 @@ crates/
   mahalo/           # Umbrella crate - re-exports everything
   mahalo-core/      # Conn, Plug, Pipeline, Controller, AssignKey
   mahalo-router/    # MahaloRouter, scopes, resources, named routes, path matching
-  mahalo-endpoint/  # io_uring HTTP server, error handlers, after-plugs, rebar supervision
+  mahalo-endpoint/  # Platform-adaptive HTTP server, error handlers, after-plugs, rebar supervision
+                    #   handler.rs    - shared request execution + bind_socket helper
+                    #   worker.rs     - io_uring event loop (Linux only)
+                    #   tcp_server.rs - tokio TCP server (all platforms)
+                    #   http_parse.rs - zero-alloc HTTP/1.1 parser + serializer
   mahalo-pubsub/    # Topic-based PubSub with broadcast channels
   mahalo-channel/   # Phoenix-compatible WebSocket channels
   mahalo-telemetry/ # Telemetry events, handlers, spans
@@ -25,7 +29,7 @@ crates/
 - **Pipeline** (`mahalo-core`): Ordered sequence of Plugs, halts early if `conn.halted`.
 - **Controller** (`mahalo-core`): RESTful trait with index/show/create/update/delete.
 - **MahaloRouter** (`mahalo-router`): Routes with scopes, named pipelines, named routes, `resources()` for CRUD, and `path_for()` reverse routing.
-- **MahaloEndpoint** (`mahalo-endpoint`): Bridges MahaloRouter to io_uring HTTP server. Body limit: 2MB default. Supports custom error handlers and after-plugs (post-handler pipeline).
+- **MahaloEndpoint** (`mahalo-endpoint`): Platform-adaptive HTTP server. Uses io_uring on Linux, tokio TCP on other platforms. Body limit: 2MB default. Supports custom error handlers and after-plugs (post-handler pipeline). Shared logic in `handler.rs` (`execute_request`, `bind_socket`).
 - **ErrorHandler** (`mahalo-endpoint`): `Arc<dyn Fn(StatusCode, Conn) -> Conn + Send + Sync>`. Built-in: `json_error_handler()`, `text_error_handler()`.
 - **PubSub** (`mahalo-pubsub`): Background tokio task managing topic -> broadcast channel map.
 - **Channel** (`mahalo-channel`): Phoenix-compatible WebSocket channels with join/handle_in/handle_info/terminate.

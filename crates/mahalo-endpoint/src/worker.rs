@@ -6,7 +6,6 @@ use io_uring::IoUring;
 use mahalo_core::plug::Plug;
 use mahalo_router::MahaloRouter;
 use rebar_core::runtime::Runtime;
-use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::endpoint::ErrorHandler;
 use crate::uring::{BufferPool, ConnectionPool, run_event_loop};
@@ -57,18 +56,7 @@ pub fn start_uring_server(
                 }
 
                 // Create the listening socket with SO_REUSEPORT.
-                let domain = if addr.is_ipv4() {
-                    Domain::IPV4
-                } else {
-                    Domain::IPV6
-                };
-                let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-                socket.set_reuse_port(true)?;
-                socket.set_reuse_address(true)?;
-                socket.set_nodelay(true)?;
-                socket.set_nonblocking(true)?;
-                socket.bind(&addr.into())?;
-                socket.listen(8192)?;
+                let socket = crate::handler::bind_socket(addr, true)?;
 
                 let listen_fd = socket.as_raw_fd();
 
