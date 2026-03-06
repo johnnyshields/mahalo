@@ -327,6 +327,21 @@ struct PendingRequest {
     keep_alive: bool,
 }
 
+/// Synchronously write a 503 response and close the fd, then re-arm accept.
+/// Used when the server is out of connection or buffer slots.
+#[inline]
+fn reject_and_close(ring: &mut IoUring, fd: RawFd, listen_fd: RawFd) {
+    unsafe {
+        libc::write(
+            fd,
+            http_parse::RESPONSE_503.as_ptr() as *const libc::c_void,
+            http_parse::RESPONSE_503.len(),
+        );
+        libc::close(fd);
+    }
+    submit_accept(ring, listen_fd);
+}
+
 // ---------------------------------------------------------------------------
 // run_event_loop
 // ---------------------------------------------------------------------------
@@ -384,15 +399,7 @@ pub(crate) fn run_event_loop(
                     let slot_idx = match conn_pool.alloc() {
                         Some(idx) => idx,
                         None => {
-                            unsafe {
-                                libc::write(
-                                    new_fd,
-                                    http_parse::RESPONSE_503.as_ptr() as *const libc::c_void,
-                                    http_parse::RESPONSE_503.len(),
-                                );
-                                libc::close(new_fd);
-                            }
-                            submit_accept(ring, listen_fd);
+                            reject_and_close(ring, new_fd, listen_fd);
                             continue;
                         }
                     };
@@ -401,15 +408,7 @@ pub(crate) fn run_event_loop(
                         Some(idx) => idx,
                         None => {
                             conn_pool.free(slot_idx);
-                            unsafe {
-                                libc::write(
-                                    new_fd,
-                                    http_parse::RESPONSE_503.as_ptr() as *const libc::c_void,
-                                    http_parse::RESPONSE_503.len(),
-                                );
-                                libc::close(new_fd);
-                            }
-                            submit_accept(ring, listen_fd);
+                            reject_and_close(ring, new_fd, listen_fd);
                             continue;
                         }
                     };

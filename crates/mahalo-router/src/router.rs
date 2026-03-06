@@ -595,6 +595,52 @@ mod tests {
     }
 
     #[test]
+    fn colon_to_brace_edge_cases() {
+        // Empty string gets a leading slash
+        assert_eq!(colon_to_brace(""), "/");
+        // Root path stays as-is
+        assert_eq!(colon_to_brace("/"), "/");
+        // Trailing slash preserved
+        assert_eq!(colon_to_brace("/rooms/"), "/rooms/");
+        // Consecutive params
+        assert_eq!(colon_to_brace("/:a/:b"), "/{a}/{b}");
+        // No params at all
+        assert_eq!(colon_to_brace("/static/css/style.css"), "/static/css/style.css");
+    }
+
+    #[test]
+    fn normalize_prefix_cases() {
+        // Already normalized
+        assert_eq!(normalize_prefix("/api"), "/api");
+        // Strips trailing slash
+        assert_eq!(normalize_prefix("/api/"), "/api");
+        // Adds leading slash
+        assert_eq!(normalize_prefix("api"), "/api");
+        // Strips trailing + adds leading
+        assert_eq!(normalize_prefix("api/"), "/api");
+        // Root
+        assert_eq!(normalize_prefix("/"), "/");
+        // Empty becomes /
+        assert_eq!(normalize_prefix(""), "/");
+    }
+
+    #[test]
+    fn build_matchit_path_cases() {
+        // Path is root — uses prefix only
+        assert_eq!(build_matchit_path("/api", "/"), "/api");
+        // Path is empty — uses prefix only
+        assert_eq!(build_matchit_path("/api", ""), "/api");
+        // Path with leading slash — concatenated directly
+        assert_eq!(build_matchit_path("/api", "/rooms"), "/api/rooms");
+        // Path without leading slash — gets / separator
+        assert_eq!(build_matchit_path("/api", "rooms"), "/api/rooms");
+        // Params converted to braces
+        assert_eq!(build_matchit_path("/api", "/rooms/:id"), "/api/rooms/{id}");
+        // Nested prefix with param
+        assert_eq!(build_matchit_path("/api/v1", "/:resource/:id"), "/api/v1/{resource}/{id}");
+    }
+
+    #[test]
     fn resolve_simple_get() {
         let router = MahaloRouter::new().get(
             "/health",

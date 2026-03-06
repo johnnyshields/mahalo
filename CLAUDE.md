@@ -11,7 +11,7 @@ crates/
   mahalo/           # Umbrella crate - re-exports everything
   mahalo-core/      # Conn, Plug, Pipeline, Controller, AssignKey
   mahalo-router/    # MahaloRouter, scopes, resources, named routes, path matching
-  mahalo-endpoint/  # Axum bridge, HTTP server, error handlers, after-plugs, rebar supervision
+  mahalo-endpoint/  # io_uring HTTP server, error handlers, after-plugs, rebar supervision
   mahalo-pubsub/    # Topic-based PubSub with broadcast channels
   mahalo-channel/   # Phoenix-compatible WebSocket channels
   mahalo-telemetry/ # Telemetry events, handlers, spans
@@ -25,7 +25,7 @@ crates/
 - **Pipeline** (`mahalo-core`): Ordered sequence of Plugs, halts early if `conn.halted`.
 - **Controller** (`mahalo-core`): RESTful trait with index/show/create/update/delete.
 - **MahaloRouter** (`mahalo-router`): Routes with scopes, named pipelines, named routes, `resources()` for CRUD, and `path_for()` reverse routing.
-- **MahaloEndpoint** (`mahalo-endpoint`): Bridges MahaloRouter to Axum. Body limit: 2MB default. Supports custom error handlers and after-plugs (post-handler pipeline).
+- **MahaloEndpoint** (`mahalo-endpoint`): Bridges MahaloRouter to io_uring HTTP server. Body limit: 2MB default. Supports custom error handlers and after-plugs (post-handler pipeline).
 - **ErrorHandler** (`mahalo-endpoint`): `Arc<dyn Fn(StatusCode, Conn) -> Conn + Send + Sync>`. Built-in: `json_error_handler()`, `text_error_handler()`.
 - **PubSub** (`mahalo-pubsub`): Background tokio task managing topic -> broadcast channel map.
 - **Channel** (`mahalo-channel`): Phoenix-compatible WebSocket channels with join/handle_in/handle_info/terminate.
@@ -54,7 +54,7 @@ There are no features flags. Edition is 2024. All crates use `workspace = true` 
 ## Dependencies
 
 - **rebar-core**: OTP-style runtime, supervision, processes (path dep at `../rebar`)
-- **axum 0.8**: HTTP server (with `ws` feature for WebSockets)
+- **io-uring 0.7**: Linux io_uring HTTP server
 - **tokio**: Async runtime (full features)
 - **serde/serde_json**: Serialization
 - **http**: HTTP types (Method, StatusCode, Uri, HeaderMap)

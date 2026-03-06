@@ -54,26 +54,6 @@ impl Conn {
         }
     }
 
-    /// Fast constructor from pre-decomposed HTTP request parts.
-    /// Avoids all cloning — moves parts directly into Conn.
-    pub fn from_parts(parts: http::request::Parts) -> Self {
-        Self {
-            method: parts.method,
-            uri: parts.uri,
-            headers: parts.headers,
-            path_params: HashMap::new(),
-            query_params: HashMap::new(),
-            remote_addr: None,
-            body: Bytes::new(),
-            status: StatusCode::OK,
-            resp_headers: HeaderMap::new(),
-            resp_body: Bytes::new(),
-            halted: false,
-            assigns: None,
-            runtime: None,
-        }
-    }
-
     pub fn put_status(mut self, status: StatusCode) -> Self {
         self.status = status;
         self

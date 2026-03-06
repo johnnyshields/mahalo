@@ -391,6 +391,24 @@ mod tests {
     }
 
     #[test]
+    fn serialize_response_into_reuses_buffer_capacity() {
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .put_status(StatusCode::OK)
+            .put_resp_body("Hello");
+
+        let mut buf = Vec::with_capacity(512);
+        serialize_response_into(&conn, true, &mut buf);
+        let first_len = buf.len();
+        let cap_after_first = buf.capacity();
+
+        // Second call reuses the same buffer — capacity should not grow
+        // for a same-size response.
+        serialize_response_into(&conn, true, &mut buf);
+        assert_eq!(buf.len(), first_len);
+        assert_eq!(buf.capacity(), cap_after_first);
+    }
+
+    #[test]
     fn static_responses_well_formed() {
         let r400 = std::str::from_utf8(RESPONSE_400).unwrap();
         assert!(r400.starts_with("HTTP/1.1 400"));
