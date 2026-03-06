@@ -562,11 +562,12 @@ pub(crate) fn run_event_loop(
                     let buf = &buf_pool.slice(buf_idx)[..read_len];
 
                     // Try to reuse a recycled Conn, or parse into a new one.
-                    // Note: Conn recycling (try_parse_into_conn) does not return ws_key,
-                    // so WS upgrade detection only happens on the fallback path. This is
-                    // correct because WS upgrades occur on the first request of a connection
-                    // (before any Conn is available for recycling).
-                    let parse_result = if let Some(mut recycled) = conn_recycle.pop() {
+                    // Skip Conn recycling for WebSocket upgrades since
+                    // try_parse_into_conn doesn't detect ws_key.
+                    let maybe_ws = ws_config.is_some()
+                        && buf.windows(9).any(|w| w.eq_ignore_ascii_case(b"websocket"));
+                    let parse_result = if !maybe_ws && !conn_recycle.is_empty() {
+                        let mut recycled = conn_recycle.pop().unwrap();
                         match http_parse::try_parse_into_conn(&mut recycled, buf, body_limit, peer_addr) {
                             Ok(Some(parsed)) => {
                                 let conn = recycled.with_runtime(Arc::clone(runtime));
@@ -580,7 +581,6 @@ pub(crate) fn run_event_loop(
                                 None // consumed successfully
                             }
                             Ok(None) => {
-                                // Put it back — incomplete request.
                                 conn_recycle.push(recycled);
                                 Some(Ok(None))
                             }
@@ -596,17 +596,15 @@ pub(crate) fn run_event_loop(
                                 if let (Some(ws_key), Some(_wsc)) =
                                     (parsed.ws_key, ws_config)
                                 {
-                                    // WebSocket upgrade: serialize 101 response into write_buf
                                     let slot = conn_pool.get_mut(slot_idx).unwrap();
                                     buf_pool.free(slot.read_buf_idx);
                                     slot.write_buf.clear();
                                     http_parse::serialize_ws_accept_response(&ws_key, &mut slot.write_buf);
                                     slot.write_offset = 0;
-                                    slot.keep_alive = false; // not used for WS
+                                    slot.keep_alive = false;
 
                                     let ptr = slot.write_buf.as_ptr();
                                     let len = slot.write_buf.len() as u32;
-                                    // Write the 101 response, then transition to WS
                                     let entry = opcode::Write::new(types::Fd(fd), ptr, len)
                                         .build()
                                         .user_data(encode_user_data(STATE_WS_UPGRADING, slot_idx, generation));
@@ -1019,6 +1017,18 @@ pub(crate) fn run_event_loop(
                         let cast_val = rmpv::Value::String(rmpv::Utf8String::from(dispatch.text));
                         let _ = gen_server::cast_from_runtime(runtime, ws.gen_pid, cast_val).await;
                     }
+                }
+            });
+        }
+
+        // Give tokio runtime a chance to process GenServer messages
+        // (dispatched casts above) so replies are ready to drain.
+        if !ws_active_slots.is_empty() {
+            tokio_rt.block_on(async {
+                // Yield multiple times to allow GenServer processing chain to complete
+                // (mailbox receive → handle_cast → channel.join → socket.reply).
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
                 }
             });
         }
