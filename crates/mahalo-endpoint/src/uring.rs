@@ -11,7 +11,7 @@ use nix::libc;
 use rebar_core::gen_server;
 use rebar_core::process::ProcessId;
 use rebar_core::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use mahalo_channel::socket::WsSendItem;
 
@@ -427,6 +427,8 @@ pub(crate) fn run_event_loop(
     let mut ws_dispatches: Vec<WsPendingDispatch> = Vec::with_capacity(64);
     // Track slots that have active WS connections for outbox polling.
     let mut ws_active_slots: Vec<(u32, u32)> = Vec::with_capacity(256); // (slot_idx, generation)
+    // Shared notify for GenServer cast completion signaling.
+    let cast_notify: Arc<Notify> = Arc::new(Notify::new());
 
     // Conn object pool — recycle Conn structs to reuse HeaderMap/HashMap capacity.
     let mut conn_recycle: Vec<Conn> = Vec::with_capacity(CONN_POOL_CAP);
@@ -562,23 +564,43 @@ pub(crate) fn run_event_loop(
                     let buf = &buf_pool.slice(buf_idx)[..read_len];
 
                     // Try to reuse a recycled Conn, or parse into a new one.
-                    // Skip Conn recycling for WebSocket upgrades since
-                    // try_parse_into_conn doesn't detect ws_key.
-                    let maybe_ws = ws_config.is_some()
-                        && buf.windows(9).any(|w| w.eq_ignore_ascii_case(b"websocket"));
-                    let parse_result = if !maybe_ws && !conn_recycle.is_empty() {
+                    // Both paths now detect ws_key, so recycling is always safe.
+                    let parse_result = if !conn_recycle.is_empty() {
                         let mut recycled = conn_recycle.pop().unwrap();
                         match http_parse::try_parse_into_conn(&mut recycled, buf, body_limit, peer_addr) {
                             Ok(Some(parsed)) => {
-                                let conn = recycled.with_runtime(Arc::clone(runtime));
-                                pending_meta.push(PendingRequest {
-                                    slot_idx,
-                                    generation,
-                                    fd,
-                                    keep_alive: parsed.keep_alive,
-                                });
-                                pending_conns.push(conn);
-                                None // consumed successfully
+                                // Check for WebSocket upgrade on recycled path
+                                if let (Some(ws_key), Some(_wsc)) =
+                                    (parsed.ws_key, ws_config)
+                                {
+                                    conn_recycle.push(recycled);
+                                    let slot = conn_pool.get_mut(slot_idx).unwrap();
+                                    buf_pool.free(slot.read_buf_idx);
+                                    slot.write_buf.clear();
+                                    http_parse::serialize_ws_accept_response(&ws_key, &mut slot.write_buf);
+                                    slot.write_offset = 0;
+                                    slot.keep_alive = false;
+
+                                    let ptr = slot.write_buf.as_ptr();
+                                    let len = slot.write_buf.len() as u32;
+                                    let entry = opcode::Write::new(types::Fd(fd), ptr, len)
+                                        .build()
+                                        .user_data(encode_user_data(STATE_WS_UPGRADING, slot_idx, generation));
+                                    unsafe {
+                                        ring.submission().push(&entry).ok();
+                                    }
+                                    None
+                                } else {
+                                    let conn = recycled.with_runtime(Arc::clone(runtime));
+                                    pending_meta.push(PendingRequest {
+                                        slot_idx,
+                                        generation,
+                                        fd,
+                                        keep_alive: parsed.keep_alive,
+                                    });
+                                    pending_conns.push(conn);
+                                    None // consumed successfully
+                                }
                             }
                             Ok(None) => {
                                 conn_recycle.push(recycled);
@@ -703,11 +725,12 @@ pub(crate) fn run_event_loop(
 
                     // Start GenServer for this connection
                     let gen_pid = tokio_rt.block_on(async {
-                        let server = mahalo_channel::socket::ChannelConnectionServer::new(
+                        let server = mahalo_channel::socket::ChannelConnectionServer::with_notify(
                             Arc::clone(&wsc.channel_router),
                             wsc.pubsub.clone(),
                             tx.clone(),
                             Arc::clone(runtime),
+                            Arc::clone(&cast_notify),
                         );
                         gen_server::start(runtime, server, rmpv::Value::Nil).await
                     });
@@ -1006,6 +1029,7 @@ pub(crate) fn run_event_loop(
         }
 
         // ---- Batched WebSocket dispatch ----
+        let mut casts_dispatched: usize = 0;
         if !ws_dispatches.is_empty() {
             tokio_rt.block_on(async {
                 for dispatch in ws_dispatches.drain(..) {
@@ -1016,19 +1040,23 @@ pub(crate) fn run_event_loop(
                     if let Some(ws) = &slot.ws {
                         let cast_val = rmpv::Value::String(rmpv::Utf8String::from(dispatch.text));
                         let _ = gen_server::cast_from_runtime(runtime, ws.gen_pid, cast_val).await;
+                        casts_dispatched += 1;
                     }
                 }
             });
         }
 
-        // Give tokio runtime a chance to process GenServer messages
-        // (dispatched casts above) so replies are ready to drain.
-        if !ws_active_slots.is_empty() {
+        // Wait for GenServer cast processing to complete so replies are
+        // ready to drain. Each handle_cast signals cast_notify on completion.
+        if casts_dispatched > 0 {
             tokio_rt.block_on(async {
-                // Yield multiple times to allow GenServer processing chain to complete
-                // (mailbox receive → handle_cast → channel.join → socket.reply).
-                for _ in 0..4 {
-                    tokio::task::yield_now().await;
+                for _ in 0..casts_dispatched {
+                    if tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        cast_notify.notified(),
+                    ).await.is_err() {
+                        break; // Timed out waiting — proceed with whatever is ready.
+                    }
                 }
             });
         }

@@ -7,7 +7,7 @@ use axum::extract::ws::{Message as WsMessage, WebSocket};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 /// The type carried over the internal channel from ChannelSocket → WebSocket sink.
 /// Decoupled from any specific WebSocket library (axum, tungstenite, etc.).
@@ -404,6 +404,9 @@ pub struct ChannelConnectionServer {
     pubsub: PubSub,
     ws_tx: mpsc::UnboundedSender<WsSendItem>,
     runtime: Arc<Runtime>,
+    /// Signaled after each `handle_cast` completes, so the io_uring event loop
+    /// can drain replies without arbitrary yield loops.
+    cast_notify: Arc<Notify>,
 }
 
 impl ChannelConnectionServer {
@@ -414,11 +417,26 @@ impl ChannelConnectionServer {
         ws_tx: mpsc::UnboundedSender<WsSendItem>,
         runtime: Arc<Runtime>,
     ) -> Self {
+        Self::with_notify(channel_router, pubsub, ws_tx, runtime, Arc::new(Notify::new()))
+    }
+
+    /// Create a ChannelConnectionServer with a shared `Notify` for cast completion signaling.
+    ///
+    /// The io_uring event loop passes its own `Arc<Notify>` here so it can
+    /// wait for cast processing to finish instead of using arbitrary yield loops.
+    pub fn with_notify(
+        channel_router: Arc<ChannelRouter>,
+        pubsub: PubSub,
+        ws_tx: mpsc::UnboundedSender<WsSendItem>,
+        runtime: Arc<Runtime>,
+        cast_notify: Arc<Notify>,
+    ) -> Self {
         Self {
             channel_router,
             pubsub,
             ws_tx,
             runtime,
+            cast_notify,
         }
     }
 }
@@ -495,6 +513,7 @@ impl GenServer for ChannelConnectionServer {
                 }
             }
         }
+        self.cast_notify.notify_one();
         CastReply::NoReply(state)
     }
 
@@ -559,12 +578,12 @@ pub async fn handle_websocket(
     let send_task = spawn_ws_forwarder(ws_sender, rx);
 
     // Start GenServer for this connection
-    let server = ChannelConnectionServer {
+    let server = ChannelConnectionServer::new(
         channel_router,
         pubsub,
-        ws_tx: tx,
-        runtime: Arc::clone(&runtime),
-    };
+        tx,
+        Arc::clone(&runtime),
+    );
     let pid = gen_server::start(&runtime, server, rmpv::Value::Nil).await;
 
     // Read WebSocket messages and cast them to the GenServer

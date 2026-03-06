@@ -165,6 +165,42 @@ fn finalize_body_and_keepalive(
     Ok(Some((body, keep_alive, total)))
 }
 
+/// Detect WebSocket upgrade from raw parsed headers.
+///
+/// Returns `Some(key)` when method is GET and headers contain:
+/// - `Upgrade: websocket`
+/// - `Sec-WebSocket-Key: <key>`
+/// - `Sec-WebSocket-Version: 13`
+fn detect_ws_key(method: &Method, headers: &[httparse::Header<'_>], header_map: &HeaderMap) -> Option<String> {
+    if *method != Method::GET {
+        return None;
+    }
+    let mut upgrade_websocket = false;
+    let mut key: Option<String> = None;
+    for h in headers {
+        if h.name.eq_ignore_ascii_case("upgrade") {
+            if let Ok(v) = std::str::from_utf8(h.value) {
+                if v.eq_ignore_ascii_case("websocket") {
+                    upgrade_websocket = true;
+                }
+            }
+        } else if h.name.eq_ignore_ascii_case("sec-websocket-key") {
+            if let Ok(v) = std::str::from_utf8(h.value) {
+                key = Some(v.trim().to_string());
+            }
+        }
+    }
+    if upgrade_websocket && key.is_some() {
+        // RFC 6455 §4.2.1: Sec-WebSocket-Version must be 13.
+        let version_ok = header_map.get("sec-websocket-version")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim() == "13");
+        if version_ok { key } else { None }
+    } else {
+        None
+    }
+}
+
 /// Attempt to parse an HTTP/1.1 request from `buf`.
 ///
 /// Returns `Ok(None)` if the buffer contains a partial request (need more data).
@@ -195,36 +231,7 @@ pub fn try_parse_request(
     conn.body = body;
     conn.remote_addr = Some(peer_addr);
 
-    // Scan for WebSocket upgrade headers (only needed for try_parse_request,
-    // not the try_parse_into_conn path which never returns ws_key).
-    let ws_key = if conn.method == Method::GET {
-        let mut upgrade_websocket = false;
-        let mut key: Option<String> = None;
-        for h in raw.headers {
-            if h.name.eq_ignore_ascii_case("upgrade") {
-                if let Ok(v) = std::str::from_utf8(h.value) {
-                    if v.eq_ignore_ascii_case("websocket") {
-                        upgrade_websocket = true;
-                    }
-                }
-            } else if h.name.eq_ignore_ascii_case("sec-websocket-key") {
-                if let Ok(v) = std::str::from_utf8(h.value) {
-                    key = Some(v.trim().to_string());
-                }
-            }
-        }
-        if upgrade_websocket && key.is_some() {
-            // RFC 6455 §4.2.1: Sec-WebSocket-Version must be 13.
-            let version_ok = conn.headers.get("sec-websocket-version")
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.trim() == "13");
-            if version_ok { key } else { None }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let ws_key = detect_ws_key(&conn.method, raw.headers, &conn.headers);
 
     Ok(Some(ParsedRequest {
         conn,
@@ -238,6 +245,7 @@ pub fn try_parse_request(
 pub struct ParsedIntoResult {
     pub keep_alive: bool,
     pub bytes_consumed: usize,
+    pub ws_key: Option<String>,
 }
 
 /// Parse an HTTP request into an existing Conn, reusing its backing allocations.
@@ -266,9 +274,12 @@ pub fn try_parse_into_conn(
     conn.body = body;
     conn.remote_addr = Some(peer_addr);
 
+    let ws_key = detect_ws_key(&conn.method, raw.headers, &conn.headers);
+
     Ok(Some(ParsedIntoResult {
         keep_alive,
         bytes_consumed: total,
+        ws_key,
     }))
 }
 
@@ -680,5 +691,48 @@ mod tests {
         let raw = b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
         let result = try_parse_request(raw, 1024, addr()).unwrap().unwrap();
         assert_eq!(result.ws_key, None, "Missing version header should not produce ws_key");
+    }
+
+    // -- try_parse_into_conn WebSocket detection tests --
+
+    #[test]
+    fn parse_into_conn_detects_ws_upgrade() {
+        let raw = b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        let mut conn = Conn::new(Method::GET, Uri::from_static("/"));
+        let result = try_parse_into_conn(&mut conn, raw, 1024, addr()).unwrap().unwrap();
+        assert_eq!(result.ws_key, Some("dGhlIHNhbXBsZSBub25jZQ==".to_string()));
+    }
+
+    #[test]
+    fn parse_into_conn_normal_get_no_ws_key() {
+        let raw = b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut conn = Conn::new(Method::GET, Uri::from_static("/"));
+        let result = try_parse_into_conn(&mut conn, raw, 1024, addr()).unwrap().unwrap();
+        assert_eq!(result.ws_key, None);
+    }
+
+    #[test]
+    fn parse_into_conn_post_with_websocket_body_no_ws_key() {
+        // POST body containing "websocket" must NOT trigger WS detection.
+        let body = b"{\"type\":\"websocket\"}";
+        let header = format!(
+            "POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut raw = Vec::new();
+        raw.extend_from_slice(header.as_bytes());
+        raw.extend_from_slice(body);
+
+        let mut conn = Conn::new(Method::GET, Uri::from_static("/"));
+        let result = try_parse_into_conn(&mut conn, &raw, 1024, addr()).unwrap().unwrap();
+        assert_eq!(result.ws_key, None, "POST with websocket in body should not produce ws_key");
+    }
+
+    #[test]
+    fn parse_into_conn_ws_rejected_without_version_13() {
+        let raw = b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n";
+        let mut conn = Conn::new(Method::GET, Uri::from_static("/"));
+        let result = try_parse_into_conn(&mut conn, raw, 1024, addr()).unwrap().unwrap();
+        assert_eq!(result.ws_key, None, "Version != 13 should not produce ws_key");
     }
 }
