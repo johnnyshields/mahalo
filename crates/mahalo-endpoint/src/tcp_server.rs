@@ -10,7 +10,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::endpoint::ErrorHandler;
+use crate::endpoint::{ErrorHandler, WsConfig};
 use crate::http_parse::{self, ParseError};
 
 /// Start a multi-threaded tokio-based TCP server.
@@ -26,8 +26,7 @@ pub fn start_tcp_server(
     after_plugs: Arc<Vec<Box<dyn Plug>>>,
     runtime: Arc<Runtime>,
     body_limit: usize,
-    channel_router: Option<Arc<ChannelRouter>>,
-    pubsub: Option<PubSub>,
+    ws_config: Option<WsConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -52,8 +51,7 @@ pub fn start_tcp_server(
         let error_handler = Arc::clone(&error_handler);
         let after_plugs = Arc::clone(&after_plugs);
         let runtime = Arc::clone(&runtime);
-        let channel_router = channel_router.clone();
-        let pubsub = pubsub.clone();
+        let ws_config = ws_config.clone();
 
         #[cfg(target_os = "windows")]
         let shared_listener = shared_listener.clone();
@@ -99,8 +97,7 @@ pub fn start_tcp_server(
                         let error_handler = Arc::clone(&error_handler);
                         let after_plugs = Arc::clone(&after_plugs);
                         let runtime = Arc::clone(&runtime);
-                        let channel_router = channel_router.clone();
-                        let pubsub = pubsub.clone();
+                        let ws_config = ws_config.clone();
 
                         tokio::spawn(async move {
                             handle_connection(
@@ -111,8 +108,7 @@ pub fn start_tcp_server(
                                 &after_plugs,
                                 &runtime,
                                 body_limit,
-                                channel_router.as_ref(),
-                                pubsub.as_ref(),
+                                ws_config.as_ref(),
                             )
                             .await;
                         });
@@ -167,8 +163,7 @@ async fn handle_connection(
     after_plugs: &[Box<dyn Plug>],
     runtime: &Arc<Runtime>,
     body_limit: usize,
-    channel_router: Option<&Arc<ChannelRouter>>,
-    pubsub: Option<&PubSub>,
+    ws_config: Option<&WsConfig>,
 ) {
     let mut buf = vec![0u8; 8192];
     let mut filled = 0;
@@ -186,8 +181,8 @@ async fn handle_connection(
             match http_parse::try_parse_request(&buf[..filled], body_limit, peer_addr) {
                 Ok(Some(parsed)) => {
                     // Check for WebSocket upgrade.
-                    if let (Some(ws_key), Some(cr), Some(ps)) =
-                        (parsed.ws_key, channel_router, pubsub)
+                    if let (Some(ws_key), Some(wsc)) =
+                        (parsed.ws_key, ws_config)
                     {
                         // Write the 101 response manually.
                         let mut resp_buf = Vec::new();
@@ -197,7 +192,7 @@ async fn handle_connection(
                         }
 
                         // Upgrade the raw TCP stream to a WebSocket using tokio-tungstenite.
-                        handle_ws_upgraded(stream, cr, ps, runtime).await;
+                        handle_ws_upgraded(stream, &wsc.channel_router, &wsc.pubsub, runtime).await;
                         return;
                     }
 
@@ -316,8 +311,14 @@ async fn handle_ws_upgraded(
         }
     }
 
+    // Kill the GenServer — this triggers terminate() for cleanup (unsubscribe, leave channels).
+    // Killing also drops internal tx clones, causing the send_task's rx.recv() to return None.
     runtime.kill(pid);
-    send_task.abort();
+    // Give the send_task a brief window to finish gracefully before aborting.
+    tokio::select! {
+        _ = send_task => {}
+        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+    }
 }
 
 #[cfg(test)]

@@ -130,11 +130,22 @@ pub fn try_parse_request(
     conn.body = body;
     conn.remote_addr = Some(peer_addr);
 
+    // WebSocket upgrade requires GET method and Sec-WebSocket-Version: 13 (RFC 6455 §4.2.1).
+    let ws_key = if upgrade_websocket && method == Method::GET {
+        // Check Sec-WebSocket-Version header.
+        let version_ok = conn.headers.get("sec-websocket-version")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim() == "13");
+        if version_ok { ws_key } else { None }
+    } else {
+        None
+    };
+
     Ok(Some(ParsedRequest {
         conn,
         keep_alive,
         bytes_consumed: total,
-        ws_key: if upgrade_websocket { ws_key } else { None },
+        ws_key,
     }))
 }
 
@@ -485,5 +496,26 @@ mod tests {
         assert!(response.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
         assert!(response.contains("Upgrade: websocket"));
         assert!(response.contains("Connection: Upgrade"));
+    }
+
+    #[test]
+    fn ws_upgrade_rejected_for_post_method() {
+        let raw = b"POST /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        let result = try_parse_request(raw, 1024, addr()).unwrap().unwrap();
+        assert_eq!(result.ws_key, None, "POST with Upgrade should not produce ws_key");
+    }
+
+    #[test]
+    fn ws_upgrade_rejected_without_version_13() {
+        let raw = b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n";
+        let result = try_parse_request(raw, 1024, addr()).unwrap().unwrap();
+        assert_eq!(result.ws_key, None, "Version != 13 should not produce ws_key");
+    }
+
+    #[test]
+    fn ws_upgrade_rejected_without_version_header() {
+        let raw = b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+        let result = try_parse_request(raw, 1024, addr()).unwrap().unwrap();
+        assert_eq!(result.ws_key, None, "Missing version header should not produce ws_key");
     }
 }

@@ -13,4 +13,4 @@ pub mod worker;
 pub mod tcp_server;
 
 pub use application::{MahaloApplication, MahaloApplicationBuilder};
-pub use endpoint::{json_error_handler, text_error_handler, ErrorHandler, MahaloEndpoint};
+pub use endpoint::{json_error_handler, text_error_handler, ErrorHandler, MahaloEndpoint, WsConfig};

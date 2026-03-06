@@ -71,6 +71,11 @@ pub fn try_parse_frame(buf: &[u8]) -> Result<Option<(WsFrame, usize)>, WsError> 
         return Err(WsError::ProtocolError("client frame not masked".into()));
     }
 
+    // Reserved opcodes (3-7, 11-15) MUST cause failure (RFC 6455 §5.2).
+    if matches!(opcode, 3..=7 | 11..=15) {
+        return Err(WsError::ProtocolError(format!("reserved opcode {opcode}")));
+    }
+
     let (payload_len, header_offset) = match b1 & 0x7F {
         len @ 0..=125 => (len as u64, 2),
         126 => {
@@ -375,5 +380,52 @@ mod tests {
     #[test]
     fn parse_empty_buffer() {
         assert!(try_parse_frame(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_reserved_opcode_3_rejected() {
+        let frame = build_masked_frame(3, b"data", [0x01, 0x02, 0x03, 0x04]);
+        match try_parse_frame(&frame) {
+            Err(WsError::ProtocolError(msg)) => assert!(msg.contains("reserved opcode")),
+            other => panic!("expected ProtocolError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_reserved_opcode_7_rejected() {
+        let frame = build_masked_frame(7, b"", [0x01, 0x02, 0x03, 0x04]);
+        assert!(matches!(try_parse_frame(&frame), Err(WsError::ProtocolError(_))));
+    }
+
+    #[test]
+    fn parse_reserved_opcode_11_rejected() {
+        let frame = build_masked_frame(11, b"", [0x01, 0x02, 0x03, 0x04]);
+        assert!(matches!(try_parse_frame(&frame), Err(WsError::ProtocolError(_))));
+    }
+
+    #[test]
+    fn parse_reserved_opcode_15_rejected() {
+        let frame = build_masked_frame(15, b"", [0x01, 0x02, 0x03, 0x04]);
+        assert!(matches!(try_parse_frame(&frame), Err(WsError::ProtocolError(_))));
+    }
+
+    #[test]
+    fn parse_close_frame_empty_payload() {
+        // Close frame with no payload (no status code) — valid per RFC 6455 §5.5.1.
+        let frame = build_masked_frame(OPCODE_CLOSE, b"", [0x01, 0x02, 0x03, 0x04]);
+        let (parsed, _) = try_parse_frame(&frame).unwrap().unwrap();
+        assert_eq!(parsed.opcode, OPCODE_CLOSE);
+        assert!(parsed.payload.is_empty());
+    }
+
+    #[test]
+    fn parse_close_frame_one_byte_payload() {
+        // Close frame with 1-byte payload is technically invalid per RFC 6455 §5.5.1
+        // (must be 0 or >= 2 bytes), but our parser accepts it since the opcode-level
+        // validation happens at a higher layer. The frame is structurally well-formed.
+        let frame = build_masked_frame(OPCODE_CLOSE, &[0x42], [0x01, 0x02, 0x03, 0x04]);
+        let (parsed, _) = try_parse_frame(&frame).unwrap().unwrap();
+        assert_eq!(parsed.opcode, OPCODE_CLOSE);
+        assert_eq!(parsed.payload.len(), 1);
     }
 }

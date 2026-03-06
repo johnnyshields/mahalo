@@ -19,6 +19,16 @@ pub type ErrorHandler = Arc<dyn Fn(StatusCode, Conn) -> Conn + Send + Sync>;
 /// Default maximum request body size (2 MB).
 pub(crate) const DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
+/// Bundles WebSocket channel configuration (channel router + PubSub).
+///
+/// Used instead of two separate `Option`s to enforce the invariant that
+/// channel_router and pubsub are always provided together.
+#[derive(Clone)]
+pub struct WsConfig {
+    pub channel_router: Arc<ChannelRouter>,
+    pub pubsub: PubSub,
+}
+
 /// Bridges MahaloRouter to an HTTP server with rebar supervision support.
 ///
 /// On Linux, uses io_uring for maximum performance. On other platforms
@@ -29,8 +39,7 @@ pub struct MahaloEndpoint {
     runtime: Arc<Runtime>,
     error_handler: Option<ErrorHandler>,
     after_plugs: Vec<Box<dyn Plug>>,
-    channel_router: Option<Arc<ChannelRouter>>,
-    pubsub: Option<PubSub>,
+    ws_config: Option<WsConfig>,
 }
 
 impl MahaloEndpoint {
@@ -41,8 +50,7 @@ impl MahaloEndpoint {
             runtime,
             error_handler: None,
             after_plugs: Vec::new(),
-            channel_router: None,
-            pubsub: None,
+            ws_config: None,
         }
     }
 
@@ -57,8 +65,10 @@ impl MahaloEndpoint {
 
     /// Configure WebSocket channel support.
     pub fn channels(mut self, channel_router: ChannelRouter, pubsub: PubSub) -> Self {
-        self.channel_router = Some(Arc::new(channel_router));
-        self.pubsub = Some(pubsub);
+        self.ws_config = Some(WsConfig {
+            channel_router: Arc::new(channel_router),
+            pubsub,
+        });
         self
     }
 
@@ -84,8 +94,7 @@ impl MahaloEndpoint {
                 Arc::new(self.after_plugs),
                 self.runtime,
                 DEFAULT_BODY_LIMIT,
-                self.channel_router,
-                self.pubsub,
+                self.ws_config,
             )
         }
 
@@ -98,8 +107,7 @@ impl MahaloEndpoint {
                 Arc::new(self.after_plugs),
                 self.runtime,
                 DEFAULT_BODY_LIMIT,
-                self.channel_router,
-                self.pubsub,
+                self.ws_config,
             )
         }
     }
@@ -112,16 +120,14 @@ impl MahaloEndpoint {
         let runtime = self.runtime;
         let error_handler = self.error_handler;
         let after_plugs = Arc::new(self.after_plugs);
-        let channel_router = self.channel_router;
-        let pubsub = self.pubsub;
+        let ws_config = self.ws_config;
 
         ChildEntry::new(spec, move || {
             let router = Arc::clone(&router);
             let runtime = Arc::clone(&runtime);
             let error_handler = error_handler.clone();
             let after_plugs = Arc::clone(&after_plugs);
-            let channel_router = channel_router.clone();
-            let pubsub = pubsub.clone();
+            let ws_config = ws_config.clone();
             async move {
                 tracing::info!("Mahalo endpoint listening on {}", addr);
 
@@ -133,8 +139,7 @@ impl MahaloEndpoint {
                     after_plugs,
                     runtime,
                     DEFAULT_BODY_LIMIT,
-                    channel_router,
-                    pubsub,
+                    ws_config,
                 );
 
                 #[cfg(not(target_os = "linux"))]
@@ -145,8 +150,7 @@ impl MahaloEndpoint {
                     after_plugs,
                     runtime,
                     DEFAULT_BODY_LIMIT,
-                    channel_router,
-                    pubsub,
+                    ws_config,
                 );
 
                 match result {

@@ -424,6 +424,10 @@ impl ChannelConnectionServer {
 }
 
 /// Internal state for the ChannelConnectionServer GenServer.
+/// Internal state for the ChannelConnectionServer GenServer.
+///
+/// This type is public because it must satisfy the `GenServer::State` associated type,
+/// but it is not re-exported from `lib.rs` and should be treated as an internal detail.
 pub struct ChannelConnectionState {
     joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)>,
     self_pid: rebar_core::process::ProcessId,
@@ -2017,6 +2021,192 @@ mod tests {
         assert!(terminated.load(Ordering::SeqCst), "terminate should be called when stopping() returns ShouldStop::Yes");
 
         server.abort();
+        pubsub.shutdown();
+    }
+
+    // -- ChannelConnectionServer GenServer unit tests --------------------------
+
+    /// Helper: start a ChannelConnectionServer GenServer and return (pid, rx, runtime, pubsub).
+    async fn start_genserver_with_channel(
+        channel: Arc<dyn Channel>,
+        topic_pattern: &str,
+    ) -> (
+        rebar_core::process::ProcessId,
+        mpsc::UnboundedReceiver<WsSendItem>,
+        Arc<Runtime>,
+        PubSub,
+    ) {
+        let pubsub = PubSub::start();
+        let runtime = Arc::new(Runtime::new(1));
+        let channel_router = Arc::new(ChannelRouter::new().channel(topic_pattern, channel));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let server = ChannelConnectionServer::new(
+            channel_router,
+            pubsub.clone(),
+            tx,
+            Arc::clone(&runtime),
+        );
+        let pid = gen_server::start(&runtime, server, rmpv::Value::Nil).await;
+        (pid, rx, runtime, pubsub)
+    }
+
+    /// Cast a Phoenix JSON message to the GenServer.
+    async fn cast_phoenix_msg(runtime: &Arc<Runtime>, pid: rebar_core::process::ProcessId, msg: &Value) {
+        let json = serde_json::to_string(msg).unwrap();
+        let cast_val = rmpv::Value::String(rmpv::Utf8String::from(json));
+        gen_server::cast_from_runtime(runtime, pid, cast_val).await.unwrap();
+    }
+
+    /// Read all available messages from the receiver (non-blocking).
+    fn drain_rx(rx: &mut mpsc::UnboundedReceiver<WsSendItem>) -> Vec<Value> {
+        let mut msgs = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            msgs.push(serde_json::from_str(&msg).unwrap());
+        }
+        msgs
+    }
+
+    #[tokio::test]
+    async fn genserver_handle_cast_join_and_event() {
+        let (pid, mut rx, runtime, pubsub) =
+            start_genserver_with_channel(Arc::new(EchoChannel), "room:*").await;
+
+        // Join
+        cast_phoenix_msg(&runtime, pid, &serde_json::json!({
+            "topic": "room:lobby", "event": "phx_join", "payload": {}, "ref": "j1"
+        })).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let msgs = drain_rx(&mut rx);
+        assert!(!msgs.is_empty(), "should receive join reply");
+        assert_eq!(msgs[0]["event"], "phx_reply");
+        assert_eq!(msgs[0]["payload"]["status"], "ok");
+        assert_eq!(msgs[0]["ref"], "j1");
+
+        // Custom event
+        cast_phoenix_msg(&runtime, pid, &serde_json::json!({
+            "topic": "room:lobby", "event": "new_msg", "payload": {"text": "hi"}, "ref": "m1"
+        })).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let msgs = drain_rx(&mut rx);
+        assert!(!msgs.is_empty(), "should receive event reply");
+        assert_eq!(msgs[0]["payload"]["response"]["echo_event"], "new_msg");
+        assert_eq!(msgs[0]["ref"], "m1");
+
+        runtime.kill(pid);
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn genserver_handle_cast_heartbeat() {
+        let (pid, mut rx, runtime, pubsub) =
+            start_genserver_with_channel(Arc::new(DummyChannel), "room:*").await;
+
+        cast_phoenix_msg(&runtime, pid, &serde_json::json!({
+            "topic": "phoenix", "event": "heartbeat", "payload": {}, "ref": "hb-1"
+        })).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let msgs = drain_rx(&mut rx);
+        assert!(!msgs.is_empty());
+        assert_eq!(msgs[0]["event"], "phx_reply");
+        assert_eq!(msgs[0]["payload"]["status"], "ok");
+        assert_eq!(msgs[0]["ref"], "hb-1");
+
+        runtime.kill(pid);
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn genserver_handle_cast_leave() {
+        let (pid, mut rx, runtime, pubsub) =
+            start_genserver_with_channel(Arc::new(DummyChannel), "room:*").await;
+
+        // Join first
+        cast_phoenix_msg(&runtime, pid, &serde_json::json!({
+            "topic": "room:test", "event": "phx_join", "payload": {}, "ref": "j1"
+        })).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drain_rx(&mut rx); // consume join reply
+
+        // Leave
+        cast_phoenix_msg(&runtime, pid, &serde_json::json!({
+            "topic": "room:test", "event": "phx_leave", "payload": {}, "ref": "l1"
+        })).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let msgs = drain_rx(&mut rx);
+        assert!(!msgs.is_empty());
+        assert_eq!(msgs[0]["event"], "phx_reply");
+        assert_eq!(msgs[0]["payload"]["status"], "ok");
+        assert_eq!(msgs[0]["ref"], "l1");
+
+        runtime.kill(pid);
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn genserver_handle_cast_invalid_json_ignored() {
+        let (pid, mut rx, runtime, pubsub) =
+            start_genserver_with_channel(Arc::new(DummyChannel), "room:*").await;
+
+        // Send non-JSON text — should be silently ignored.
+        let cast_val = rmpv::Value::String(rmpv::Utf8String::from("not valid json"));
+        gen_server::cast_from_runtime(&runtime, pid, cast_val).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(drain_rx(&mut rx).is_empty(), "invalid JSON should produce no output");
+
+        runtime.kill(pid);
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn genserver_handle_info_pubsub_broadcast() {
+        // Use a channel that pushes on handle_info
+        struct InfoPushChannel;
+
+        #[async_trait]
+        impl Channel for InfoPushChannel {
+            async fn join(
+                &self, _topic: &str, _payload: &Value, _socket: &mut ChannelSocket,
+            ) -> Result<Value, crate::channel::ChannelError> {
+                Ok(serde_json::json!({}))
+            }
+            async fn handle_in(
+                &self, _event: &str, _payload: &Value, _socket: &mut ChannelSocket,
+            ) -> Result<Option<Reply>, crate::channel::ChannelError> {
+                Ok(None)
+            }
+            async fn handle_info(
+                &self, msg: &mahalo_pubsub::PubSubMessage, socket: &mut ChannelSocket,
+            ) -> Result<(), crate::channel::ChannelError> {
+                socket.push(&msg.event, &msg.payload).await;
+                Ok(())
+            }
+        }
+
+        let (pid, mut rx, runtime, pubsub) =
+            start_genserver_with_channel(Arc::new(InfoPushChannel), "room:*").await;
+
+        // Join to establish PubSub subscription
+        cast_phoenix_msg(&runtime, pid, &serde_json::json!({
+            "topic": "room:lobby", "event": "phx_join", "payload": {}, "ref": "j1"
+        })).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drain_rx(&mut rx); // consume join reply
+
+        // Broadcast via PubSub — should arrive via handle_info
+        pubsub.broadcast("room:lobby", "server_push", serde_json::json!({"data": 42}));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let msgs = drain_rx(&mut rx);
+        assert!(!msgs.is_empty(), "should receive handle_info push from PubSub broadcast");
+        assert_eq!(msgs[0]["event"], "server_push");
+        assert_eq!(msgs[0]["payload"]["data"], 42);
+
+        runtime.kill(pid);
         pubsub.shutdown();
     }
 }
