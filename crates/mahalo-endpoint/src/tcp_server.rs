@@ -213,7 +213,6 @@ mod tests {
     use mahalo_core::conn::Conn;
     use mahalo_core::plug::plug_fn;
     use rebar_core::runtime::Runtime;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpListener;
 
     #[test]
