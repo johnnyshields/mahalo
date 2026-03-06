@@ -112,6 +112,18 @@ impl Conn {
         self
     }
 
+    /// Fast path for setting response headers with pre-validated HeaderName constants.
+    /// Use with `http::header::CONTENT_TYPE`, `http::header::CACHE_CONTROL`, etc.
+    #[inline]
+    pub fn put_resp_header_static(
+        mut self,
+        key: http::header::HeaderName,
+        value: http::header::HeaderValue,
+    ) -> Self {
+        self.resp_headers.insert(key, value);
+        self
+    }
+
     #[inline]
     pub fn put_resp_body(mut self, body: impl Into<Bytes>) -> Self {
         self.resp_body = body.into();

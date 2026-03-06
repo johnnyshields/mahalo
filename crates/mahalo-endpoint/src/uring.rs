@@ -1007,6 +1007,8 @@ pub(crate) fn run_event_loop(
             results.clear();
             let r = &mut results;
             let pc = &mut pending_conns;
+            // Single block_on call for all pending requests — amortizes
+            // tokio runtime enter/leave overhead across the batch.
             tokio_rt.block_on(async {
                 for conn in pc.drain(..) {
                     r.push(crate::handler::execute_request(conn, router, error_handler, after_plugs).await);

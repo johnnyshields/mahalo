@@ -92,13 +92,64 @@ fn parse_raw<'buf, 'hdr>(
     }))
 }
 
+/// Fast lookup for common header names — avoids the hash+validation in
+/// `HeaderName::from_bytes()` for headers we see on virtually every request.
+#[inline]
+fn fast_header_name(name: &[u8]) -> Option<http::header::HeaderName> {
+    // Match on length first (branch predictor friendly), then content.
+    match name.len() {
+        4 => {
+            if name.eq_ignore_ascii_case(b"host") {
+                return Some(http::header::HOST);
+            }
+        }
+        6 => {
+            if name.eq_ignore_ascii_case(b"accept") {
+                return Some(http::header::ACCEPT);
+            }
+            if name.eq_ignore_ascii_case(b"cookie") {
+                return Some(http::header::COOKIE);
+            }
+        }
+        10 => {
+            if name.eq_ignore_ascii_case(b"connection") {
+                return Some(http::header::CONNECTION);
+            }
+            if name.eq_ignore_ascii_case(b"user-agent") {
+                return Some(http::header::USER_AGENT);
+            }
+        }
+        12 => {
+            if name.eq_ignore_ascii_case(b"content-type") {
+                return Some(http::header::CONTENT_TYPE);
+            }
+        }
+        14 => {
+            if name.eq_ignore_ascii_case(b"content-length") {
+                return Some(http::header::CONTENT_LENGTH);
+            }
+        }
+        15 => {
+            if name.eq_ignore_ascii_case(b"accept-encoding") {
+                return Some(http::header::ACCEPT_ENCODING);
+            }
+            if name.eq_ignore_ascii_case(b"accept-language") {
+                return Some(http::header::ACCEPT_LANGUAGE);
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 /// Convert parsed httparse headers into an `http::HeaderMap`.
 #[inline]
 fn build_header_map(headers: &[httparse::Header<'_>]) -> Result<HeaderMap, ParseError> {
     let mut map = HeaderMap::with_capacity(headers.len());
     for h in headers {
-        let name = http::header::HeaderName::from_bytes(h.name.as_bytes())
-            .map_err(|_| ParseError::InvalidRequest)?;
+        let name = fast_header_name(h.name.as_bytes())
+            .or_else(|| http::header::HeaderName::from_bytes(h.name.as_bytes()).ok())
+            .ok_or(ParseError::InvalidRequest)?;
         // SAFETY: httparse already validated that header values contain only
         // visible ASCII characters and spaces/tabs (RFC 7230 field-value).
         // Skipping re-validation avoids redundant work on the hot path.
@@ -116,8 +167,9 @@ fn build_header_map(headers: &[httparse::Header<'_>]) -> Result<HeaderMap, Parse
 #[inline]
 fn append_headers(map: &mut HeaderMap, headers: &[httparse::Header<'_>]) -> Result<(), ParseError> {
     for h in headers {
-        let name = http::header::HeaderName::from_bytes(h.name.as_bytes())
-            .map_err(|_| ParseError::InvalidRequest)?;
+        let name = fast_header_name(h.name.as_bytes())
+            .or_else(|| http::header::HeaderName::from_bytes(h.name.as_bytes()).ok())
+            .ok_or(ParseError::InvalidRequest)?;
         // SAFETY: httparse already validated header values.
         let value = unsafe {
             http::header::HeaderValue::from_maybe_shared_unchecked(

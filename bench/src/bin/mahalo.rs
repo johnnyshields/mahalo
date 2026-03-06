@@ -5,8 +5,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use http::StatusCode;
+use http::header::{HeaderValue, CONTENT_TYPE};
 use mahalo::{Conn, MahaloEndpoint, MahaloRouter, plug_fn};
 use rebar_core::runtime::Runtime;
+
+/// Pre-validated header values — avoids per-request parsing.
+static CT_TEXT: HeaderValue = HeaderValue::from_static("text/plain");
+static CT_JSON: HeaderValue = HeaderValue::from_static("application/json");
 
 #[tokio::main]
 async fn main() {
@@ -22,7 +27,7 @@ async fn main() {
             "/plaintext",
             plug_fn(|conn: Conn| async {
                 conn.put_status(StatusCode::OK)
-                    .put_resp_header("content-type", "text/plain")
+                    .put_resp_header_static(CONTENT_TYPE, CT_TEXT.clone())
                     .put_resp_body("Hello, World!")
             }),
         )
@@ -30,7 +35,7 @@ async fn main() {
             "/json",
             plug_fn(|conn: Conn| async {
                 conn.put_status(StatusCode::OK)
-                    .put_resp_header("content-type", "application/json")
+                    .put_resp_header_static(CONTENT_TYPE, CT_JSON.clone())
                     .put_resp_body(r#"{"message":"Hello, World!"}"#)
             }),
         );
