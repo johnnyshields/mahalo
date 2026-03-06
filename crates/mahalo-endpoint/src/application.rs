@@ -6,7 +6,7 @@ use rebar_core::supervisor::engine::{SupervisorHandle, start_supervisor};
 use rebar_core::supervisor::spec::{RestartStrategy, SupervisorSpec};
 
 use mahalo_channel::socket::ChannelRouter;
-use mahalo_channel::supervisor::ChannelSupervisor;
+use mahalo_channel::supervisor::{ChannelSupervisor, ChannelSupervisorHandle};
 use mahalo_pubsub::PubSub;
 use mahalo_router::MahaloRouter;
 
@@ -38,8 +38,6 @@ pub struct MahaloApplication {
     router: MahaloRouter,
     channel_router: Option<ChannelRouter>,
     runtime: Arc<Runtime>,
-    // Internal: holds the started PubSub handle after build.
-    pubsub: Option<PubSub>,
 }
 
 impl MahaloApplication {
@@ -48,18 +46,11 @@ impl MahaloApplication {
         MahaloApplicationBuilder::default()
     }
 
-    /// Returns the PubSub handle. Available after [`start()`] returns.
-    ///
-    /// Panics if called before `start()`.
-    pub fn pubsub(&self) -> &PubSub {
-        self.pubsub.as_ref().expect("PubSub not yet started")
-    }
-
     /// Start the application, returning the top-level supervisor handle.
     ///
     /// The returned `SupervisorHandle` keeps the supervision tree running.
     /// Drop it or call `.shutdown()` to stop.
-    pub async fn start(mut self) -> (SupervisorHandle, PubSub) {
+    pub async fn start(self) -> (SupervisorHandle, PubSub, Option<ChannelSupervisorHandle>) {
         let runtime = Arc::clone(&self.runtime);
         let spec = SupervisorSpec::new(RestartStrategy::OneForOne);
         let mut children = Vec::new();
@@ -67,13 +58,15 @@ impl MahaloApplication {
         // 1. PubSub (Permanent) — properly supervised
         let (pubsub, pubsub_entry) = PubSub::new_supervised();
         children.push(pubsub_entry);
-        self.pubsub = Some(pubsub.clone());
 
         // 2. ChannelSupervisor (Permanent) — if WebSocket configured
-        if self.channel_router.is_some() {
-            let (_handle, entry) = ChannelSupervisor::child_entry(Arc::clone(&runtime));
+        let channel_supervisor = if self.channel_router.is_some() {
+            let (handle, entry) = ChannelSupervisor::child_entry(Arc::clone(&runtime));
             children.push(entry);
-        }
+            Some(handle)
+        } else {
+            None
+        };
 
         // 3. HTTP Endpoint (Permanent)
         let endpoint = MahaloEndpoint::new(self.router, self.addr, Arc::clone(&runtime));
@@ -84,7 +77,7 @@ impl MahaloApplication {
         // Give supervised processes a moment to start
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        (handle, pubsub)
+        (handle, pubsub, channel_supervisor)
     }
 }
 
@@ -143,7 +136,6 @@ impl MahaloApplicationBuilder {
             router,
             channel_router: self.channel_router,
             runtime,
-            pubsub: None,
         }
     }
 }
@@ -179,7 +171,7 @@ mod tests {
         );
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-        let (supervisor, pubsub) = MahaloApplication::builder()
+        let (supervisor, pubsub, _channel_sup) = MahaloApplication::builder()
             .bind(addr)
             .router(router)
             .build()

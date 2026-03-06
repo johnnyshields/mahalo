@@ -80,3 +80,150 @@ impl MahaloCluster {
         self.node_id
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+
+    struct MockTopology {
+        initial: Vec<SocketAddr>,
+        poll: Arc<Mutex<Vec<SocketAddr>>>,
+        interval: Duration,
+    }
+
+    #[async_trait]
+    impl TopologyStrategy for MockTopology {
+        async fn initial_peers(&self) -> Vec<SocketAddr> {
+            self.initial.clone()
+        }
+
+        async fn poll_peers(&self) -> Vec<SocketAddr> {
+            self.poll.lock().unwrap().clone()
+        }
+
+        fn poll_interval(&self) -> Duration {
+            self.interval
+        }
+    }
+
+    #[tokio::test]
+    async fn start_returns_correct_node_id() {
+        let pubsub = PubSub::start();
+        let topo = MockTopology {
+            initial: vec![],
+            poll: Arc::new(Mutex::new(vec![])),
+            interval: Duration::from_millis(50),
+        };
+
+        let cluster = MahaloCluster::start(42, topo, pubsub.clone()).await;
+        assert_eq!(cluster.node_id(), 42);
+
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn initial_peers_broadcast_node_up() {
+        let pubsub = PubSub::start();
+        let mut rx = pubsub.subscribe("mahalo:cluster").await.unwrap();
+
+        let peer1: SocketAddr = "127.0.0.1:4001".parse().unwrap();
+        let peer2: SocketAddr = "127.0.0.1:4002".parse().unwrap();
+        let initial = vec![peer1, peer2];
+
+        let topo = MockTopology {
+            initial: initial.clone(),
+            poll: Arc::new(Mutex::new(initial.clone())),
+            interval: Duration::from_millis(50),
+        };
+
+        let _cluster = MahaloCluster::start(1, topo, pubsub.clone()).await;
+
+        // Collect the two node_up messages from initial peers
+        let mut seen_addrs: HashSet<String> = HashSet::new();
+        for _ in 0..2 {
+            let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timed out waiting for node_up")
+                .expect("recv failed");
+            assert_eq!(msg.event, "node_up");
+            let addr = msg.payload["addr"].as_str().unwrap().to_string();
+            seen_addrs.insert(addr);
+        }
+
+        assert!(seen_addrs.contains(&peer1.to_string()));
+        assert!(seen_addrs.contains(&peer2.to_string()));
+
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn poll_detects_new_peer() {
+        let pubsub = PubSub::start();
+        let mut rx = pubsub.subscribe("mahalo:cluster").await.unwrap();
+
+        let poll_peers: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(vec![]));
+
+        let topo = MockTopology {
+            initial: vec![],
+            poll: poll_peers.clone(),
+            interval: Duration::from_millis(50),
+        };
+
+        let _cluster = MahaloCluster::start(10, topo, pubsub.clone()).await;
+
+        // Inject a new peer for the next poll cycle
+        let new_peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        *poll_peers.lock().unwrap() = vec![new_peer];
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for node_up from poll")
+            .expect("recv failed");
+
+        assert_eq!(msg.event, "node_up");
+        assert_eq!(msg.payload["addr"].as_str().unwrap(), new_peer.to_string());
+
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn poll_detects_removed_peer() {
+        let pubsub = PubSub::start();
+        let mut rx = pubsub.subscribe("mahalo:cluster").await.unwrap();
+
+        let peer: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        let poll_peers: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(vec![peer]));
+
+        let topo = MockTopology {
+            initial: vec![peer],
+            poll: poll_peers.clone(),
+            interval: Duration::from_millis(50),
+        };
+
+        let _cluster = MahaloCluster::start(20, topo, pubsub.clone()).await;
+
+        // Drain the initial node_up message
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for initial node_up")
+            .expect("recv failed");
+        assert_eq!(msg.event, "node_up");
+
+        // Remove the peer so next poll detects it as gone
+        *poll_peers.lock().unwrap() = vec![];
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for node_down from poll")
+            .expect("recv failed");
+
+        assert_eq!(msg.event, "node_down");
+        assert_eq!(msg.payload["addr"].as_str().unwrap(), peer.to_string());
+
+        pubsub.shutdown();
+    }
+}

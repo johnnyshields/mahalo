@@ -121,7 +121,12 @@ impl PresenceTracker {
         diff: PresenceDiff,
     ) {
         if let Some(subs) = subscribers.get_mut(topic) {
+            let before = subs.len();
             subs.retain(|tx| tx.send(diff.clone()).is_ok());
+            let dropped = before - subs.len();
+            if dropped > 0 {
+                tracing::warn!(topic = %topic, dropped, "presence diff subscribers dropped (channel closed)");
+            }
         }
     }
 

@@ -113,4 +113,54 @@ mod tests {
         assert_eq!(diff.joins[0].key, "user:2");
         assert!(diff.leaves.is_empty());
     }
+
+    #[tokio::test]
+    async fn subscribe_diff_receives_leave() {
+        let presence = Presence::new(1);
+        // Track first so there is something to untrack.
+        presence.track("room:lobby", "user:5", serde_json::json!({"name": "Eve"}));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Subscribe after the initial track so we don't receive the join diff.
+        let mut diff_rx = presence.subscribe_diff("room:lobby").await;
+
+        presence.untrack("room:lobby", "user:5");
+
+        let diff = tokio::time::timeout(Duration::from_secs(1), diff_rx.recv())
+            .await
+            .expect("timed out")
+            .expect("channel closed");
+        assert_eq!(diff.topic, "room:lobby");
+        assert!(diff.joins.is_empty());
+        assert_eq!(diff.leaves.len(), 1);
+        assert_eq!(diff.leaves[0].key, "user:5");
+    }
+
+    #[tokio::test]
+    async fn multiple_topics_are_isolated() {
+        let presence = Presence::new(1);
+        presence.track("room:a", "user:1", serde_json::json!({"room": "a"}));
+        presence.track("room:b", "user:2", serde_json::json!({"room": "b"}));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let entries_a = presence.list("room:a").await;
+        let entries_b = presence.list("room:b").await;
+
+        assert_eq!(entries_a.len(), 1);
+        assert_eq!(entries_a[0].key, "user:1");
+
+        assert_eq!(entries_b.len(), 1);
+        assert_eq!(entries_b[0].key, "user:2");
+    }
+
+    #[tokio::test]
+    async fn untrack_nonexistent_key_is_silent() {
+        let presence = Presence::new(1);
+        // Untrack a key that was never tracked — should not panic.
+        presence.untrack("room:ghost", "user:999");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let entries = presence.list("room:ghost").await;
+        assert!(entries.is_empty());
+    }
 }

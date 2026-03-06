@@ -102,7 +102,8 @@ impl DistributedPubSub {
     }
 
     /// Access the underlying local PubSub handle.
-    pub fn local(&self) -> &PubSub {
+    #[allow(dead_code)]
+    pub(crate) fn local(&self) -> &PubSub {
         &self.local
     }
 }

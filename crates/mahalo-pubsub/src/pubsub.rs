@@ -184,23 +184,6 @@ impl PubSub {
         (handle, entry)
     }
 
-    /// Create a [`ChildEntry`] so this PubSub server can be supervised by a
-    /// rebar supervisor tree.
-    ///
-    /// # Deprecated
-    /// Use [`PubSub::new_supervised()`] instead. This method wraps an already-running
-    /// server in a dummy supervised process that does not actually supervise it.
-    #[deprecated(since = "0.1.0", note = "use PubSub::new_supervised() instead")]
-    pub fn child_entry(pubsub: Arc<PubSub>) -> ChildEntry {
-        ChildEntry::new(ChildSpec::new("mahalo_pubsub"), move || {
-            let pubsub = Arc::clone(&pubsub);
-            async move {
-                tokio::signal::ctrl_c().await.ok();
-                pubsub.shutdown();
-                ExitReason::Normal
-            }
-        })
-    }
 }
 
 #[cfg(test)]
@@ -309,15 +292,6 @@ mod tests {
         assert_eq!(deserialized.topic, "room:lobby");
         assert_eq!(deserialized.event, "new_msg");
         assert_eq!(deserialized.payload, serde_json::json!({"text": "hello"}));
-    }
-
-    #[tokio::test]
-    async fn child_entry_creates_entry() {
-        let pubsub = PubSub::start();
-        let pubsub_arc = Arc::new(pubsub.clone());
-        let entry = PubSub::child_entry(pubsub_arc);
-        assert_eq!(entry.spec.id, "mahalo_pubsub");
-        pubsub.shutdown();
     }
 
     #[tokio::test]

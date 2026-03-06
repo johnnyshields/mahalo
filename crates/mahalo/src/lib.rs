@@ -18,8 +18,9 @@ pub use mahalo_pubsub::{DistributedPubSub, PubSub, PubSubMessage};
 
 // Channels
 pub use mahalo_channel::{
-    handle_websocket, Channel, ChannelAddr, ChannelError, ChannelRouter, ChannelSocket,
-    ChannelSupervisor, PhoenixMessage, Reply, ShouldStop,
+    handle_websocket, handle_websocket_supervised, Channel, ChannelAddr, ChannelError,
+    ChannelRouter, ChannelSocket, ChannelSupervisor, PhoenixMessage, Reply, ShouldStop,
+    HEARTBEAT, PHX_JOIN, PHX_LEAVE, PHX_REPLY,
 };
 
 // Plugs
