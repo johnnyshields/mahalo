@@ -1,6 +1,7 @@
 // Static File Serving plug
 use std::path::PathBuf;
 
+use http::header::HeaderValue;
 use http::{Method, StatusCode};
 use mahalo_core::conn::Conn;
 use mahalo_core::plug::{BoxFuture, Plug};
@@ -9,7 +10,7 @@ use mahalo_core::plug::{BoxFuture, Plug};
 pub struct StaticFiles {
     url_prefix: String,
     dir: PathBuf,
-    cache_control: String,
+    cache_control: HeaderValue,
 }
 
 impl StaticFiles {
@@ -24,12 +25,13 @@ impl StaticFiles {
         Self {
             url_prefix: prefix,
             dir: dir.into(),
-            cache_control: "public, max-age=3600".to_string(),
+            cache_control: HeaderValue::from_static("public, max-age=3600"),
         }
     }
 
     pub fn cache_control(mut self, value: impl Into<String>) -> Self {
-        self.cache_control = value.into();
+        self.cache_control = HeaderValue::from_str(&value.into())
+            .expect("invalid cache-control header value");
         self
     }
 }
@@ -49,6 +51,24 @@ fn mime_from_extension(ext: &str) -> &'static str {
         "txt" => "text/plain",
         _ => "application/octet-stream",
     }
+}
+
+/// Returns true if the given MIME type is likely compressible.
+fn is_compressible(mime: &str) -> bool {
+    if mime.starts_with("video/") || mime.starts_with("audio/") {
+        return false;
+    }
+    if mime.starts_with("image/") && mime != "image/svg+xml" {
+        return false;
+    }
+    !matches!(
+        mime,
+        "font/woff2"
+            | "application/zip"
+            | "application/gzip"
+            | "application/x-bzip2"
+            | "application/octet-stream"
+    )
 }
 
 impl Plug for StaticFiles {
@@ -106,26 +126,86 @@ impl Plug for StaticFiles {
                 _ => return conn,
             }
 
-            // Read file
-            let contents = match tokio::fs::read(&canonical).await {
-                Ok(c) => c,
-                Err(_) => return conn,
-            };
-
             // Determine content type
             let ext = file_path
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
             let mime = mime_from_extension(ext);
+            let compressible = is_compressible(mime);
+
+            // Try precompressed variants for compressible types
+            if compressible {
+                let accept_encoding = conn
+                    .headers
+                    .get("accept-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+
+                // Priority: br > zst > gz
+                let variants: &[(&str, &str, &str)] = &[
+                    ("br", ".br", "br"),
+                    ("zstd", ".zst", "zstd"),
+                    ("gzip", ".gz", "gzip"),
+                ];
+
+                for &(token, suffix, encoding) in variants {
+                    if accept_encoding.contains(token) {
+                        let compressed_path = canonical.with_extension(
+                            format!(
+                                "{}{}",
+                                canonical.extension().and_then(|e| e.to_str()).unwrap_or(""),
+                                suffix
+                            ),
+                        );
+                        if let Ok(m) = tokio::fs::metadata(&compressed_path).await {
+                            if m.is_file() {
+                                let contents = match tokio::fs::read(&compressed_path).await {
+                                    Ok(c) => c,
+                                    Err(_) => continue,
+                                };
+                                let len = contents.len().to_string();
+                                let is_head = conn.method == Method::HEAD;
+
+                                let mut conn = conn
+                                    .put_status(StatusCode::OK)
+                                    .put_resp_header("content-type", mime)
+                                    .put_resp_header("content-encoding", encoding)
+                                    .put_resp_header("vary", "accept-encoding")
+                                    .put_resp_header("content-length", len.as_str());
+                                conn.resp_headers
+                                    .insert(http::header::CACHE_CONTROL, self.cache_control.clone());
+
+                                if !is_head {
+                                    conn = conn.put_resp_body(contents);
+                                }
+
+                                return conn.halt();
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Read file (no precompressed variant found or non-compressible)
+            let contents = match tokio::fs::read(&canonical).await {
+                Ok(c) => c,
+                Err(_) => return conn,
+            };
+
             let len = contents.len().to_string();
             let is_head = conn.method == Method::HEAD;
 
             let mut conn = conn
                 .put_status(StatusCode::OK)
                 .put_resp_header("content-type", mime)
-                .put_resp_header("cache-control", self.cache_control.as_str())
                 .put_resp_header("content-length", len.as_str());
+            conn.resp_headers
+                .insert(http::header::CACHE_CONTROL, self.cache_control.clone());
+
+            if compressible {
+                conn = conn.put_resp_header("vary", "accept-encoding");
+            }
 
             if !is_head {
                 conn = conn.put_resp_body(contents);
@@ -236,5 +316,77 @@ mod tests {
         assert!(!conn.halted);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn serves_precompressed_brotli() {
+        let dir = temp_dir("precomp_br");
+        fs::write(dir.join("app.js"), "console.log('hello')").unwrap();
+        fs::write(dir.join("app.js.br"), "compressed-brotli-data").unwrap();
+
+        let plug = StaticFiles::new("/static", dir.clone());
+        let mut conn = Conn::new(Method::GET, "/static/app.js".parse().unwrap());
+        conn.headers.insert("accept-encoding", "gzip, br".parse().unwrap());
+        let conn = plug.call(conn).await;
+
+        assert!(conn.halted);
+        assert_eq!(conn.resp_headers.get("content-encoding").unwrap(), "br");
+        assert_eq!(conn.resp_headers.get("vary").unwrap(), "accept-encoding");
+        assert_eq!(conn.resp_headers.get("content-type").unwrap(), "text/javascript");
+        assert_eq!(conn.resp_body.as_ref(), b"compressed-brotli-data");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn skips_precompressed_for_non_compressible() {
+        let dir = temp_dir("precomp_skip");
+        fs::write(dir.join("photo.png"), "png-data").unwrap();
+        fs::write(dir.join("photo.png.br"), "compressed-png").unwrap();
+
+        let plug = StaticFiles::new("/static", dir.clone());
+        let mut conn = Conn::new(Method::GET, "/static/photo.png".parse().unwrap());
+        conn.headers.insert("accept-encoding", "br".parse().unwrap());
+        let conn = plug.call(conn).await;
+
+        assert!(conn.halted);
+        assert!(conn.resp_headers.get("content-encoding").is_none());
+        assert!(conn.resp_headers.get("vary").is_none());
+        assert_eq!(conn.resp_body.as_ref(), b"png-data");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn compressible_file_sets_vary() {
+        let dir = temp_dir("vary");
+        fs::write(dir.join("style.css"), "body {}").unwrap();
+
+        let plug = StaticFiles::new("/static", dir.clone());
+        let conn = Conn::new(Method::GET, "/static/style.css".parse().unwrap());
+        let conn = plug.call(conn).await;
+
+        assert!(conn.halted);
+        assert_eq!(conn.resp_headers.get("vary").unwrap(), "accept-encoding");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_is_compressible() {
+        assert!(is_compressible("text/html"));
+        assert!(is_compressible("text/css"));
+        assert!(is_compressible("text/javascript"));
+        assert!(is_compressible("application/json"));
+        assert!(is_compressible("image/svg+xml"));
+
+        assert!(!is_compressible("image/png"));
+        assert!(!is_compressible("image/jpeg"));
+        assert!(!is_compressible("video/mp4"));
+        assert!(!is_compressible("audio/mpeg"));
+        assert!(!is_compressible("font/woff2"));
+        assert!(!is_compressible("application/zip"));
+        assert!(!is_compressible("application/gzip"));
+        assert!(!is_compressible("application/octet-stream"));
     }
 }

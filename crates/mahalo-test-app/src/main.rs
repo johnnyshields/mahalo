@@ -10,6 +10,9 @@
 //! - Telemetry with custom events and spans
 //! - Pipeline halting (auth plug)
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

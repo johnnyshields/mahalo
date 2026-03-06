@@ -364,6 +364,7 @@ pub(crate) fn run_event_loop(
     tokio_rt: &tokio::runtime::Runtime,
 ) {
     let peer_addr = default_peer_addr();
+    let mut accept_backoff_ms: u64 = 100;
     submit_accept(ring, listen_fd);
 
     // Reusable vectors to avoid per-iteration allocation.
@@ -387,6 +388,10 @@ pub(crate) fn run_event_loop(
         pending_meta.clear();
         pending_conns.clear();
 
+        // Timespec for EMFILE backoff — must outlive the CQE processing loop
+        // so the io_uring SQE pointer remains valid until submit_and_wait.
+        let mut emfile_timespec: Option<types::Timespec>;
+
         // Drain CQEs into reusable vec (avoids allocation after first iteration).
         cqes.clear();
         cqes.extend(ring.completion());
@@ -398,10 +403,28 @@ pub(crate) fn run_event_loop(
             match state {
                 STATE_ACCEPTING => {
                     if result < 0 {
-                        tracing::warn!("accept error: {}", std::io::Error::from_raw_os_error(-result));
-                        submit_accept(ring, listen_fd);
+                        let errno = -result;
+                        if errno == libc::EMFILE || errno == libc::ENFILE {
+                            tracing::warn!("accept error (fd exhaustion, backoff {}ms): {}", accept_backoff_ms, std::io::Error::from_raw_os_error(errno));
+                            // Use io_uring timeout to delay before re-arming accept.
+                            // Store timespec outside CQE loop so pointer stays valid until submit_and_wait.
+                            emfile_timespec = Some(types::Timespec::from(
+                                std::time::Duration::from_millis(accept_backoff_ms),
+                            ));
+                            let timeout_entry = opcode::Timeout::new(emfile_timespec.as_ref().unwrap() as *const types::Timespec)
+                                .build()
+                                .user_data(encode_user_data(STATE_ACCEPTING, 0, 0));
+                            unsafe {
+                                ring.submission().push(&timeout_entry).ok();
+                            }
+                            accept_backoff_ms = (accept_backoff_ms * 2).min(1000);
+                        } else {
+                            tracing::warn!("accept error: {}", std::io::Error::from_raw_os_error(errno));
+                            submit_accept(ring, listen_fd);
+                        }
                         continue;
                     }
+                    accept_backoff_ms = 100; // Reset on successful accept
                     let new_fd = result;
 
                     // TCP_NODELAY on accepted connection — critical for small responses.
@@ -431,7 +454,7 @@ pub(crate) fn run_event_loop(
                         wb.clear();
                         wb
                     } else {
-                        Vec::with_capacity(256)
+                        Vec::with_capacity(512)
                     };
 
                     conn_pool.insert(

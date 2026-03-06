@@ -1,43 +1,51 @@
+use http::header::{HeaderName, HeaderValue};
 use mahalo_core::conn::Conn;
 use mahalo_core::plug::{BoxFuture, Plug};
 
 pub struct SecureHeaders {
-    headers: Vec<(String, String)>,
+    headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 impl SecureHeaders {
     pub fn new() -> Self {
         Self {
             headers: vec![
-                ("x-content-type-options".into(), "nosniff".into()),
-                ("x-frame-options".into(), "SAMEORIGIN".into()),
-                ("x-xss-protection".into(), "1; mode=block".into()),
+                (HeaderName::from_static("x-content-type-options"), HeaderValue::from_static("nosniff")),
+                (HeaderName::from_static("x-frame-options"), HeaderValue::from_static("SAMEORIGIN")),
+                (HeaderName::from_static("x-xss-protection"), HeaderValue::from_static("1; mode=block")),
                 (
-                    "strict-transport-security".into(),
-                    "max-age=31536000; includeSubDomains".into(),
+                    HeaderName::from_static("strict-transport-security"),
+                    HeaderValue::from_static("max-age=31536000; includeSubDomains"),
                 ),
-                ("x-download-options".into(), "noopen".into()),
-                ("x-permitted-cross-domain-policies".into(), "none".into()),
+                (HeaderName::from_static("x-download-options"), HeaderValue::from_static("noopen")),
+                (HeaderName::from_static("x-permitted-cross-domain-policies"), HeaderValue::from_static("none")),
                 (
-                    "referrer-policy".into(),
-                    "strict-origin-when-cross-origin".into(),
+                    HeaderName::from_static("referrer-policy"),
+                    HeaderValue::from_static("strict-origin-when-cross-origin"),
                 ),
             ],
         }
     }
 
     pub fn put(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        let name = name.into();
-        if let Some(existing) = self.headers.iter_mut().find(|(k, _)| k == &name) {
-            existing.1 = value.into();
+        let name_str = name.into();
+        let header_name = HeaderName::from_bytes(name_str.as_bytes())
+            .expect("invalid header name");
+        let header_value = HeaderValue::from_str(&value.into())
+            .expect("invalid header value");
+
+        if let Some(existing) = self.headers.iter_mut().find(|(k, _)| k == &header_name) {
+            existing.1 = header_value;
         } else {
-            self.headers.push((name, value.into()));
+            self.headers.push((header_name, header_value));
         }
         self
     }
 
     pub fn remove(mut self, name: &str) -> Self {
-        self.headers.retain(|(k, _)| k != name);
+        if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
+            self.headers.retain(|(k, _)| k != &header_name);
+        }
         self
     }
 }
@@ -53,7 +61,7 @@ impl Plug for SecureHeaders {
         Box::pin(async {
             let mut conn = conn;
             for (name, value) in &self.headers {
-                conn = conn.put_resp_header(name.as_str(), value.as_str());
+                conn.resp_headers.insert(name.clone(), value.clone());
             }
             conn
         })

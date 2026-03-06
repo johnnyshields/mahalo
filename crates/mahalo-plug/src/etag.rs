@@ -1,7 +1,6 @@
 use mahalo_core::conn::Conn;
 use mahalo_core::plug::{BoxFuture, Plug};
 use http::StatusCode;
-use sha2::{Sha256, Digest};
 
 pub struct ETag;
 
@@ -9,15 +8,6 @@ impl ETag {
     pub fn new() -> Self {
         ETag
     }
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        write!(s, "{b:02x}").unwrap();
-    }
-    s
 }
 
 impl Default for ETag {
@@ -33,8 +23,9 @@ impl Plug for ETag {
                 return conn;
             }
 
-            let hash = Sha256::digest(&conn.resp_body);
-            let etag_value = format!("W/\"{}\"", to_hex(&hash[..16]));
+            let hash = blake3::hash(&conn.resp_body);
+            let hex = hash.to_hex();
+            let etag_value = format!("W/\"{}\"", &hex[..32]);
 
             let if_none_match = conn
                 .headers

@@ -1,0 +1,9 @@
+localhost {
+  listen 3006
+  location "/plaintext" {
+    status 200 body="Hello, World!"
+  }
+  location "/json" {
+    status 200 body="{\"message\":\"Hello, World!\"}"
+  }
+}

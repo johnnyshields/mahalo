@@ -287,7 +287,8 @@ pub fn serialize_response_into(conn: &Conn, keep_alive: bool, buf: &mut Vec<u8>)
     let needed = 128 + header_bytes + body_len;
 
     buf.clear();
-    buf.reserve(needed.saturating_sub(buf.capacity()));
+    let target = needed.next_power_of_two();
+    buf.reserve(target.saturating_sub(buf.len()));
 
     // Status line — try pre-computed, fall back to manual.
     let precomputed = status_line(code);
