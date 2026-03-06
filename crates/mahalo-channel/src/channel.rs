@@ -44,6 +44,16 @@ impl Reply {
     }
 }
 
+/// Return value from [`Channel::stopping()`] that controls whether the channel
+/// should proceed with shutdown or stay alive to flush pending work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShouldStop {
+    /// Proceed with normal shutdown. (default)
+    Yes,
+    /// Keep the channel alive (e.g., to flush pending messages).
+    No,
+}
+
 #[async_trait]
 pub trait Channel: Send + Sync + 'static {
     /// Called when a client joins a topic.
@@ -71,6 +81,21 @@ pub trait Channel: Send + Sync + 'static {
         // Default: push to client
         socket.push(&msg.event, &msg.payload).await;
         Ok(())
+    }
+
+    /// Called after a successful join reply is sent. Use this to schedule
+    /// timers, fetch initial state, or subscribe to additional topics.
+    ///
+    /// Actix equivalent: `Actor::started()`.
+    async fn started(&self, _socket: &mut ChannelSocket) {}
+
+    /// Called before channel cleanup begins. Returning [`ShouldStop::No`]
+    /// keeps the channel alive (e.g., to flush pending messages). The default
+    /// is [`ShouldStop::Yes`] — proceed with shutdown.
+    ///
+    /// Actix equivalent: `Actor::stopping()`.
+    async fn stopping(&self, _socket: &mut ChannelSocket) -> ShouldStop {
+        ShouldStop::Yes
     }
 
     /// Called when the channel process terminates.
@@ -112,6 +137,12 @@ mod tests {
     fn channel_error_is_std_error() {
         fn assert_error<T: std::error::Error>() {}
         assert_error::<ChannelError>();
+    }
+
+    #[test]
+    fn should_stop_default_is_yes() {
+        assert_eq!(ShouldStop::Yes, ShouldStop::Yes);
+        assert_ne!(ShouldStop::Yes, ShouldStop::No);
     }
 
     // -- Channel default trait methods -----------------------------------------
@@ -182,6 +213,38 @@ mod tests {
         let ch = MinimalChannel;
         ch.terminate("test", &mut socket).await;
         // no panic = success
+
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn started_default_does_nothing() {
+        use mahalo_pubsub::PubSub;
+        use tokio::sync::mpsc;
+
+        let pubsub = PubSub::start();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
+
+        let ch = MinimalChannel;
+        ch.started(&mut socket).await;
+        // no panic = success
+
+        pubsub.shutdown();
+    }
+
+    #[tokio::test]
+    async fn stopping_default_returns_yes() {
+        use mahalo_pubsub::PubSub;
+        use tokio::sync::mpsc;
+
+        let pubsub = PubSub::start();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
+
+        let ch = MinimalChannel;
+        let result = ch.stopping(&mut socket).await;
+        assert_eq!(result, ShouldStop::Yes);
 
         pubsub.shutdown();
     }

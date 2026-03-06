@@ -8,6 +8,8 @@ members = [
     "crates/mahalo-channel",
     "crates/mahalo-telemetry",
     "crates/mahalo-plug",
+    "crates/mahalo-cluster",
+    "crates/mahalo-presence",
     "crates/mahalo",
     "crates/cargo-mahalo",
     "crates/mahalo-test-app",
@@ -19,7 +21,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-rebar-core = { git = "https://github.com/johnnyshields/rebar", branch = "gen-server" }
+rebar-core = { path = "../../../../rebar/crates/rebar-core" }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
