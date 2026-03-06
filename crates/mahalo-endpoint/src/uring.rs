@@ -258,10 +258,10 @@ async fn execute_request(
     error_handler: &Option<ErrorHandler>,
     after_plugs: &[Box<dyn Plug>],
 ) -> Conn {
-    let method = conn.method.clone();
-    let path = conn.uri.path().to_string();
+    // Borrow method/path from conn without cloning — resolve only needs references.
+    let resolved = router.resolve(&conn.method, conn.uri.path());
 
-    let mut conn = match router.resolve(&method, &path) {
+    let mut conn = match resolved {
         Some(resolved) => resolved.execute(conn).await,
         None => {
             if let Some(handler) = error_handler {
@@ -301,7 +301,8 @@ fn write_static_error_and_close(
     }
 
     if let Some(slot) = conn_pool.get_mut(slot_idx) {
-        slot.write_buf = response.to_vec();
+        slot.write_buf.clear();
+        slot.write_buf.extend_from_slice(response);
         slot.write_offset = 0;
         slot.keep_alive = false;
         let ptr = slot.write_buf.as_ptr();
@@ -345,6 +346,8 @@ pub(crate) fn run_event_loop(
     // Reusable vectors to avoid per-iteration allocation.
     let mut pending_meta: Vec<PendingRequest> = Vec::with_capacity(64);
     let mut pending_conns: Vec<Conn> = Vec::with_capacity(64);
+    let mut results: Vec<Conn> = Vec::with_capacity(64);
+    let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::with_capacity(256);
 
     loop {
         if let Err(e) = ring.submit_and_wait(1) {
@@ -352,13 +355,14 @@ pub(crate) fn run_event_loop(
             continue;
         }
 
-        // Drain all available CQEs.
-        let cqes: Vec<io_uring::cqueue::Entry> = ring.completion().collect();
-
         pending_meta.clear();
         pending_conns.clear();
 
-        for cqe in cqes {
+        // Drain CQEs into reusable vec (avoids allocation after first iteration).
+        cqes.clear();
+        cqes.extend(ring.completion());
+
+        for cqe in cqes.iter() {
             let (state, slot_idx, generation) = decode_user_data(cqe.user_data());
             let result = cqe.result();
 
@@ -416,7 +420,7 @@ pub(crate) fn run_event_loop(
                             generation,
                             read_buf_idx: buf_idx,
                             read_len: 0,
-                            write_buf: Vec::new(),
+                            write_buf: Vec::with_capacity(256),
                             write_offset: 0,
                             keep_alive: true,
                         },
@@ -549,22 +553,22 @@ pub(crate) fn run_event_loop(
         // ---- Batched handler execution ----
         // Execute all parsed requests in a single block_on call.
         if !pending_conns.is_empty() {
-            let results = tokio_rt.block_on(async {
-                let mut results = Vec::with_capacity(pending_conns.len());
-                for conn in pending_conns.drain(..) {
-                    results.push(execute_request(conn, router, error_handler, after_plugs).await);
+            results.clear();
+            let r = &mut results;
+            let pc = &mut pending_conns;
+            tokio_rt.block_on(async {
+                for conn in pc.drain(..) {
+                    r.push(execute_request(conn, router, error_handler, after_plugs).await);
                 }
-                results
             });
 
-            for (meta, conn) in pending_meta.drain(..).zip(results) {
-                let response_bytes = http_parse::serialize_response(&conn, meta.keep_alive);
-
+            for (meta, conn) in pending_meta.drain(..).zip(results.drain(..)) {
                 let slot = match conn_pool.get_mut(meta.slot_idx) {
                     Some(s) => s,
                     None => continue,
                 };
-                slot.write_buf = response_bytes;
+                // Serialize directly into the slot's existing write_buf (reuses capacity).
+                http_parse::serialize_response_into(&conn, meta.keep_alive, &mut slot.write_buf);
                 slot.write_offset = 0;
                 slot.keep_alive = meta.keep_alive;
 

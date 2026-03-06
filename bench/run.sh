@@ -102,7 +102,7 @@ check_oha() {
 wait_for_server() {
     local port=$1
     local name=$2
-    local max_wait=15
+    local max_wait=60
     local waited=0
 
     while ! curl -sf "http://127.0.0.1:${port}/plaintext" > /dev/null 2>&1; do

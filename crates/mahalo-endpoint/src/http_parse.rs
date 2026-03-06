@@ -173,6 +173,16 @@ fn write_status_code(buf: &mut Vec<u8>, code: u16) {
 /// Zero-allocation for common status codes (200, 404, etc.) — uses
 /// pre-computed status lines and manual integer formatting.
 pub fn serialize_response(conn: &Conn, keep_alive: bool) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256);
+    serialize_response_into(conn, keep_alive, &mut buf);
+    buf
+}
+
+/// Serialize a Conn's response into an existing buffer (avoids allocation on reuse).
+///
+/// Clears `buf` first, then writes the full HTTP/1.1 response. The existing
+/// capacity is preserved, so repeated calls on the same Vec avoid re-allocation.
+pub fn serialize_response_into(conn: &Conn, keep_alive: bool, buf: &mut Vec<u8>) {
     let code = conn.status.as_u16();
     let body = &conn.resp_body;
     let body_len = body.len();
@@ -183,13 +193,15 @@ pub fn serialize_response(conn: &Conn, keep_alive: bool) -> Vec<u8> {
         &b"connection: close\r\n"[..]
     };
 
-    // Estimate capacity: ~128 bytes overhead + headers + body.
+    // Estimate needed capacity.
     let mut header_bytes = 0;
     for (name, value) in conn.resp_headers.iter() {
         header_bytes += name.as_str().len() + 2 + value.len() + 2;
     }
-    let capacity = 128 + header_bytes + body_len;
-    let mut buf = Vec::with_capacity(capacity);
+    let needed = 128 + header_bytes + body_len;
+
+    buf.clear();
+    buf.reserve(needed.saturating_sub(buf.capacity()));
 
     // Status line — try pre-computed, fall back to manual.
     let precomputed = status_line(code);
@@ -197,7 +209,7 @@ pub fn serialize_response(conn: &Conn, keep_alive: bool) -> Vec<u8> {
         buf.extend_from_slice(precomputed);
     } else {
         buf.extend_from_slice(b"HTTP/1.1 ");
-        write_status_code(&mut buf, code);
+        write_status_code(buf, code);
         buf.push(b' ');
         let reason = conn.status.canonical_reason().unwrap_or("Unknown");
         buf.extend_from_slice(reason.as_bytes());
@@ -215,7 +227,7 @@ pub fn serialize_response(conn: &Conn, keep_alive: bool) -> Vec<u8> {
     // Content-length (manual integer formatting, no String alloc).
     if !has_content_length {
         buf.extend_from_slice(b"content-length: ");
-        write_usize(&mut buf, body_len);
+        write_usize(buf, body_len);
         buf.extend_from_slice(b"\r\n");
     }
 
@@ -225,8 +237,6 @@ pub fn serialize_response(conn: &Conn, keep_alive: bool) -> Vec<u8> {
     // Separator + body.
     buf.extend_from_slice(b"\r\n");
     buf.extend_from_slice(body);
-
-    buf
 }
 
 

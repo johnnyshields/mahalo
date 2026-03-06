@@ -31,7 +31,7 @@ pub struct Conn {
 
     // State
     pub halted: bool,
-    assigns: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    assigns: Option<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     pub runtime: Option<Arc<Runtime>>,
 }
 
@@ -49,7 +49,27 @@ impl Conn {
             resp_headers: HeaderMap::new(),
             resp_body: Bytes::new(),
             halted: false,
-            assigns: HashMap::new(),
+            assigns: None,
+            runtime: None,
+        }
+    }
+
+    /// Fast constructor from pre-decomposed HTTP request parts.
+    /// Avoids all cloning — moves parts directly into Conn.
+    pub fn from_parts(parts: http::request::Parts) -> Self {
+        Self {
+            method: parts.method,
+            uri: parts.uri,
+            headers: parts.headers,
+            path_params: HashMap::new(),
+            query_params: HashMap::new(),
+            remote_addr: None,
+            body: Bytes::new(),
+            status: StatusCode::OK,
+            resp_headers: HeaderMap::new(),
+            resp_body: Bytes::new(),
+            halted: false,
+            assigns: None,
             runtime: None,
         }
     }
@@ -81,12 +101,15 @@ impl Conn {
     }
 
     pub fn assign<K: AssignKey>(mut self, value: K::Value) -> Self {
-        self.assigns.insert(TypeId::of::<K>(), Box::new(value));
+        self.assigns
+            .get_or_insert_with(HashMap::new)
+            .insert(TypeId::of::<K>(), Box::new(value));
         self
     }
 
     pub fn get_assign<K: AssignKey>(&self) -> Option<&K::Value> {
         self.assigns
+            .as_ref()?
             .get(&TypeId::of::<K>())
             .and_then(|v| v.downcast_ref())
     }

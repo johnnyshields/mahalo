@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use http::Method;
 use mahalo_core::conn::Conn;
@@ -21,13 +21,37 @@ enum Handler {
 /// An individual route entry.
 struct Route {
     method: Method,
-    /// Pattern segments, e.g. ["api", "rooms", ":id"]
+    /// Pattern segments, e.g. ["api", "rooms", ":id"] (used for path_for/named_routes)
     segments: Vec<String>,
+    /// matchit-compatible path, e.g. "/api/rooms/{id}"
+    matchit_path: String,
     handler: Handler,
     /// Names of pipelines to run before this route's handler.
     pipeline_names: Vec<String>,
     /// Optional name for reverse routing (URL helpers).
     name: Option<String>,
+}
+
+/// Compiled per-method matchit routers. Each maps path → route index.
+struct CompiledRouters {
+    get: matchit::Router<usize>,
+    post: matchit::Router<usize>,
+    put: matchit::Router<usize>,
+    patch: matchit::Router<usize>,
+    delete: matchit::Router<usize>,
+}
+
+impl CompiledRouters {
+    fn for_method(&self, method: &Method) -> Option<&matchit::Router<usize>> {
+        match *method {
+            Method::GET | Method::HEAD => Some(&self.get),
+            Method::POST => Some(&self.post),
+            Method::PUT => Some(&self.put),
+            Method::PATCH => Some(&self.patch),
+            Method::DELETE => Some(&self.delete),
+            _ => None,
+        }
+    }
 }
 
 /// The result of resolving an incoming request to a route.
@@ -66,14 +90,16 @@ impl<'a> ResolvedRoute<'a> {
 
 /// Builder used inside a `scope()` closure to register routes.
 pub struct ScopeBuilder {
+    prefix: String,
     prefix_segments: Vec<String>,
     pipeline_names: Vec<String>,
     routes: Vec<Route>,
 }
 
 impl ScopeBuilder {
-    fn new(prefix_segments: Vec<String>, pipeline_names: Vec<String>) -> Self {
+    fn new(prefix: String, prefix_segments: Vec<String>, pipeline_names: Vec<String>) -> Self {
         Self {
+            prefix,
             prefix_segments,
             pipeline_names,
             routes: Vec::new(),
@@ -83,9 +109,11 @@ impl ScopeBuilder {
     fn add_route(&mut self, method: Method, path: &str, handler: Handler) {
         let mut segments = self.prefix_segments.clone();
         segments.extend(parse_segments(path));
+        let matchit_path = build_matchit_path(&self.prefix, path);
         self.routes.push(Route {
             method,
             segments,
+            matchit_path,
             handler,
             pipeline_names: self.pipeline_names.clone(),
             name: None,
@@ -95,9 +123,11 @@ impl ScopeBuilder {
     fn add_named_route(&mut self, method: Method, path: &str, name: &str, handler: Handler) {
         let mut segments = self.prefix_segments.clone();
         segments.extend(parse_segments(path));
+        let matchit_path = build_matchit_path(&self.prefix, path);
         self.routes.push(Route {
             method,
             segments,
+            matchit_path,
             handler,
             pipeline_names: self.pipeline_names.clone(),
             name: Some(name.to_string()),
@@ -204,10 +234,13 @@ impl ScopeBuilder {
 }
 
 /// Top-level router holding named pipelines and routes.
+/// Uses matchit radix trie for O(log N) route resolution.
 pub struct MahaloRouter {
     pipelines: HashMap<String, Pipeline>,
     routes: Vec<Route>,
     name_index: HashMap<String, usize>,
+    /// Lazily compiled matchit routers, one per HTTP method.
+    compiled: OnceLock<CompiledRouters>,
 }
 
 impl MahaloRouter {
@@ -216,6 +249,7 @@ impl MahaloRouter {
             pipelines: HashMap::new(),
             routes: Vec::new(),
             name_index: HashMap::new(),
+            compiled: OnceLock::new(),
         }
     }
 
@@ -234,7 +268,8 @@ impl MahaloRouter {
     ) -> Self {
         let prefix_segments = parse_segments(prefix);
         let names: Vec<String> = pipeline_names.iter().map(|s| s.to_string()).collect();
-        let mut builder = ScopeBuilder::new(prefix_segments, names);
+        let prefix_str = normalize_prefix(prefix);
+        let mut builder = ScopeBuilder::new(prefix_str, prefix_segments, names);
         f(&mut builder);
         let start = self.routes.len();
         self.routes.extend(builder.routes);
@@ -251,6 +286,7 @@ impl MahaloRouter {
         self.routes.push(Route {
             method: Method::GET,
             segments: parse_segments(path),
+            matchit_path: colon_to_brace(path),
             handler: Handler::Plug(Box::new(plug)),
             pipeline_names: Vec::new(),
             name: None,
@@ -263,6 +299,7 @@ impl MahaloRouter {
         self.routes.push(Route {
             method: Method::POST,
             segments: parse_segments(path),
+            matchit_path: colon_to_brace(path),
             handler: Handler::Plug(Box::new(plug)),
             pipeline_names: Vec::new(),
             name: None,
@@ -276,6 +313,7 @@ impl MahaloRouter {
         self.routes.push(Route {
             method: Method::GET,
             segments: parse_segments(path),
+            matchit_path: colon_to_brace(path),
             handler: Handler::Plug(Box::new(plug)),
             pipeline_names: Vec::new(),
             name: Some(name.to_string()),
@@ -290,6 +328,7 @@ impl MahaloRouter {
         self.routes.push(Route {
             method: Method::POST,
             segments: parse_segments(path),
+            matchit_path: colon_to_brace(path),
             handler: Handler::Plug(Box::new(plug)),
             pipeline_names: Vec::new(),
             name: Some(name.to_string()),
@@ -303,6 +342,7 @@ impl MahaloRouter {
         self.routes.push(Route {
             method: Method::PUT,
             segments: parse_segments(path),
+            matchit_path: colon_to_brace(path),
             handler: Handler::Plug(Box::new(plug)),
             pipeline_names: Vec::new(),
             name: None,
@@ -315,6 +355,7 @@ impl MahaloRouter {
         self.routes.push(Route {
             method: Method::PATCH,
             segments: parse_segments(path),
+            matchit_path: colon_to_brace(path),
             handler: Handler::Plug(Box::new(plug)),
             pipeline_names: Vec::new(),
             name: None,
@@ -327,6 +368,7 @@ impl MahaloRouter {
         self.routes.push(Route {
             method: Method::DELETE,
             segments: parse_segments(path),
+            matchit_path: colon_to_brace(path),
             handler: Handler::Plug(Box::new(plug)),
             pipeline_names: Vec::new(),
             name: None,
@@ -340,6 +382,7 @@ impl MahaloRouter {
         self.routes.push(Route {
             method: Method::PUT,
             segments: parse_segments(path),
+            matchit_path: colon_to_brace(path),
             handler: Handler::Plug(Box::new(plug)),
             pipeline_names: Vec::new(),
             name: Some(name.to_string()),
@@ -354,6 +397,7 @@ impl MahaloRouter {
         self.routes.push(Route {
             method: Method::PATCH,
             segments: parse_segments(path),
+            matchit_path: colon_to_brace(path),
             handler: Handler::Plug(Box::new(plug)),
             pipeline_names: Vec::new(),
             name: Some(name.to_string()),
@@ -368,6 +412,7 @@ impl MahaloRouter {
         self.routes.push(Route {
             method: Method::DELETE,
             segments: parse_segments(path),
+            matchit_path: colon_to_brace(path),
             handler: Handler::Plug(Box::new(plug)),
             pipeline_names: Vec::new(),
             name: Some(name.to_string()),
@@ -404,29 +449,63 @@ impl MahaloRouter {
         result
     }
 
+    /// Compile the matchit routers from the route list (called once, lazily).
+    fn compile(&self) -> CompiledRouters {
+        let mut get = matchit::Router::new();
+        let mut post = matchit::Router::new();
+        let mut put = matchit::Router::new();
+        let mut patch = matchit::Router::new();
+        let mut delete = matchit::Router::new();
+
+        for (idx, route) in self.routes.iter().enumerate() {
+            let router = match route.method {
+                Method::GET => &mut get,
+                Method::POST => &mut post,
+                Method::PUT => &mut put,
+                Method::PATCH => &mut patch,
+                Method::DELETE => &mut delete,
+                _ => continue,
+            };
+            // matchit will panic on duplicate routes; that's a programming error
+            router.insert(&route.matchit_path, idx).unwrap();
+        }
+
+        CompiledRouters {
+            get,
+            post,
+            put,
+            patch,
+            delete,
+        }
+    }
+
     /// Resolve an incoming request method + path to a route.
     pub fn resolve(&self, method: &Method, path: &str) -> Option<ResolvedRoute<'_>> {
-        let request_segments = parse_segments(path);
+        let compiled = self.compiled.get_or_init(|| self.compile());
 
-        for route in &self.routes {
-            if route.method != *method {
-                continue;
-            }
-            if let Some(params) = match_segments(&route.segments, &request_segments) {
-                let pipelines: Vec<&Pipeline> = route
-                    .pipeline_names
-                    .iter()
-                    .filter_map(|name| self.pipelines.get(name))
-                    .collect();
+        let method_router = compiled.for_method(method)?;
+        let matched = method_router.at(path).ok()?;
+        let route_idx = *matched.value;
+        let route = &self.routes[route_idx];
 
-                return Some(ResolvedRoute {
-                    path_params: params,
-                    pipelines,
-                    handler: &route.handler,
-                });
-            }
-        }
-        None
+        // Extract path params from matchit's zero-alloc params
+        let path_params: HashMap<String, String> = matched
+            .params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+        let pipelines: Vec<&Pipeline> = route
+            .pipeline_names
+            .iter()
+            .filter_map(|name| self.pipelines.get(name))
+            .collect();
+
+        Some(ResolvedRoute {
+            path_params,
+            pipelines,
+            handler: &route.handler,
+        })
     }
 }
 
@@ -436,7 +515,7 @@ impl Default for MahaloRouter {
     }
 }
 
-/// Parse a path string into non-empty segments.
+/// Parse a path string into non-empty segments (preserves `:param` syntax).
 fn parse_segments(path: &str) -> Vec<String> {
     path.split('/')
         .filter(|s| !s.is_empty())
@@ -444,25 +523,52 @@ fn parse_segments(path: &str) -> Vec<String> {
         .collect()
 }
 
-/// Try to match route pattern segments against request segments.
-/// Returns extracted path params on success.
-fn match_segments(
-    pattern: &[String],
-    request: &[String],
-) -> Option<HashMap<String, String>> {
-    if pattern.len() != request.len() {
-        return None;
-    }
-
-    let mut params = HashMap::new();
-    for (pat, req) in pattern.iter().zip(request.iter()) {
-        if let Some(name) = pat.strip_prefix(':') {
-            params.insert(name.to_string(), req.to_string());
-        } else if pat != req {
-            return None;
+/// Convert `:param` segments to `{param}` for matchit.
+/// e.g. "/api/rooms/:id" → "/api/rooms/{id}"
+fn colon_to_brace(path: &str) -> String {
+    let mut result = String::with_capacity(path.len() + 4);
+    for segment in path.split('/') {
+        if !result.is_empty() || path.starts_with('/') {
+            if !result.is_empty() {
+                result.push('/');
+            } else {
+                // First segment after leading /
+            }
+        }
+        if let Some(param) = segment.strip_prefix(':') {
+            result.push('{');
+            result.push_str(param);
+            result.push('}');
+        } else {
+            result.push_str(segment);
         }
     }
-    Some(params)
+    // Ensure leading slash
+    if !result.starts_with('/') {
+        result.insert(0, '/');
+    }
+    result
+}
+
+/// Normalize a scope prefix: ensure leading slash, strip trailing slash.
+fn normalize_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{}", trimmed)
+    }
+}
+
+/// Build a matchit-compatible path from scope prefix + route path.
+fn build_matchit_path(prefix: &str, path: &str) -> String {
+    let full = if path == "/" || path.is_empty() {
+        prefix.to_string()
+    } else {
+        let path_part = if path.starts_with('/') { path } else { path };
+        format!("{}{}", prefix, path_part)
+    };
+    colon_to_brace(&full)
 }
 
 #[cfg(test)]
@@ -481,41 +587,10 @@ mod tests {
     }
 
     #[test]
-    fn match_exact_path() {
-        let params = match_segments(
-            &parse_segments("/health"),
-            &parse_segments("/health"),
-        );
-        assert!(params.is_some());
-        assert!(params.unwrap().is_empty());
-    }
-
-    #[test]
-    fn match_with_param() {
-        let params = match_segments(
-            &parse_segments("/rooms/:id"),
-            &parse_segments("/rooms/42"),
-        );
-        let params = params.unwrap();
-        assert_eq!(params.get("id").unwrap(), "42");
-    }
-
-    #[test]
-    fn no_match_different_length() {
-        let params = match_segments(
-            &parse_segments("/rooms/:id"),
-            &parse_segments("/rooms"),
-        );
-        assert!(params.is_none());
-    }
-
-    #[test]
-    fn no_match_different_literal() {
-        let params = match_segments(
-            &parse_segments("/rooms/:id"),
-            &parse_segments("/users/42"),
-        );
-        assert!(params.is_none());
+    fn colon_to_brace_conversion() {
+        assert_eq!(colon_to_brace("/health"), "/health");
+        assert_eq!(colon_to_brace("/rooms/:id"), "/rooms/{id}");
+        assert_eq!(colon_to_brace("/a/:id/b/:name"), "/a/{id}/b/{name}");
     }
 
     #[test]
