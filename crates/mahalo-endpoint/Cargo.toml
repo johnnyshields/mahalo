@@ -3,7 +3,7 @@ name = "mahalo-endpoint"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Axum bridge and supervised server lifecycle for Mahalo"
+description = "io_uring HTTP server and supervised lifecycle for Mahalo"
 
 [dependencies]
 mahalo-core = { path = "../mahalo-core" }
@@ -12,12 +12,14 @@ mahalo-channel = { path = "../mahalo-channel" }
 mahalo-pubsub = { path = "../mahalo-pubsub" }
 rebar-core = { workspace = true }
 tokio = { workspace = true }
-axum = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
-async-trait = { workspace = true }
-tower-http = { workspace = true }
+io-uring = { workspace = true }
+httparse = { workspace = true }
+socket2 = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

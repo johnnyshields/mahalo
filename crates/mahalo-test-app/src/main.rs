@@ -1177,9 +1177,12 @@ async fn main() {
 
     let addr: std::net::SocketAddr = "127.0.0.1:4000".parse().unwrap();
 
+    // Note: WebSocket channel support is deferred (io_uring migration).
+    // channel_router and pubsub are configured separately.
+    let _channel_router = channel_router;
+    let _pubsub_ref = pubsub.clone();
+
     let endpoint = MahaloEndpoint::new(router, addr, runtime)
-        .channel_router(channel_router)
-        .pubsub(pubsub.clone())
         .error_handler(|status: StatusCode, conn: Conn| {
             conn.put_status(status)
                 .put_resp_header("content-type", "text/html; charset=utf-8")

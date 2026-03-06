@@ -7,7 +7,7 @@ pub use mahalo_core::plug::{plug_fn, BoxFuture, Plug, PlugFn};
 // Router
 pub use mahalo_router::MahaloRouter;
 
-// Endpoint (Axum bridge)
+// Endpoint (io_uring HTTP server)
 pub use mahalo_endpoint::{
     json_error_handler, text_error_handler, ErrorHandler, MahaloApplication,
     MahaloApplicationBuilder, MahaloEndpoint,

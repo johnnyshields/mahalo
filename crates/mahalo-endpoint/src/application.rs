@@ -70,24 +70,13 @@ impl MahaloApplication {
         self.pubsub = Some(pubsub.clone());
 
         // 2. ChannelSupervisor (Permanent) — if WebSocket configured
-        let channel_supervisor = if self.channel_router.is_some() {
-            let supervisor = ChannelSupervisor::start(Arc::clone(&runtime)).await;
-            Some(supervisor)
-        } else {
-            None
-        };
+        if self.channel_router.is_some() {
+            let (_handle, entry) = ChannelSupervisor::child_entry(Arc::clone(&runtime));
+            children.push(entry);
+        }
 
         // 3. HTTP Endpoint (Permanent)
-        let mut endpoint = MahaloEndpoint::new(self.router, self.addr, Arc::clone(&runtime))
-            .pubsub(pubsub.clone());
-
-        if let Some(cr) = self.channel_router {
-            endpoint = endpoint.channel_router(cr);
-        }
-        if let Some(supervisor) = channel_supervisor {
-            endpoint = endpoint.channel_supervisor(supervisor);
-        }
-
+        let endpoint = MahaloEndpoint::new(self.router, self.addr, Arc::clone(&runtime));
         children.push(endpoint.child_entry());
 
         let handle = start_supervisor(runtime, spec, children).await;
