@@ -72,10 +72,21 @@ pub fn start_uring_server(
 
                 let listen_fd = socket.as_raw_fd();
 
-                // Build io_uring — try SQPOLL first, fall back to standard.
+                // Build io_uring with optimal flags for single-threaded use.
+                // SQPOLL: kernel-side submission polling (requires root, falls back gracefully).
+                // COOP_TASKRUN + SINGLE_ISSUER: reduce kernel overhead for single-threaded.
                 let mut ring = IoUring::builder()
                     .setup_sqpoll(2000)
+                    .setup_coop_taskrun()
+                    .setup_single_issuer()
                     .build(4096)
+                    .or_else(|_| {
+                        // Fallback without SQPOLL (doesn't require root).
+                        IoUring::builder()
+                            .setup_coop_taskrun()
+                            .setup_single_issuer()
+                            .build(4096)
+                    })
                     .or_else(|_| IoUring::new(4096))?;
 
                 // Per-worker pools.

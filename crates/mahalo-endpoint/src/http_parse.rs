@@ -122,44 +122,87 @@ pub fn try_parse_request(
     }))
 }
 
+/// Fast status line lookup for common HTTP status codes (avoids allocation).
+#[inline]
+fn status_line(code: u16) -> &'static [u8] {
+    match code {
+        200 => b"HTTP/1.1 200 OK\r\n",
+        201 => b"HTTP/1.1 201 Created\r\n",
+        204 => b"HTTP/1.1 204 No Content\r\n",
+        301 => b"HTTP/1.1 301 Moved Permanently\r\n",
+        302 => b"HTTP/1.1 302 Found\r\n",
+        304 => b"HTTP/1.1 304 Not Modified\r\n",
+        400 => b"HTTP/1.1 400 Bad Request\r\n",
+        401 => b"HTTP/1.1 401 Unauthorized\r\n",
+        403 => b"HTTP/1.1 403 Forbidden\r\n",
+        404 => b"HTTP/1.1 404 Not Found\r\n",
+        405 => b"HTTP/1.1 405 Method Not Allowed\r\n",
+        413 => b"HTTP/1.1 413 Payload Too Large\r\n",
+        500 => b"HTTP/1.1 500 Internal Server Error\r\n",
+        503 => b"HTTP/1.1 503 Service Unavailable\r\n",
+        _ => b"",
+    }
+}
+
+/// Write a usize as decimal digits directly into buf (no String allocation).
+#[inline]
+fn write_usize(buf: &mut Vec<u8>, mut n: usize) {
+    if n == 0 {
+        buf.push(b'0');
+        return;
+    }
+    // Max 20 digits for u64.
+    let start = buf.len();
+    while n > 0 {
+        buf.push(b'0' + (n % 10) as u8);
+        n /= 10;
+    }
+    buf[start..].reverse();
+}
+
+/// Write a u16 as 3-digit decimal directly into buf (for HTTP status codes).
+#[inline]
+fn write_status_code(buf: &mut Vec<u8>, code: u16) {
+    buf.push(b'0' + (code / 100) as u8);
+    buf.push(b'0' + ((code / 10) % 10) as u8);
+    buf.push(b'0' + (code % 10) as u8);
+}
+
 /// Serialize a Conn's response into a raw HTTP/1.1 response buffer.
+///
+/// Zero-allocation for common status codes (200, 404, etc.) — uses
+/// pre-computed status lines and manual integer formatting.
 pub fn serialize_response(conn: &Conn, keep_alive: bool) -> Vec<u8> {
-    let status = conn.status.as_u16();
-    let reason = conn.status.canonical_reason().unwrap_or("Unknown");
+    let code = conn.status.as_u16();
     let body = &conn.resp_body;
     let body_len = body.len();
-
-    // Check if content-length is already set.
     let has_content_length = conn.resp_headers.contains_key(http::header::CONTENT_LENGTH);
+    let connection_hdr = if keep_alive {
+        &b"connection: keep-alive\r\n"[..]
+    } else {
+        &b"connection: close\r\n"[..]
+    };
 
-    let connection_val = if keep_alive { "keep-alive" } else { "close" };
-
-    // Pre-calculate capacity: status line + headers + body.
-    // Status line: "HTTP/1.1 " + 3 digit status + " " + reason + "\r\n"
-    let status_line_len = 9 + 3 + 1 + reason.len() + 2;
-    let mut header_len = 0;
+    // Estimate capacity: ~128 bytes overhead + headers + body.
+    let mut header_bytes = 0;
     for (name, value) in conn.resp_headers.iter() {
-        // name: value\r\n
-        header_len += name.as_str().len() + 2 + value.len() + 2;
+        header_bytes += name.as_str().len() + 2 + value.len() + 2;
     }
-    if !has_content_length {
-        // "content-length: " + digits + "\r\n"
-        header_len += 16 + count_digits(body_len) + 2;
-    }
-    // "connection: " + val + "\r\n"
-    header_len += 12 + connection_val.len() + 2;
-    // Final "\r\n"
-    let separator_len = 2;
-    let capacity = status_line_len + header_len + separator_len + body_len;
-
+    let capacity = 128 + header_bytes + body_len;
     let mut buf = Vec::with_capacity(capacity);
 
-    // Status line.
-    buf.extend_from_slice(b"HTTP/1.1 ");
-    buf.extend_from_slice(status.to_string().as_bytes());
-    buf.push(b' ');
-    buf.extend_from_slice(reason.as_bytes());
-    buf.extend_from_slice(b"\r\n");
+    // Status line — try pre-computed, fall back to manual.
+    let precomputed = status_line(code);
+    if !precomputed.is_empty() {
+        buf.extend_from_slice(precomputed);
+    } else {
+        buf.extend_from_slice(b"HTTP/1.1 ");
+        write_status_code(&mut buf, code);
+        buf.push(b' ');
+        let reason = conn.status.canonical_reason().unwrap_or("Unknown");
+        buf.extend_from_slice(reason.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
 
     // Response headers.
     for (name, value) in conn.resp_headers.iter() {
@@ -169,39 +212,23 @@ pub fn serialize_response(conn: &Conn, keep_alive: bool) -> Vec<u8> {
         buf.extend_from_slice(b"\r\n");
     }
 
-    // Content-length if not already present.
+    // Content-length (manual integer formatting, no String alloc).
     if !has_content_length {
         buf.extend_from_slice(b"content-length: ");
-        buf.extend_from_slice(body_len.to_string().as_bytes());
+        write_usize(&mut buf, body_len);
         buf.extend_from_slice(b"\r\n");
     }
 
     // Connection header.
-    buf.extend_from_slice(b"connection: ");
-    buf.extend_from_slice(connection_val.as_bytes());
-    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(connection_hdr);
 
-    // Header/body separator.
+    // Separator + body.
     buf.extend_from_slice(b"\r\n");
-
-    // Body.
     buf.extend_from_slice(body);
 
     buf
 }
 
-/// Count the number of decimal digits in a usize value.
-fn count_digits(mut n: usize) -> usize {
-    if n == 0 {
-        return 1;
-    }
-    let mut count = 0;
-    while n > 0 {
-        count += 1;
-        n /= 10;
-    }
-    count
-}
 
 #[cfg(test)]
 mod tests {

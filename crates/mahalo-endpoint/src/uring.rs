@@ -14,9 +14,23 @@ use crate::endpoint::ErrorHandler;
 use crate::http_parse::{self, ParseError};
 
 /// Default peer address used when the actual peer address isn't captured.
-/// We use accept without sockaddr storage for maximum performance.
 fn default_peer_addr() -> SocketAddr {
-    "0.0.0.0:0".parse().unwrap()
+    SocketAddr::from(([0, 0, 0, 0], 0))
+}
+
+/// Set TCP_NODELAY on a raw fd (best-effort).
+#[inline]
+fn set_tcp_nodelay(fd: RawFd) {
+    unsafe {
+        let flag: libc::c_int = 1;
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            &flag as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -27,10 +41,12 @@ fn default_peer_addr() -> SocketAddr {
 //   bits  8–39 : slot index (u32)
 //   bits 40–63 : generation (lower 24 bits of u32)
 
+#[inline]
 fn encode_user_data(state: u8, slot: u32, generation: u32) -> u64 {
     (state as u64) | ((slot as u64) << 8) | (((generation & 0x00FF_FFFF) as u64) << 40)
 }
 
+#[inline]
 fn decode_user_data(data: u64) -> (u8, u32, u32) {
     let state = (data & 0xFF) as u8;
     let slot = ((data >> 8) & 0xFFFF_FFFF) as u32;
@@ -74,7 +90,6 @@ pub(crate) struct ConnectionPool {
 impl ConnectionPool {
     pub fn new(capacity: usize) -> Self {
         let mut free_list = Vec::with_capacity(capacity);
-        // Push in reverse so that index 0 is popped first.
         for i in (0..capacity as u32).rev() {
             free_list.push(i);
         }
@@ -104,14 +119,12 @@ impl ConnectionPool {
         self.slots.get_mut(idx as usize).and_then(|s| s.as_mut())
     }
 
-    /// Allocate a generation counter for a new connection.
     pub fn next_generation(&mut self) -> u32 {
         let g = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
         g
     }
 
-    /// Insert a ConnSlot at the given index.
     pub fn insert(&mut self, idx: u32, slot: ConnSlot) {
         if let Some(entry) = self.slots.get_mut(idx as usize) {
             *entry = Some(slot);
@@ -180,6 +193,7 @@ impl BufferPool {
 // submit helpers
 // ---------------------------------------------------------------------------
 
+#[inline]
 fn submit_accept(ring: &mut IoUring, listen_fd: RawFd) {
     let entry = opcode::Accept::new(types::Fd(listen_fd), std::ptr::null_mut(), std::ptr::null_mut())
         .build()
@@ -189,6 +203,7 @@ fn submit_accept(ring: &mut IoUring, listen_fd: RawFd) {
     }
 }
 
+#[inline]
 fn submit_read(
     ring: &mut IoUring,
     fd: RawFd,
@@ -206,6 +221,7 @@ fn submit_read(
     }
 }
 
+#[inline]
 fn submit_write(
     ring: &mut IoUring,
     fd: RawFd,
@@ -222,6 +238,7 @@ fn submit_write(
     }
 }
 
+#[inline]
 fn submit_close(ring: &mut IoUring, fd: RawFd, slot_idx: u32, generation: u32) {
     let entry = opcode::Close::new(types::Fd(fd))
         .build()
@@ -240,7 +257,6 @@ async fn execute_request(
     router: &MahaloRouter,
     error_handler: &Option<ErrorHandler>,
     after_plugs: &[Box<dyn Plug>],
-    _runtime: &Arc<Runtime>,
 ) -> Conn {
     let method = conn.method.clone();
     let path = conn.uri.path().to_string();
@@ -280,13 +296,10 @@ fn write_static_error_and_close(
     conn_pool: &mut ConnectionPool,
     buf_pool: &mut BufferPool,
 ) {
-    // Free the read buffer if this slot has one.
     if let Some(slot) = conn_pool.get(slot_idx) {
         buf_pool.free(slot.read_buf_idx);
     }
 
-    // We write the static response directly, then the CLOSING CQE will free the slot.
-    // Store the static bytes in the slot's write_buf so the pointer stays valid.
     if let Some(slot) = conn_pool.get_mut(slot_idx) {
         slot.write_buf = response.to_vec();
         slot.write_offset = 0;
@@ -295,9 +308,19 @@ fn write_static_error_and_close(
         let len = slot.write_buf.len() as u32;
         submit_write(ring, fd, ptr, len, slot_idx, generation);
     } else {
-        // Slot is gone — just close.
         submit_close(ring, fd, slot_idx, generation);
     }
+}
+
+// ---------------------------------------------------------------------------
+// PendingRequest — collects parsed requests for batched execution
+// ---------------------------------------------------------------------------
+
+struct PendingRequest {
+    slot_idx: u32,
+    generation: u32,
+    fd: RawFd,
+    keep_alive: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -317,11 +340,13 @@ pub(crate) fn run_event_loop(
     tokio_rt: &tokio::runtime::Runtime,
 ) {
     let peer_addr = default_peer_addr();
-    // Submit the first accept.
     submit_accept(ring, listen_fd);
 
+    // Reusable vectors to avoid per-iteration allocation.
+    let mut pending_meta: Vec<PendingRequest> = Vec::with_capacity(64);
+    let mut pending_conns: Vec<Conn> = Vec::with_capacity(64);
+
     loop {
-        // Submit pending SQEs and wait for at least one CQE.
         if let Err(e) = ring.submit_and_wait(1) {
             tracing::error!("io_uring submit_and_wait error: {}", e);
             continue;
@@ -329,6 +354,9 @@ pub(crate) fn run_event_loop(
 
         // Drain all available CQEs.
         let cqes: Vec<io_uring::cqueue::Entry> = ring.completion().collect();
+
+        pending_meta.clear();
+        pending_conns.clear();
 
         for cqe in cqes {
             let (state, slot_idx, generation) = decode_user_data(cqe.user_data());
@@ -343,12 +371,12 @@ pub(crate) fn run_event_loop(
                     }
                     let new_fd = result;
 
-                    // Allocate a slot and buffer for the new connection.
+                    // TCP_NODELAY on accepted connection — critical for small responses.
+                    set_tcp_nodelay(new_fd);
+
                     let slot_idx = match conn_pool.alloc() {
                         Some(idx) => idx,
                         None => {
-                            // Pool full — reject with 503 and close immediately.
-                            // We cannot store state, so just write + close via raw syscall.
                             unsafe {
                                 libc::write(
                                     new_fd,
@@ -394,24 +422,19 @@ pub(crate) fn run_event_loop(
                         },
                     );
 
-                    // Submit read for the new connection.
                     let buf_ptr = buf_pool.slice_mut(buf_idx).as_mut_ptr();
                     let chunk_len = buf_pool.chunk_size() as u32;
                     submit_read(ring, new_fd, buf_ptr, chunk_len, 0, slot_idx, generation);
-
-                    // Resubmit accept for the next connection.
                     submit_accept(ring, listen_fd);
                 }
 
                 STATE_READING => {
-                    // Validate generation.
                     let slot_gen = conn_pool.get(slot_idx).map(|s| s.generation);
                     if slot_gen != Some(generation & 0x00FF_FFFF) {
                         continue;
                     }
 
                     if result <= 0 {
-                        // EOF or error — close connection, free resources.
                         if let Some(slot) = conn_pool.get(slot_idx) {
                             let fd = slot.fd;
                             buf_pool.free(slot.read_buf_idx);
@@ -435,73 +458,40 @@ pub(crate) fn run_event_loop(
 
                     match http_parse::try_parse_request(buf, body_limit, peer_addr) {
                         Ok(Some(parsed)) => {
-                            // Attach runtime to conn.
+                            // Defer execution — collect for batched block_on.
                             let conn = parsed.conn.with_runtime(Arc::clone(runtime));
-
-                            // Execute through router.
-                            let conn = tokio_rt.block_on(
-                                execute_request(conn, router, error_handler, after_plugs, runtime),
-                            );
-
-                            let response_bytes =
-                                http_parse::serialize_response(&conn, parsed.keep_alive);
-
-                            let slot = conn_pool.get_mut(slot_idx).unwrap();
-                            slot.write_buf = response_bytes;
-                            slot.write_offset = 0;
-                            slot.keep_alive = parsed.keep_alive;
-
-                            let ptr = slot.write_buf.as_ptr();
-                            let len = slot.write_buf.len() as u32;
-                            submit_write(ring, fd, ptr, len, slot_idx, generation);
+                            pending_meta.push(PendingRequest {
+                                slot_idx,
+                                generation,
+                                fd,
+                                keep_alive: parsed.keep_alive,
+                            });
+                            pending_conns.push(conn);
                         }
                         Ok(None) => {
-                            // Partial request — need more data.
                             if read_len >= chunk_size {
-                                // Buffer full, can't read more — send 413.
                                 write_static_error_and_close(
-                                    ring,
-                                    fd,
-                                    http_parse::RESPONSE_413,
-                                    slot_idx,
-                                    generation,
-                                    conn_pool,
-                                    buf_pool,
+                                    ring, fd, http_parse::RESPONSE_413,
+                                    slot_idx, generation, conn_pool, buf_pool,
                                 );
                             } else {
-                                // Submit another read at the current offset.
                                 let buf_ptr = buf_pool.slice_mut(buf_idx).as_mut_ptr();
                                 submit_read(
-                                    ring,
-                                    fd,
-                                    buf_ptr,
-                                    chunk_size as u32,
-                                    read_len,
-                                    slot_idx,
-                                    generation,
+                                    ring, fd, buf_ptr, chunk_size as u32,
+                                    read_len, slot_idx, generation,
                                 );
                             }
                         }
                         Err(ParseError::BodyTooLarge) => {
                             write_static_error_and_close(
-                                ring,
-                                fd,
-                                http_parse::RESPONSE_413,
-                                slot_idx,
-                                generation,
-                                conn_pool,
-                                buf_pool,
+                                ring, fd, http_parse::RESPONSE_413,
+                                slot_idx, generation, conn_pool, buf_pool,
                             );
                         }
                         Err(ParseError::InvalidRequest) => {
                             write_static_error_and_close(
-                                ring,
-                                fd,
-                                http_parse::RESPONSE_400,
-                                slot_idx,
-                                generation,
-                                conn_pool,
-                                buf_pool,
+                                ring, fd, http_parse::RESPONSE_400,
+                                slot_idx, generation, conn_pool, buf_pool,
                             );
                         }
                     }
@@ -514,7 +504,6 @@ pub(crate) fn run_event_loop(
                     }
 
                     if result <= 0 {
-                        // Write error — close.
                         if let Some(slot) = conn_pool.get(slot_idx) {
                             let fd = slot.fd;
                             buf_pool.free(slot.read_buf_idx);
@@ -531,12 +520,10 @@ pub(crate) fn run_event_loop(
                     let fd = slot.fd;
 
                     if slot.write_offset < slot.write_buf.len() {
-                        // Partial write — submit the remaining bytes.
                         let ptr = unsafe { slot.write_buf.as_ptr().add(slot.write_offset) };
                         let remaining = (slot.write_buf.len() - slot.write_offset) as u32;
                         submit_write(ring, fd, ptr, remaining, slot_idx, generation);
                     } else if slot.keep_alive {
-                        // Response fully written, keep-alive — reset for next request.
                         let buf_idx = slot.read_buf_idx;
                         slot.read_len = 0;
                         slot.write_buf.clear();
@@ -546,18 +533,44 @@ pub(crate) fn run_event_loop(
                         let chunk_len = buf_pool.chunk_size() as u32;
                         submit_read(ring, fd, buf_ptr, chunk_len, 0, slot_idx, generation);
                     } else {
-                        // Not keep-alive — close the connection.
                         buf_pool.free(slot.read_buf_idx);
                         submit_close(ring, fd, slot_idx, generation);
                     }
                 }
 
                 STATE_CLOSING => {
-                    // Connection closed — free the slot.
                     conn_pool.free(slot_idx);
                 }
 
                 _ => {}
+            }
+        }
+
+        // ---- Batched handler execution ----
+        // Execute all parsed requests in a single block_on call.
+        if !pending_conns.is_empty() {
+            let results = tokio_rt.block_on(async {
+                let mut results = Vec::with_capacity(pending_conns.len());
+                for conn in pending_conns.drain(..) {
+                    results.push(execute_request(conn, router, error_handler, after_plugs).await);
+                }
+                results
+            });
+
+            for (meta, conn) in pending_meta.drain(..).zip(results) {
+                let response_bytes = http_parse::serialize_response(&conn, meta.keep_alive);
+
+                let slot = match conn_pool.get_mut(meta.slot_idx) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                slot.write_buf = response_bytes;
+                slot.write_offset = 0;
+                slot.keep_alive = meta.keep_alive;
+
+                let ptr = slot.write_buf.as_ptr();
+                let len = slot.write_buf.len() as u32;
+                submit_write(ring, meta.fd, ptr, len, meta.slot_idx, meta.generation);
             }
         }
     }
@@ -570,8 +583,6 @@ pub(crate) fn run_event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- encode / decode round-trip --
 
     #[test]
     fn encode_decode_round_trip_basic() {
@@ -604,13 +615,10 @@ mod tests {
 
     #[test]
     fn encode_decode_generation_truncated_to_24_bits() {
-        // Generations above 24 bits should be masked.
         let data = encode_user_data(STATE_ACCEPTING, 1, 0x01FF_FFFF);
         let (_, _, g) = decode_user_data(data);
-        assert_eq!(g, 0x00FF_FFFF); // upper bits truncated
+        assert_eq!(g, 0x00FF_FFFF);
     }
-
-    // -- ConnectionPool --
 
     #[test]
     fn connection_pool_alloc_free() {
@@ -618,7 +626,7 @@ mod tests {
         let a = pool.alloc().unwrap();
         let b = pool.alloc().unwrap();
         let c = pool.alloc().unwrap();
-        assert!(pool.alloc().is_none()); // exhausted
+        assert!(pool.alloc().is_none());
 
         pool.free(b);
         let d = pool.alloc().unwrap();
@@ -677,8 +685,6 @@ mod tests {
         assert!(pool.get(idx).is_none());
     }
 
-    // -- BufferPool --
-
     #[test]
     fn buffer_pool_alloc_free() {
         let mut pool = BufferPool::new(2, 64);
@@ -701,14 +707,10 @@ mod tests {
         let a = pool.alloc().unwrap();
         let b = pool.alloc().unwrap();
 
-        // Write to slice a.
         pool.slice_mut(a)[0] = 0xAA;
         pool.slice_mut(a)[127] = 0xBB;
-
-        // Write to slice b.
         pool.slice_mut(b)[0] = 0xCC;
 
-        // Verify isolation.
         assert_eq!(pool.slice(a)[0], 0xAA);
         assert_eq!(pool.slice(a)[127], 0xBB);
         assert_eq!(pool.slice(b)[0], 0xCC);
