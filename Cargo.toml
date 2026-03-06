@@ -54,6 +54,7 @@ itoa = "1"
 httpdate = "1"
 blake3 = "1"
 mimalloc = "0.1"
+smallvec = "1"
 
 [profile.release]
 opt-level = 3

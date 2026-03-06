@@ -51,6 +51,7 @@ struct RawParsed<'a> {
 
 /// Shared parsing core: runs httparse, extracts method/uri, scans for
 /// content-length and connection headers. Does NOT touch Conn or HeaderMap.
+#[inline]
 fn parse_raw<'buf, 'hdr>(
     req: &'hdr mut httparse::Request<'hdr, 'buf>,
     buf: &'buf [u8],
@@ -92,6 +93,7 @@ fn parse_raw<'buf, 'hdr>(
 }
 
 /// Convert parsed httparse headers into an `http::HeaderMap`.
+#[inline]
 fn build_header_map(headers: &[httparse::Header<'_>]) -> Result<HeaderMap, ParseError> {
     let mut map = HeaderMap::with_capacity(headers.len());
     for h in headers {
@@ -111,6 +113,7 @@ fn build_header_map(headers: &[httparse::Header<'_>]) -> Result<HeaderMap, Parse
 }
 
 /// Append parsed httparse headers into an existing `HeaderMap`.
+#[inline]
 fn append_headers(map: &mut HeaderMap, headers: &[httparse::Header<'_>]) -> Result<(), ParseError> {
     for h in headers {
         let name = http::header::HeaderName::from_bytes(h.name.as_bytes())
@@ -128,6 +131,7 @@ fn append_headers(map: &mut HeaderMap, headers: &[httparse::Header<'_>]) -> Resu
 
 /// Compute body length, validate against limit, extract body bytes, and
 /// determine keep-alive. Returns `Ok(None)` if the buffer is incomplete.
+#[inline]
 fn finalize_body_and_keepalive(
     raw: &RawParsed<'_>,
     buf: &[u8],
@@ -327,6 +331,7 @@ pub fn serialize_response(conn: &Conn, keep_alive: bool) -> Vec<u8> {
 ///
 /// Clears `buf` first, then writes the full HTTP/1.1 response. The existing
 /// capacity is preserved, so repeated calls on the same Vec avoid re-allocation.
+#[inline]
 pub fn serialize_response_into(conn: &Conn, keep_alive: bool, buf: &mut Vec<u8>) {
     let code = conn.status.as_u16();
     let body = &conn.resp_body;
@@ -346,40 +351,78 @@ pub fn serialize_response_into(conn: &Conn, keep_alive: bool, buf: &mut Vec<u8>)
     let needed = 128 + header_bytes + body_len;
 
     buf.clear();
-    let target = needed.next_power_of_two();
-    buf.reserve(target.saturating_sub(buf.len()));
-
-    // Status line — try pre-computed, fall back to manual.
-    let precomputed = status_line(code);
-    if !precomputed.is_empty() {
-        buf.extend_from_slice(precomputed);
-    } else {
-        buf.extend_from_slice(b"HTTP/1.1 ");
-        write_status_code(buf, code);
-        buf.push(b' ');
-        let reason = conn.status.canonical_reason().unwrap_or("Unknown");
-        buf.extend_from_slice(reason.as_bytes());
-        buf.extend_from_slice(b"\r\n");
+    if buf.capacity() < needed {
+        buf.reserve(needed);
     }
 
-    // Response headers.
-    for (name, value) in conn.resp_headers.iter() {
-        buf.extend_from_slice(name.as_str().as_bytes());
-        buf.extend_from_slice(b": ");
-        buf.extend_from_slice(value.as_bytes());
-        buf.extend_from_slice(b"\r\n");
-    }
+    // Use unsafe pointer-based writing to eliminate per-extend bounds checks.
+    // SAFETY: We reserved `needed` bytes above, and carefully track `pos` to
+    // never exceed the reserved capacity.
+    unsafe {
+        let base = buf.as_mut_ptr();
+        let mut pos = 0usize;
 
-    // Content-length (itoa: 2-digit lookup tables, no reverse step).
-    if !has_content_length {
-        buf.extend_from_slice(b"content-length: ");
-        let mut itoa_buf = itoa::Buffer::new();
-        buf.extend_from_slice(itoa_buf.format(body_len).as_bytes());
-        buf.extend_from_slice(b"\r\n");
-    }
+        // Status line — try pre-computed, fall back to manual.
+        let precomputed = status_line(code);
+        if !precomputed.is_empty() {
+            std::ptr::copy_nonoverlapping(precomputed.as_ptr(), base.add(pos), precomputed.len());
+            pos += precomputed.len();
+        } else {
+            let sl = b"HTTP/1.1 ";
+            std::ptr::copy_nonoverlapping(sl.as_ptr(), base.add(pos), sl.len());
+            pos += sl.len();
+            *base.add(pos) = b'0' + (code / 100) as u8;
+            *base.add(pos + 1) = b'0' + ((code / 10) % 10) as u8;
+            *base.add(pos + 2) = b'0' + (code % 10) as u8;
+            pos += 3;
+            *base.add(pos) = b' ';
+            pos += 1;
+            let reason = conn.status.canonical_reason().unwrap_or("Unknown");
+            let rb = reason.as_bytes();
+            std::ptr::copy_nonoverlapping(rb.as_ptr(), base.add(pos), rb.len());
+            pos += rb.len();
+            *base.add(pos) = b'\r';
+            *base.add(pos + 1) = b'\n';
+            pos += 2;
+        }
 
-    // Connection header.
-    buf.extend_from_slice(connection_hdr);
+        // Response headers.
+        for (name, value) in conn.resp_headers.iter() {
+            let nb = name.as_str().as_bytes();
+            std::ptr::copy_nonoverlapping(nb.as_ptr(), base.add(pos), nb.len());
+            pos += nb.len();
+            *base.add(pos) = b':';
+            *base.add(pos + 1) = b' ';
+            pos += 2;
+            let vb = value.as_bytes();
+            std::ptr::copy_nonoverlapping(vb.as_ptr(), base.add(pos), vb.len());
+            pos += vb.len();
+            *base.add(pos) = b'\r';
+            *base.add(pos + 1) = b'\n';
+            pos += 2;
+        }
+
+        // Content-length.
+        if !has_content_length {
+            let cl = b"content-length: ";
+            std::ptr::copy_nonoverlapping(cl.as_ptr(), base.add(pos), cl.len());
+            pos += cl.len();
+            let mut itoa_buf = itoa::Buffer::new();
+            let num = itoa_buf.format(body_len).as_bytes();
+            std::ptr::copy_nonoverlapping(num.as_ptr(), base.add(pos), num.len());
+            pos += num.len();
+            *base.add(pos) = b'\r';
+            *base.add(pos + 1) = b'\n';
+            pos += 2;
+        }
+
+        // Connection header.
+        std::ptr::copy_nonoverlapping(connection_hdr.as_ptr(), base.add(pos), connection_hdr.len());
+        pos += connection_hdr.len();
+
+        // Update length so write_date_header can extend safely.
+        buf.set_len(pos);
+    }
 
     // Date header (thread-local cache, refreshed every 500ms).
     write_date_header(buf);

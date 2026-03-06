@@ -36,6 +36,7 @@ pub(crate) fn bind_socket(
 /// Execute a request through the router and after-plugs.
 ///
 /// Shared by both the io_uring event loop (Linux) and the tokio TCP server (other platforms).
+#[inline]
 pub async fn execute_request(
     conn: Conn,
     router: &MahaloRouter,

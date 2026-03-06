@@ -21,6 +21,7 @@ impl Pipeline {
         self
     }
 
+    #[inline]
     pub async fn execute(&self, mut conn: Conn) -> Conn {
         for plug in &self.plugs {
             if conn.halted {

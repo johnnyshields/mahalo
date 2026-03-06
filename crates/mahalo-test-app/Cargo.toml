@@ -21,3 +21,4 @@ tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
 tera = { workspace = true }
 mimalloc = { workspace = true }
+smallvec = { workspace = true }

@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use http::Method;
-use mahalo_core::conn::Conn;
+use mahalo_core::conn::{Conn, PathParams};
 use mahalo_core::controller::Controller;
 use mahalo_core::pipeline::Pipeline;
 use mahalo_core::plug::Plug;
+use smallvec::SmallVec;
 
 /// What a matched route dispatches to.
 enum Handler {
@@ -30,6 +31,18 @@ struct Route {
     pipeline_names: Vec<String>,
     /// Optional name for reverse routing (URL helpers).
     name: Option<String>,
+    /// Pre-extracted parameter names as &'static str (leaked once).
+    /// Avoids per-request String allocation for param keys.
+    param_keys: Vec<&'static str>,
+}
+
+/// Extract parameter names from segments and leak them as &'static str.
+fn extract_param_keys(segments: &[String]) -> Vec<&'static str> {
+    segments
+        .iter()
+        .filter_map(|s| s.strip_prefix(':'))
+        .map(|name| -> &'static str { Box::leak(name.to_string().into_boxed_str()) })
+        .collect()
 }
 
 /// Compiled per-method matchit routers. Each maps path → route index.
@@ -56,13 +69,14 @@ impl CompiledRouters {
 
 /// The result of resolving an incoming request to a route.
 pub struct ResolvedRoute<'a> {
-    pub path_params: HashMap<String, String>,
+    pub path_params: PathParams,
     pub pipelines: Vec<&'a Pipeline>,
     handler: &'a Handler,
 }
 
 impl<'a> ResolvedRoute<'a> {
     /// Execute the resolved route: run pipelines then the handler.
+    #[inline]
     pub async fn execute(self, mut conn: Conn) -> Conn {
         conn.path_params = self.path_params;
 
@@ -110,6 +124,7 @@ impl ScopeBuilder {
         let mut segments = self.prefix_segments.clone();
         segments.extend(parse_segments(path));
         let matchit_path = build_matchit_path(&self.prefix, path);
+        let param_keys = extract_param_keys(&segments);
         self.routes.push(Route {
             method,
             segments,
@@ -117,6 +132,7 @@ impl ScopeBuilder {
             handler,
             pipeline_names: self.pipeline_names.clone(),
             name: None,
+            param_keys,
         });
     }
 
@@ -124,6 +140,7 @@ impl ScopeBuilder {
         let mut segments = self.prefix_segments.clone();
         segments.extend(parse_segments(path));
         let matchit_path = build_matchit_path(&self.prefix, path);
+        let param_keys = extract_param_keys(&segments);
         self.routes.push(Route {
             method,
             segments,
@@ -131,6 +148,7 @@ impl ScopeBuilder {
             handler,
             pipeline_names: self.pipeline_names.clone(),
             name: Some(name.to_string()),
+            param_keys,
         });
     }
 
@@ -281,143 +299,82 @@ impl MahaloRouter {
         self
     }
 
-    /// Add a top-level GET route (no scope, no pipelines).
-    pub fn get(mut self, path: &str, plug: impl Plug) -> Self {
+    /// Add a top-level route (no scope, no pipelines).
+    fn add_top_level_route(&mut self, method: Method, path: &str, plug: impl Plug, name: Option<&str>) {
+        let segments = parse_segments(path);
+        let param_keys = extract_param_keys(&segments);
+        let idx = self.routes.len();
         self.routes.push(Route {
-            method: Method::GET,
-            segments: parse_segments(path),
+            method,
+            segments,
             matchit_path: colon_to_brace(path),
             handler: Handler::Plug(Box::new(plug)),
             pipeline_names: Vec::new(),
-            name: None,
+            name: name.map(|n| n.to_string()),
+            param_keys,
         });
+        if let Some(n) = name {
+            self.name_index.insert(n.to_string(), idx);
+        }
+    }
+
+    /// Add a top-level GET route (no scope, no pipelines).
+    pub fn get(mut self, path: &str, plug: impl Plug) -> Self {
+        self.add_top_level_route(Method::GET, path, plug, None);
         self
     }
 
     /// Add a top-level POST route.
     pub fn post(mut self, path: &str, plug: impl Plug) -> Self {
-        self.routes.push(Route {
-            method: Method::POST,
-            segments: parse_segments(path),
-            matchit_path: colon_to_brace(path),
-            handler: Handler::Plug(Box::new(plug)),
-            pipeline_names: Vec::new(),
-            name: None,
-        });
+        self.add_top_level_route(Method::POST, path, plug, None);
         self
     }
 
     /// Add a top-level named GET route.
     pub fn get_named(mut self, path: &str, name: &str, plug: impl Plug) -> Self {
-        let idx = self.routes.len();
-        self.routes.push(Route {
-            method: Method::GET,
-            segments: parse_segments(path),
-            matchit_path: colon_to_brace(path),
-            handler: Handler::Plug(Box::new(plug)),
-            pipeline_names: Vec::new(),
-            name: Some(name.to_string()),
-        });
-        self.name_index.insert(name.to_string(), idx);
+        self.add_top_level_route(Method::GET, path, plug, Some(name));
         self
     }
 
     /// Add a top-level named POST route.
     pub fn post_named(mut self, path: &str, name: &str, plug: impl Plug) -> Self {
-        let idx = self.routes.len();
-        self.routes.push(Route {
-            method: Method::POST,
-            segments: parse_segments(path),
-            matchit_path: colon_to_brace(path),
-            handler: Handler::Plug(Box::new(plug)),
-            pipeline_names: Vec::new(),
-            name: Some(name.to_string()),
-        });
-        self.name_index.insert(name.to_string(), idx);
+        self.add_top_level_route(Method::POST, path, plug, Some(name));
         self
     }
 
     /// Add a top-level PUT route.
     pub fn put(mut self, path: &str, plug: impl Plug) -> Self {
-        self.routes.push(Route {
-            method: Method::PUT,
-            segments: parse_segments(path),
-            matchit_path: colon_to_brace(path),
-            handler: Handler::Plug(Box::new(plug)),
-            pipeline_names: Vec::new(),
-            name: None,
-        });
+        self.add_top_level_route(Method::PUT, path, plug, None);
         self
     }
 
     /// Add a top-level PATCH route.
     pub fn patch(mut self, path: &str, plug: impl Plug) -> Self {
-        self.routes.push(Route {
-            method: Method::PATCH,
-            segments: parse_segments(path),
-            matchit_path: colon_to_brace(path),
-            handler: Handler::Plug(Box::new(plug)),
-            pipeline_names: Vec::new(),
-            name: None,
-        });
+        self.add_top_level_route(Method::PATCH, path, plug, None);
         self
     }
 
     /// Add a top-level DELETE route.
     pub fn delete(mut self, path: &str, plug: impl Plug) -> Self {
-        self.routes.push(Route {
-            method: Method::DELETE,
-            segments: parse_segments(path),
-            matchit_path: colon_to_brace(path),
-            handler: Handler::Plug(Box::new(plug)),
-            pipeline_names: Vec::new(),
-            name: None,
-        });
+        self.add_top_level_route(Method::DELETE, path, plug, None);
         self
     }
 
     /// Add a top-level named PUT route.
     pub fn put_named(mut self, path: &str, name: &str, plug: impl Plug) -> Self {
-        let idx = self.routes.len();
-        self.routes.push(Route {
-            method: Method::PUT,
-            segments: parse_segments(path),
-            matchit_path: colon_to_brace(path),
-            handler: Handler::Plug(Box::new(plug)),
-            pipeline_names: Vec::new(),
-            name: Some(name.to_string()),
-        });
-        self.name_index.insert(name.to_string(), idx);
+        self.add_top_level_route(Method::PUT, path, plug, Some(name));
         self
     }
 
     /// Add a top-level named PATCH route.
     pub fn patch_named(mut self, path: &str, name: &str, plug: impl Plug) -> Self {
-        let idx = self.routes.len();
-        self.routes.push(Route {
-            method: Method::PATCH,
-            segments: parse_segments(path),
-            matchit_path: colon_to_brace(path),
-            handler: Handler::Plug(Box::new(plug)),
-            pipeline_names: Vec::new(),
-            name: Some(name.to_string()),
-        });
-        self.name_index.insert(name.to_string(), idx);
+        self.add_top_level_route(Method::PATCH, path, plug, Some(name));
         self
     }
 
     /// Add a top-level named DELETE route.
     pub fn delete_named(mut self, path: &str, name: &str, plug: impl Plug) -> Self {
-        let idx = self.routes.len();
-        self.routes.push(Route {
-            method: Method::DELETE,
-            segments: parse_segments(path),
-            matchit_path: colon_to_brace(path),
-            handler: Handler::Plug(Box::new(plug)),
-            pipeline_names: Vec::new(),
-            name: Some(name.to_string()),
-        });
-        self.name_index.insert(name.to_string(), idx);
+        self.add_top_level_route(Method::DELETE, path, plug, Some(name));
         self
     }
 
@@ -480,6 +437,7 @@ impl MahaloRouter {
     }
 
     /// Resolve an incoming request method + path to a route.
+    #[inline]
     pub fn resolve(&self, method: &Method, path: &str) -> Option<ResolvedRoute<'_>> {
         let compiled = self.compiled.get_or_init(|| self.compile());
 
@@ -488,12 +446,17 @@ impl MahaloRouter {
         let route_idx = *matched.value;
         let route = &self.routes[route_idx];
 
-        // Extract path params from matchit's zero-alloc params
-        let path_params: HashMap<String, String> = matched
-            .params
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        // Extract path params into SmallVec — zero heap allocation for 0-4 params.
+        // Keys are leaked &'static str from route param names (allocated once at compile time).
+        let mut path_params = PathParams::new();
+        for (k, v) in matched.params.iter() {
+            // Lookup the static key from the route's param_keys
+            let static_key = route.param_keys.iter()
+                .find(|pk| **pk == k)
+                .copied()
+                .unwrap_or_else(|| Box::leak(k.to_string().into_boxed_str()));
+            path_params.push((static_key, SmallVec::from_slice(v.as_bytes())));
+        }
 
         let pipelines: Vec<&Pipeline> = route
             .pipeline_names
@@ -640,6 +603,16 @@ mod tests {
         assert_eq!(build_matchit_path("/api/v1", "/:resource/:id"), "/api/v1/{resource}/{id}");
     }
 
+    /// Helper: get a path param value as &str from resolved route path_params.
+    fn get_param<'a>(params: &'a PathParams, name: &str) -> Option<&'a str> {
+        for (k, v) in params {
+            if *k == name {
+                return std::str::from_utf8(v).ok();
+            }
+        }
+        None
+    }
+
     #[test]
     fn resolve_simple_get() {
         let router = MahaloRouter::new().get(
@@ -710,14 +683,14 @@ mod tests {
 
         // GET /api/rooms/42 -> show
         let resolved = router.resolve(&Method::GET, "/api/rooms/42").unwrap();
-        assert_eq!(resolved.path_params.get("id").unwrap(), "42");
+        assert_eq!(get_param(&resolved.path_params, "id").unwrap(), "42");
 
         // POST /api/rooms -> create
         assert!(router.resolve(&Method::POST, "/api/rooms").is_some());
 
         // PUT /api/rooms/7 -> update
         let resolved = router.resolve(&Method::PUT, "/api/rooms/7").unwrap();
-        assert_eq!(resolved.path_params.get("id").unwrap(), "7");
+        assert_eq!(get_param(&resolved.path_params, "id").unwrap(), "7");
 
         // DELETE /api/rooms/7 -> delete
         assert!(router.resolve(&Method::DELETE, "/api/rooms/7").is_some());
@@ -770,7 +743,7 @@ mod tests {
         let conn = resolved.execute(conn).await;
         assert_eq!(conn.status, StatusCode::OK);
         assert_eq!(conn.resp_body, "show");
-        assert_eq!(conn.path_params.get("id").unwrap(), "99");
+        assert_eq!(conn.path_param("id").unwrap(), "99");
     }
 
     #[tokio::test]
@@ -836,7 +809,7 @@ mod tests {
             s.put("/items/:id", plug_fn(|conn: Conn| async { conn.put_status(StatusCode::OK) }));
         });
         let resolved = router.resolve(&Method::PUT, "/api/items/5").unwrap();
-        assert_eq!(resolved.path_params.get("id").unwrap(), "5");
+        assert_eq!(get_param(&resolved.path_params, "id").unwrap(), "5");
     }
 
     #[test]
@@ -845,7 +818,7 @@ mod tests {
             s.patch("/items/:id", plug_fn(|conn: Conn| async { conn.put_status(StatusCode::OK) }));
         });
         let resolved = router.resolve(&Method::PATCH, "/api/items/3").unwrap();
-        assert_eq!(resolved.path_params.get("id").unwrap(), "3");
+        assert_eq!(get_param(&resolved.path_params, "id").unwrap(), "3");
     }
 
     #[test]

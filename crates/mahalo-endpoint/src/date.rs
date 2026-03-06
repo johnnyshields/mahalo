@@ -33,18 +33,51 @@ thread_local! {
     static CACHED: RefCell<CachedDate> = RefCell::new(CachedDate::new());
 }
 
+/// Total bytes written by write_date_header: "date: " (6) + 29 + "\r\n" (2) = 37.
+pub const DATE_HEADER_WIRE_LEN: usize = 6 + DATE_HEADER_LEN + 2;
+
+/// Pre-built date header line: "date: <IMF-fixdate>\r\n" (37 bytes).
+struct CachedDateLine {
+    wire: [u8; DATE_HEADER_WIRE_LEN],
+    last_updated: Instant,
+}
+
+impl CachedDateLine {
+    fn new() -> Self {
+        let mut cdl = CachedDateLine {
+            wire: [0u8; DATE_HEADER_WIRE_LEN],
+            last_updated: Instant::now(),
+        };
+        cdl.wire[..6].copy_from_slice(b"date: ");
+        cdl.wire[DATE_HEADER_WIRE_LEN - 2] = b'\r';
+        cdl.wire[DATE_HEADER_WIRE_LEN - 1] = b'\n';
+        cdl.refresh();
+        cdl
+    }
+
+    fn refresh(&mut self) {
+        let now = SystemTime::now();
+        let formatted = httpdate::HttpDate::from(now).to_string();
+        let bytes = formatted.as_bytes();
+        self.wire[6..6 + DATE_HEADER_LEN].copy_from_slice(&bytes[..DATE_HEADER_LEN]);
+        self.last_updated = Instant::now();
+    }
+}
+
+thread_local! {
+    static CACHED_LINE: RefCell<CachedDateLine> = RefCell::new(CachedDateLine::new());
+}
+
 /// Append `date: <IMF-fixdate>\r\n` to `buf`, using a thread-local cache
-/// that refreshes every 500ms.
+/// that refreshes every 500ms. Single memcpy of 37 bytes.
 #[inline]
 pub fn write_date_header(buf: &mut Vec<u8>) {
-    CACHED.with(|cell| {
+    CACHED_LINE.with(|cell| {
         let mut cached = cell.borrow_mut();
         if cached.last_updated.elapsed() >= REFRESH_INTERVAL {
             cached.refresh();
         }
-        buf.extend_from_slice(b"date: ");
-        buf.extend_from_slice(&cached.bytes);
-        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(&cached.wire);
     });
 }
 

@@ -740,8 +740,7 @@ impl Channel for SupportChannel {
 // ---------------------------------------------------------------------------
 
 fn parse_id_param(conn: &Conn) -> u64 {
-    conn.path_params
-        .get("id")
+    conn.path_param("id")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
 }
@@ -833,7 +832,7 @@ fn render_order(conn: Conn, tera: &Tera, store: &Store) -> Conn {
 }
 
 fn render_order_status(conn: Conn, tera: &Tera) -> Conn {
-    let order_id = conn.path_params.get("id").cloned().unwrap_or_else(|| "0".to_string());
+    let order_id = conn.path_param("id").unwrap_or("0").to_string();
     let mut context = Context::new();
     context.insert("order_id", &order_id);
     render_template(conn, tera, "order_status.html", &context)
@@ -1315,11 +1314,11 @@ mod tests {
     #[test]
     fn test_parse_id_param() {
         let mut conn = Conn::test();
-        conn.path_params.insert("id".to_string(), "7".to_string());
+        conn.path_params.push(("id", smallvec::smallvec![b'7']));
         assert_eq!(parse_id_param(&conn), 7);
 
         let mut conn2 = Conn::test();
-        conn2.path_params.insert("id".to_string(), "abc".to_string());
+        conn2.path_params.push(("id", smallvec::SmallVec::from_slice(b"abc")));
         assert_eq!(parse_id_param(&conn2), 0);
 
         let conn3 = Conn::test();

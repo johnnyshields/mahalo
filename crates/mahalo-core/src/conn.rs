@@ -7,11 +7,16 @@ use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, Uri};
 use percent_encoding::percent_decode_str;
 use rebar_core::runtime::Runtime;
+use smallvec::SmallVec;
 
 /// Typed key for the assigns map.
 pub trait AssignKey: Send + Sync + 'static {
     type Value: Send + Sync + 'static;
 }
+
+/// Inline key-value pair for path parameters. Avoids HashMap allocation for
+/// the common case of 0-4 path parameters.
+pub type PathParams = SmallVec<[(&'static str, SmallVec<[u8; 32]>); 4]>;
 
 /// Central request + response struct, inspired by Phoenix's `Plug.Conn`.
 pub struct Conn {
@@ -19,7 +24,7 @@ pub struct Conn {
     pub method: Method,
     pub uri: Uri,
     pub headers: HeaderMap,
-    pub path_params: HashMap<String, String>,
+    pub path_params: PathParams,
     pub query_params: HashMap<String, String>,
     pub remote_addr: Option<SocketAddr>,
     pub body: Bytes,
@@ -41,7 +46,7 @@ impl Conn {
             method,
             uri,
             headers: HeaderMap::new(),
-            path_params: HashMap::new(),
+            path_params: SmallVec::new(),
             query_params: HashMap::new(),
             remote_addr: None,
             body: Bytes::new(),
@@ -74,11 +79,25 @@ impl Conn {
         self.runtime = None;
     }
 
+    /// Get a path parameter by name. O(n) scan over the SmallVec, but
+    /// n is typically 0-4 so this is faster than HashMap lookup.
+    #[inline]
+    pub fn path_param(&self, name: &str) -> Option<&str> {
+        for (k, v) in &self.path_params {
+            if *k == name {
+                return std::str::from_utf8(v).ok();
+            }
+        }
+        None
+    }
+
+    #[inline]
     pub fn put_status(mut self, status: StatusCode) -> Self {
         self.status = status;
         self
     }
 
+    #[inline]
     pub fn put_resp_header(
         mut self,
         key: impl TryInto<http::header::HeaderName>,
@@ -90,11 +109,13 @@ impl Conn {
         self
     }
 
+    #[inline]
     pub fn put_resp_body(mut self, body: impl Into<Bytes>) -> Self {
         self.resp_body = body.into();
         self
     }
 
+    #[inline]
     pub fn halt(mut self) -> Self {
         self.halted = true;
         self
@@ -114,6 +135,7 @@ impl Conn {
             .and_then(|v| v.downcast_ref())
     }
 
+    #[inline]
     pub fn with_runtime(mut self, runtime: Arc<Runtime>) -> Self {
         self.runtime = Some(runtime);
         self
@@ -269,7 +291,7 @@ mod tests {
 
         let mut conn = conn;
         conn.headers.insert("host", "example.com".parse().unwrap());
-        conn.path_params.insert("id".into(), "1".into());
+        conn.path_params.push(("id", SmallVec::from_slice(b"1")));
         conn.query_params.insert("q".into(), "test".into());
         conn.remote_addr = Some("1.2.3.4:80".parse().unwrap());
 
