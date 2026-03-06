@@ -104,6 +104,7 @@ impl ConnectionPool {
         self.free_list.pop()
     }
 
+    /// Return a connection slot to the pool. Safe to call on uninitialized (None) slots.
     pub fn free(&mut self, idx: u32) {
         if let Some(slot) = self.slots.get_mut(idx as usize) {
             *slot = None;
@@ -160,7 +161,12 @@ impl BufferPool {
         self.free_list.pop()
     }
 
+    /// Return a buffer to the pool. Caller must ensure `idx` is not already free.
     pub fn free(&mut self, idx: u16) {
+        debug_assert!(
+            !self.free_list.contains(&idx),
+            "BufferPool double-free of index {idx}"
+        );
         self.free_list.push(idx);
     }
 
@@ -213,7 +219,7 @@ fn submit_read(
     slot_idx: u32,
     generation: u32,
 ) {
-    let entry = opcode::Read::new(types::Fd(fd), buf_ptr.wrapping_add(offset), len - offset as u32)
+    let entry = opcode::Read::new(types::Fd(fd), buf_ptr.wrapping_add(offset), len.saturating_sub(offset as u32))
         .build()
         .user_data(encode_user_data(STATE_READING, slot_idx, generation));
     unsafe {
@@ -296,11 +302,8 @@ fn write_static_error_and_close(
     conn_pool: &mut ConnectionPool,
     buf_pool: &mut BufferPool,
 ) {
-    if let Some(slot) = conn_pool.get(slot_idx) {
-        buf_pool.free(slot.read_buf_idx);
-    }
-
     if let Some(slot) = conn_pool.get_mut(slot_idx) {
+        buf_pool.free(slot.read_buf_idx);
         slot.write_buf.clear();
         slot.write_buf.extend_from_slice(response);
         slot.write_offset = 0;

@@ -564,9 +564,10 @@ fn normalize_prefix(prefix: &str) -> String {
 fn build_matchit_path(prefix: &str, path: &str) -> String {
     let full = if path == "/" || path.is_empty() {
         prefix.to_string()
+    } else if path.starts_with('/') {
+        format!("{}{}", prefix, path)
     } else {
-        let path_part = if path.starts_with('/') { path } else { path };
-        format!("{}{}", prefix, path_part)
+        format!("{}/{}", prefix, path)
     };
     colon_to_brace(&full)
 }
