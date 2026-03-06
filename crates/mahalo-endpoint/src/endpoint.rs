@@ -17,7 +17,10 @@ pub type ErrorHandler = Arc<dyn Fn(StatusCode, Conn) -> Conn + Send + Sync>;
 /// Default maximum request body size (2 MB).
 pub(crate) const DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
-/// Bridges MahaloRouter to an io_uring HTTP server with rebar supervision support.
+/// Bridges MahaloRouter to an HTTP server with rebar supervision support.
+///
+/// On Linux, uses io_uring for maximum performance. On other platforms
+/// (macOS, Windows), falls back to a tokio-based TCP server.
 pub struct MahaloEndpoint {
     router: Arc<MahaloRouter>,
     addr: SocketAddr,
@@ -52,18 +55,36 @@ impl MahaloEndpoint {
         self
     }
 
-    /// Start the HTTP server using io_uring, blocking until shutdown.
+    /// Start the HTTP server, blocking until shutdown.
+    ///
+    /// Uses io_uring on Linux, tokio TCP on other platforms.
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let addr = self.addr;
         tracing::info!("Mahalo endpoint listening on {}", addr);
-        crate::worker::start_uring_server(
-            addr,
-            self.router,
-            self.error_handler,
-            Arc::new(self.after_plugs),
-            self.runtime,
-            DEFAULT_BODY_LIMIT,
-        )
+
+        #[cfg(target_os = "linux")]
+        {
+            crate::worker::start_uring_server(
+                addr,
+                self.router,
+                self.error_handler,
+                Arc::new(self.after_plugs),
+                self.runtime,
+                DEFAULT_BODY_LIMIT,
+            )
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            crate::tcp_server::start_tcp_server(
+                addr,
+                self.router,
+                self.error_handler,
+                Arc::new(self.after_plugs),
+                self.runtime,
+                DEFAULT_BODY_LIMIT,
+            )
+        }
     }
 
     /// Create a rebar ChildEntry for supervision.
@@ -82,14 +103,28 @@ impl MahaloEndpoint {
             let after_plugs = Arc::clone(&after_plugs);
             async move {
                 tracing::info!("Mahalo endpoint listening on {}", addr);
-                match crate::worker::start_uring_server(
+
+                #[cfg(target_os = "linux")]
+                let result = crate::worker::start_uring_server(
                     addr,
                     router,
                     error_handler,
                     after_plugs,
                     runtime,
                     DEFAULT_BODY_LIMIT,
-                ) {
+                );
+
+                #[cfg(not(target_os = "linux"))]
+                let result = crate::tcp_server::start_tcp_server(
+                    addr,
+                    router,
+                    error_handler,
+                    after_plugs,
+                    runtime,
+                    DEFAULT_BODY_LIMIT,
+                );
+
+                match result {
                     Ok(()) => ExitReason::Normal,
                     Err(e) => ExitReason::Abnormal(format!("endpoint error: {}", e)),
                 }

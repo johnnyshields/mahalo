@@ -2,7 +2,6 @@ use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
-use http::StatusCode;
 use io_uring::{IoUring, opcode, types};
 use mahalo_core::conn::Conn;
 use mahalo_core::plug::Plug;
@@ -252,41 +251,6 @@ fn submit_close(ring: &mut IoUring, fd: RawFd, slot_idx: u32, generation: u32) {
     unsafe {
         ring.submission().push(&entry).ok();
     }
-}
-
-// ---------------------------------------------------------------------------
-// execute_request – runs Conn through the router + after-plugs
-// ---------------------------------------------------------------------------
-
-async fn execute_request(
-    conn: Conn,
-    router: &MahaloRouter,
-    error_handler: &Option<ErrorHandler>,
-    after_plugs: &[Box<dyn Plug>],
-) -> Conn {
-    // Borrow method/path from conn without cloning — resolve only needs references.
-    let resolved = router.resolve(&conn.method, conn.uri.path());
-
-    let mut conn = match resolved {
-        Some(resolved) => resolved.execute(conn).await,
-        None => {
-            if let Some(handler) = error_handler {
-                let conn = conn.put_status(StatusCode::NOT_FOUND);
-                handler(StatusCode::NOT_FOUND, conn)
-            } else {
-                conn.put_status(StatusCode::NOT_FOUND)
-                    .put_resp_body("Not Found")
-            }
-        }
-    };
-
-    for plug in after_plugs {
-        if conn.halted {
-            break;
-        }
-        conn = plug.call(conn).await;
-    }
-    conn
 }
 
 // ---------------------------------------------------------------------------
@@ -560,7 +524,7 @@ pub(crate) fn run_event_loop(
             let pc = &mut pending_conns;
             tokio_rt.block_on(async {
                 for conn in pc.drain(..) {
-                    r.push(execute_request(conn, router, error_handler, after_plugs).await);
+                    r.push(crate::handler::execute_request(conn, router, error_handler, after_plugs).await);
                 }
             });
 
