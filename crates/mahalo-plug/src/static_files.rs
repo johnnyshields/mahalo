@@ -53,6 +53,25 @@ fn mime_from_extension(ext: &str) -> &'static str {
     }
 }
 
+/// Compute a BLAKE3 ETag for file contents, set the `etag` response header,
+/// and check `if-none-match`. Returns `(conn, true)` if the client's cached
+/// version matches (caller should return 304), `(conn, false)` otherwise.
+fn check_etag(conn: Conn, contents: &[u8]) -> (Conn, bool) {
+    let hash = blake3::hash(contents);
+    let hex = hash.to_hex();
+    // Truncate to 32 hex chars (128-bit) — adequate collision resistance for ETags.
+    let etag_value = format!("W/\"{}\"", &hex[..32]);
+
+    let matches = conn
+        .headers
+        .get("if-none-match")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s == etag_value);
+
+    let conn = conn.put_resp_header("etag", etag_value.as_str());
+    (conn, matches)
+}
+
 /// Returns true if the given MIME type is likely compressible.
 fn is_compressible(mime: &str) -> bool {
     if mime.starts_with("video/") || mime.starts_with("audio/") {
@@ -167,14 +186,22 @@ impl Plug for StaticFiles {
                                 let len = contents.len().to_string();
                                 let is_head = conn.method == Method::HEAD;
 
+                                let (conn, etag_match) = check_etag(conn, &contents);
                                 let mut conn = conn
                                     .put_status(StatusCode::OK)
-                                    .put_resp_header("content-type", mime)
                                     .put_resp_header("content-encoding", encoding)
                                     .put_resp_header("vary", "accept-encoding")
                                     .put_resp_header("content-length", len.as_str());
                                 conn.resp_headers
+                                    .insert(http::header::CONTENT_TYPE, HeaderValue::from_static(mime));
+                                conn.resp_headers
                                     .insert(http::header::CACHE_CONTROL, self.cache_control.clone());
+
+                                if etag_match {
+                                    return conn.put_status(StatusCode::NOT_MODIFIED)
+                                        .put_resp_body(bytes::Bytes::new())
+                                        .halt();
+                                }
 
                                 if !is_head {
                                     conn = conn.put_resp_body(contents);
@@ -196,15 +223,23 @@ impl Plug for StaticFiles {
             let len = contents.len().to_string();
             let is_head = conn.method == Method::HEAD;
 
+            let (conn, etag_match) = check_etag(conn, &contents);
             let mut conn = conn
                 .put_status(StatusCode::OK)
-                .put_resp_header("content-type", mime)
                 .put_resp_header("content-length", len.as_str());
+            conn.resp_headers
+                .insert(http::header::CONTENT_TYPE, HeaderValue::from_static(mime));
             conn.resp_headers
                 .insert(http::header::CACHE_CONTROL, self.cache_control.clone());
 
             if compressible {
                 conn = conn.put_resp_header("vary", "accept-encoding");
+            }
+
+            if etag_match {
+                return conn.put_status(StatusCode::NOT_MODIFIED)
+                    .put_resp_body(bytes::Bytes::new())
+                    .halt();
             }
 
             if !is_head {
@@ -368,6 +403,150 @@ mod tests {
 
         assert!(conn.halted);
         assert_eq!(conn.resp_headers.get("vary").unwrap(), "accept-encoding");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn head_on_precompressed_returns_headers_no_body() {
+        let dir = temp_dir("head_precomp");
+        fs::write(dir.join("app.js"), "console.log('hello')").unwrap();
+        fs::write(dir.join("app.js.br"), "compressed-brotli-data").unwrap();
+
+        let plug = StaticFiles::new("/static", dir.clone());
+        let mut conn = Conn::new(Method::HEAD, "/static/app.js".parse().unwrap());
+        conn.headers.insert("accept-encoding", "br".parse().unwrap());
+        let conn = plug.call(conn).await;
+
+        assert!(conn.halted);
+        assert_eq!(conn.status, StatusCode::OK);
+        assert_eq!(conn.resp_headers.get("content-encoding").unwrap(), "br");
+        assert_eq!(conn.resp_headers.get("content-type").unwrap(), "text/javascript");
+        assert!(conn.resp_body.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn gzip_fallback_when_br_missing() {
+        let dir = temp_dir("gz_fallback");
+        fs::write(dir.join("app.js"), "console.log('hello')").unwrap();
+        // Only .gz variant exists, no .br
+        fs::write(dir.join("app.js.gz"), "gzip-data").unwrap();
+
+        let plug = StaticFiles::new("/static", dir.clone());
+        let mut conn = Conn::new(Method::GET, "/static/app.js".parse().unwrap());
+        conn.headers.insert("accept-encoding", "gzip, br".parse().unwrap());
+        let conn = plug.call(conn).await;
+
+        assert!(conn.halted);
+        assert_eq!(conn.resp_headers.get("content-encoding").unwrap(), "gzip");
+        assert_eq!(conn.resp_body.as_ref(), b"gzip-data");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn serves_zstd_variant() {
+        let dir = temp_dir("zstd");
+        fs::write(dir.join("app.js"), "console.log('hello')").unwrap();
+        fs::write(dir.join("app.js.zst"), "zstd-data").unwrap();
+
+        let plug = StaticFiles::new("/static", dir.clone());
+        let mut conn = Conn::new(Method::GET, "/static/app.js".parse().unwrap());
+        conn.headers.insert("accept-encoding", "zstd".parse().unwrap());
+        let conn = plug.call(conn).await;
+
+        assert!(conn.halted);
+        assert_eq!(conn.resp_headers.get("content-encoding").unwrap(), "zstd");
+        assert_eq!(conn.resp_body.as_ref(), b"zstd-data");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn br_preferred_over_gzip_when_both_available() {
+        let dir = temp_dir("priority");
+        fs::write(dir.join("app.js"), "console.log('hello')").unwrap();
+        fs::write(dir.join("app.js.br"), "br-data").unwrap();
+        fs::write(dir.join("app.js.gz"), "gz-data").unwrap();
+
+        let plug = StaticFiles::new("/static", dir.clone());
+        let mut conn = Conn::new(Method::GET, "/static/app.js".parse().unwrap());
+        conn.headers.insert("accept-encoding", "gzip, br".parse().unwrap());
+        let conn = plug.call(conn).await;
+
+        assert!(conn.halted);
+        assert_eq!(conn.resp_headers.get("content-encoding").unwrap(), "br");
+        assert_eq!(conn.resp_body.as_ref(), b"br-data");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn etag_set_on_static_file() {
+        let dir = temp_dir("etag");
+        fs::write(dir.join("style.css"), "body {}").unwrap();
+
+        let plug = StaticFiles::new("/static", dir.clone());
+        let conn = Conn::new(Method::GET, "/static/style.css".parse().unwrap());
+        let conn = plug.call(conn).await;
+
+        assert!(conn.halted);
+        let etag = conn.resp_headers.get("etag").unwrap().to_str().unwrap();
+        assert!(etag.starts_with("W/\""));
+        assert_eq!(etag.len(), 36);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn static_file_304_on_matching_if_none_match() {
+        let dir = temp_dir("etag304");
+        fs::write(dir.join("style.css"), "body {}").unwrap();
+
+        let plug = StaticFiles::new("/static", dir.clone());
+
+        // First request to get the ETag
+        let conn = Conn::new(Method::GET, "/static/style.css".parse().unwrap());
+        let conn = plug.call(conn).await;
+        let etag = conn.resp_headers.get("etag").unwrap().to_str().unwrap().to_owned();
+
+        // Second request with matching if-none-match
+        let mut conn = Conn::new(Method::GET, "/static/style.css".parse().unwrap());
+        conn.headers.insert("if-none-match", etag.parse().unwrap());
+        let conn = plug.call(conn).await;
+
+        assert!(conn.halted);
+        assert_eq!(conn.status, StatusCode::NOT_MODIFIED);
+        assert!(conn.resp_body.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn precompressed_etag_and_304() {
+        let dir = temp_dir("etag_precomp");
+        fs::write(dir.join("app.js"), "console.log('hello')").unwrap();
+        fs::write(dir.join("app.js.br"), "br-data").unwrap();
+
+        let plug = StaticFiles::new("/static", dir.clone());
+
+        // First request
+        let mut conn = Conn::new(Method::GET, "/static/app.js".parse().unwrap());
+        conn.headers.insert("accept-encoding", "br".parse().unwrap());
+        let conn = plug.call(conn).await;
+        let etag = conn.resp_headers.get("etag").unwrap().to_str().unwrap().to_owned();
+
+        // Conditional request
+        let mut conn = Conn::new(Method::GET, "/static/app.js".parse().unwrap());
+        conn.headers.insert("accept-encoding", "br".parse().unwrap());
+        conn.headers.insert("if-none-match", etag.parse().unwrap());
+        let conn = plug.call(conn).await;
+
+        assert!(conn.halted);
+        assert_eq!(conn.status, StatusCode::NOT_MODIFIED);
+        assert!(conn.resp_body.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

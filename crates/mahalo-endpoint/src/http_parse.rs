@@ -36,6 +36,134 @@ pub const RESPONSE_413: &[u8] =
 pub const RESPONSE_503: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 19\r\nconnection: close\r\n\r\nService Unavailable";
 
+/// Internal result of the shared parsing helper — everything extracted from
+/// the raw buffer before Conn population.
+struct RawParsed<'a> {
+    method: Method,
+    uri: Uri,
+    headers: &'a [httparse::Header<'a>],
+    content_length: Option<usize>,
+    connection_header: Option<&'a str>,
+    http_version: Option<u8>,
+    header_len: usize,
+}
+
+/// Shared parsing core: runs httparse, extracts method/uri, scans for
+/// content-length and connection headers. Does NOT touch Conn or HeaderMap.
+fn parse_raw<'buf, 'hdr>(
+    req: &'hdr mut httparse::Request<'hdr, 'buf>,
+    buf: &'buf [u8],
+) -> Result<Option<RawParsed<'hdr>>, ParseError> {
+    let header_len = match req.parse(buf) {
+        Ok(httparse::Status::Partial) => return Ok(None),
+        Ok(httparse::Status::Complete(len)) => len,
+        Err(_) => return Err(ParseError::InvalidRequest),
+    };
+
+    let method = Method::from_bytes(req.method.ok_or(ParseError::InvalidRequest)?.as_bytes())
+        .map_err(|_| ParseError::InvalidRequest)?;
+    let uri = Uri::from_str(req.path.ok_or(ParseError::InvalidRequest)?)
+        .map_err(|_| ParseError::InvalidRequest)?;
+
+    let mut content_length: Option<usize> = None;
+    let mut connection_header: Option<&str> = None;
+
+    for h in req.headers.iter() {
+        if h.name.eq_ignore_ascii_case("content-length") {
+            if let Ok(s) = std::str::from_utf8(h.value) {
+                content_length = s.trim().parse().ok();
+            }
+        }
+        if h.name.eq_ignore_ascii_case("connection") {
+            connection_header = std::str::from_utf8(h.value).ok();
+        }
+    }
+
+    Ok(Some(RawParsed {
+        method,
+        uri,
+        headers: req.headers,
+        content_length,
+        connection_header,
+        http_version: req.version,
+        header_len,
+    }))
+}
+
+/// Convert parsed httparse headers into an `http::HeaderMap`.
+fn build_header_map(headers: &[httparse::Header<'_>]) -> Result<HeaderMap, ParseError> {
+    let mut map = HeaderMap::with_capacity(headers.len());
+    for h in headers {
+        let name = http::header::HeaderName::from_bytes(h.name.as_bytes())
+            .map_err(|_| ParseError::InvalidRequest)?;
+        // SAFETY: httparse already validated that header values contain only
+        // visible ASCII characters and spaces/tabs (RFC 7230 field-value).
+        // Skipping re-validation avoids redundant work on the hot path.
+        let value = unsafe {
+            http::header::HeaderValue::from_maybe_shared_unchecked(
+                Bytes::copy_from_slice(h.value),
+            )
+        };
+        map.append(name, value);
+    }
+    Ok(map)
+}
+
+/// Append parsed httparse headers into an existing `HeaderMap`.
+fn append_headers(map: &mut HeaderMap, headers: &[httparse::Header<'_>]) -> Result<(), ParseError> {
+    for h in headers {
+        let name = http::header::HeaderName::from_bytes(h.name.as_bytes())
+            .map_err(|_| ParseError::InvalidRequest)?;
+        // SAFETY: httparse already validated header values.
+        let value = unsafe {
+            http::header::HeaderValue::from_maybe_shared_unchecked(
+                Bytes::copy_from_slice(h.value),
+            )
+        };
+        map.append(name, value);
+    }
+    Ok(())
+}
+
+/// Compute body length, validate against limit, extract body bytes, and
+/// determine keep-alive. Returns `Ok(None)` if the buffer is incomplete.
+fn finalize_body_and_keepalive(
+    raw: &RawParsed<'_>,
+    buf: &[u8],
+    body_limit: usize,
+) -> Result<Option<(Bytes, bool, usize)>, ParseError> {
+    let body_len = match raw.method {
+        Method::GET | Method::HEAD | Method::DELETE => 0,
+        _ => raw.content_length.unwrap_or(0),
+    };
+
+    if body_len > body_limit {
+        return Err(ParseError::BodyTooLarge);
+    }
+
+    let total = raw.header_len + body_len;
+
+    if buf.len() < total {
+        return Ok(None);
+    }
+
+    let body = if body_len > 0 {
+        Bytes::copy_from_slice(&buf[raw.header_len..total])
+    } else {
+        Bytes::new()
+    };
+
+    // HTTP/1.1 defaults to keep-alive; HTTP/1.0 defaults to close.
+    let keep_alive = match raw.connection_header {
+        Some(v) if v.eq_ignore_ascii_case("close") => false,
+        Some(v) if v.eq_ignore_ascii_case("keep-alive") => true,
+        // Check HTTP version from httparse (1 = HTTP/1.1, 0 = HTTP/1.0).
+        _ => raw.http_version.unwrap_or(1) >= 1,
+    };
+
+    Ok(Some((body, keep_alive, total)))
+}
+
 /// Attempt to parse an HTTP/1.1 request from `buf`.
 ///
 /// Returns `Ok(None)` if the buffer contains a partial request (need more data).
@@ -49,79 +177,19 @@ pub fn try_parse_request(
     let mut headers_buf = [httparse::EMPTY_HEADER; 96];
     let mut req = httparse::Request::new(&mut headers_buf);
 
-    let header_len = match req.parse(buf) {
-        Ok(httparse::Status::Partial) => return Ok(None),
-        Ok(httparse::Status::Complete(len)) => len,
-        Err(_) => return Err(ParseError::InvalidRequest),
+    let raw = match parse_raw(&mut req, buf)? {
+        Some(r) => r,
+        None => return Ok(None),
     };
 
-    let method = Method::from_bytes(req.method.ok_or(ParseError::InvalidRequest)?.as_bytes())
-        .map_err(|_| ParseError::InvalidRequest)?;
-    let uri = Uri::from_str(req.path.ok_or(ParseError::InvalidRequest)?)
-        .map_err(|_| ParseError::InvalidRequest)?;
-
-    let mut header_map = HeaderMap::with_capacity(req.headers.len());
-    let mut content_length: Option<usize> = None;
-    let mut connection_header: Option<&str> = None;
-
-    for h in req.headers.iter() {
-        let name = http::header::HeaderName::from_bytes(h.name.as_bytes())
-            .map_err(|_| ParseError::InvalidRequest)?;
-        // SAFETY: httparse already validated that header values contain only
-        // visible ASCII characters and spaces/tabs (RFC 7230 field-value).
-        // Skipping re-validation avoids redundant work on the hot path.
-        let value = unsafe {
-            http::header::HeaderValue::from_maybe_shared_unchecked(
-                Bytes::copy_from_slice(h.value),
-            )
-        };
-
-        if h.name.eq_ignore_ascii_case("content-length") {
-            if let Ok(s) = std::str::from_utf8(h.value) {
-                content_length = s.trim().parse().ok();
-            }
-        }
-        if h.name.eq_ignore_ascii_case("connection") {
-            connection_header = std::str::from_utf8(h.value).ok();
-        }
-
-        header_map.append(name, value);
-    }
-
-    // Determine if the method carries a body.
-    let body_len = match method {
-        Method::GET | Method::HEAD | Method::DELETE => 0,
-        _ => content_length.unwrap_or(0),
+    let (body, keep_alive, total) = match finalize_body_and_keepalive(&raw, buf, body_limit)? {
+        Some(t) => t,
+        None => return Ok(None),
     };
 
-    if body_len > body_limit {
-        return Err(ParseError::BodyTooLarge);
-    }
+    let header_map = build_header_map(raw.headers)?;
 
-    let total = header_len + body_len;
-
-    // Not enough data yet for the full body.
-    if buf.len() < total {
-        return Ok(None);
-    }
-
-    let body = if body_len > 0 {
-        Bytes::copy_from_slice(&buf[header_len..total])
-    } else {
-        Bytes::new()
-    };
-
-    // HTTP/1.1 defaults to keep-alive; HTTP/1.0 defaults to close.
-    let keep_alive = match connection_header {
-        Some(v) if v.eq_ignore_ascii_case("close") => false,
-        Some(v) if v.eq_ignore_ascii_case("keep-alive") => true,
-        _ => {
-            // Check HTTP version from httparse (1 = HTTP/1.1, 0 = HTTP/1.0).
-            req.version.unwrap_or(1) >= 1
-        }
-    };
-
-    let mut conn = Conn::new(method, uri);
+    let mut conn = Conn::new(raw.method, raw.uri);
     conn.headers = header_map;
     conn.body = body;
     conn.remote_addr = Some(peer_addr);
@@ -150,73 +218,20 @@ pub fn try_parse_into_conn(
     let mut headers_buf = [httparse::EMPTY_HEADER; 96];
     let mut req = httparse::Request::new(&mut headers_buf);
 
-    let header_len = match req.parse(buf) {
-        Ok(httparse::Status::Partial) => return Ok(None),
-        Ok(httparse::Status::Complete(len)) => len,
-        Err(_) => return Err(ParseError::InvalidRequest),
+    let raw = match parse_raw(&mut req, buf)? {
+        Some(r) => r,
+        None => return Ok(None),
     };
 
-    let method = Method::from_bytes(req.method.ok_or(ParseError::InvalidRequest)?.as_bytes())
-        .map_err(|_| ParseError::InvalidRequest)?;
-    let uri = Uri::from_str(req.path.ok_or(ParseError::InvalidRequest)?)
-        .map_err(|_| ParseError::InvalidRequest)?;
-
-    // Reset and populate the existing Conn.
-    conn.reset(method, uri);
-
-    let mut content_length: Option<usize> = None;
-    let mut connection_header: Option<&str> = None;
-
-    for h in req.headers.iter() {
-        let name = http::header::HeaderName::from_bytes(h.name.as_bytes())
-            .map_err(|_| ParseError::InvalidRequest)?;
-        // SAFETY: httparse already validated header values.
-        let value = unsafe {
-            http::header::HeaderValue::from_maybe_shared_unchecked(
-                Bytes::copy_from_slice(h.value),
-            )
-        };
-
-        if h.name.eq_ignore_ascii_case("content-length") {
-            if let Ok(s) = std::str::from_utf8(h.value) {
-                content_length = s.trim().parse().ok();
-            }
-        }
-        if h.name.eq_ignore_ascii_case("connection") {
-            connection_header = std::str::from_utf8(h.value).ok();
-        }
-
-        conn.headers.append(name, value);
-    }
-
-    let body_len = match conn.method {
-        Method::GET | Method::HEAD | Method::DELETE => 0,
-        _ => content_length.unwrap_or(0),
+    let (body, keep_alive, total) = match finalize_body_and_keepalive(&raw, buf, body_limit)? {
+        Some(t) => t,
+        None => return Ok(None),
     };
 
-    if body_len > body_limit {
-        return Err(ParseError::BodyTooLarge);
-    }
-
-    let total = header_len + body_len;
-
-    if buf.len() < total {
-        return Ok(None);
-    }
-
-    conn.body = if body_len > 0 {
-        Bytes::copy_from_slice(&buf[header_len..total])
-    } else {
-        Bytes::new()
-    };
-
+    conn.reset(raw.method, raw.uri);
+    append_headers(&mut conn.headers, raw.headers)?;
+    conn.body = body;
     conn.remote_addr = Some(peer_addr);
-
-    let keep_alive = match connection_header {
-        Some(v) if v.eq_ignore_ascii_case("close") => false,
-        Some(v) if v.eq_ignore_ascii_case("keep-alive") => true,
-        _ => req.version.unwrap_or(1) >= 1,
-    };
 
     Ok(Some(ParsedIntoResult {
         keep_alive,
