@@ -1,48 +1,27 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::extract::{ConnectInfo, Request, State, WebSocketUpgrade};
-use axum::response::IntoResponse;
-use axum::response::Response;
-use axum::routing;
-use axum::Router;
 use http::StatusCode;
 use rebar_core::process::ExitReason;
 use rebar_core::runtime::Runtime;
 use rebar_core::supervisor::engine::{ChildEntry, SupervisorHandle, start_supervisor};
 use rebar_core::supervisor::spec::{ChildSpec, RestartStrategy, SupervisorSpec};
 
-use mahalo_channel::socket::{ChannelRouter, handle_websocket_with_runtime};
 use mahalo_core::conn::Conn;
 use mahalo_core::plug::Plug;
-use mahalo_pubsub::PubSub;
 use mahalo_router::MahaloRouter;
 
 /// A custom error handler that receives a status code and a Conn, and returns a modified Conn.
 pub type ErrorHandler = Arc<dyn Fn(StatusCode, Conn) -> Conn + Send + Sync>;
 
 /// Default maximum request body size (2 MB).
-const DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
+pub(crate) const DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
-/// Shared state passed to each Axum handler via State extractor.
-#[derive(Clone)]
-struct EndpointState {
-    router: Arc<MahaloRouter>,
-    runtime: Arc<Runtime>,
-    channel_router: Option<Arc<ChannelRouter>>,
-    pubsub: Option<PubSub>,
-    error_handler: Option<ErrorHandler>,
-    after_plugs: Arc<Vec<Box<dyn Plug>>>,
-}
-
-/// Bridges MahaloRouter to an Axum HTTP server with rebar supervision support.
+/// Bridges MahaloRouter to an io_uring HTTP server with rebar supervision support.
 pub struct MahaloEndpoint {
     router: Arc<MahaloRouter>,
     addr: SocketAddr,
     runtime: Arc<Runtime>,
-    channel_router: Option<Arc<ChannelRouter>>,
-    pubsub: Option<PubSub>,
     error_handler: Option<ErrorHandler>,
     after_plugs: Vec<Box<dyn Plug>>,
 }
@@ -53,23 +32,9 @@ impl MahaloEndpoint {
             router: Arc::new(router),
             addr,
             runtime,
-            channel_router: None,
-            pubsub: None,
             error_handler: None,
             after_plugs: Vec::new(),
         }
-    }
-
-    /// Set a ChannelRouter for WebSocket support.
-    pub fn channel_router(mut self, channel_router: ChannelRouter) -> Self {
-        self.channel_router = Some(Arc::new(channel_router));
-        self
-    }
-
-    /// Set a PubSub instance for WebSocket channel broadcasting.
-    pub fn pubsub(mut self, pubsub: PubSub) -> Self {
-        self.pubsub = Some(pubsub);
-        self
     }
 
     /// Set a custom error handler for unmatched routes (404s).
@@ -87,80 +52,44 @@ impl MahaloEndpoint {
         self
     }
 
-    /// Convert into an Axum Router that delegates all requests to MahaloRouter.
-    pub fn into_axum_router(self) -> Router {
-        let has_ws = self.channel_router.is_some() && self.pubsub.is_some();
-
-        let state = EndpointState {
-            router: self.router,
-            runtime: self.runtime,
-            channel_router: self.channel_router,
-            pubsub: self.pubsub,
-            error_handler: self.error_handler,
-            after_plugs: Arc::new(self.after_plugs),
-        };
-
-        let mut router = Router::new();
-
-        // Add WebSocket route if channel_router and pubsub are configured
-        if has_ws {
-            router = router.route("/ws", routing::get(ws_handler));
-        }
-
-        router.fallback(fallback_handler).with_state(state)
-    }
-
-    /// Start the HTTP server, blocking until shutdown.
+    /// Start the HTTP server using io_uring, blocking until shutdown.
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let addr = self.addr;
-        let axum_router = self.into_axum_router();
-        let listener = tokio::net::TcpListener::bind(addr).await?;
         tracing::info!("Mahalo endpoint listening on {}", addr);
-        axum::serve(
-            listener,
-            axum_router.into_make_service_with_connect_info::<SocketAddr>(),
+        crate::worker::start_uring_server(
+            addr,
+            self.router,
+            self.error_handler,
+            Arc::new(self.after_plugs),
+            self.runtime,
+            DEFAULT_BODY_LIMIT,
         )
-        .await?;
-        Ok(())
     }
 
     /// Create a rebar ChildEntry for supervision.
     pub fn child_entry(self) -> ChildEntry {
         let spec = ChildSpec::new("mahalo_endpoint");
         let addr = self.addr;
-        let has_ws = self.channel_router.is_some() && self.pubsub.is_some();
-        let state = EndpointState {
-            router: self.router,
-            runtime: self.runtime,
-            channel_router: self.channel_router,
-            pubsub: self.pubsub,
-            error_handler: self.error_handler,
-            after_plugs: Arc::new(self.after_plugs),
-        };
+        let router = self.router;
+        let runtime = self.runtime;
+        let error_handler = self.error_handler;
+        let after_plugs = Arc::new(self.after_plugs);
 
         ChildEntry::new(spec, move || {
-            let state = state.clone();
+            let router = Arc::clone(&router);
+            let runtime = Arc::clone(&runtime);
+            let error_handler = error_handler.clone();
+            let after_plugs = Arc::clone(&after_plugs);
             async move {
-                let mut axum_router = Router::new();
-                if has_ws {
-                    axum_router = axum_router.route("/ws", routing::get(ws_handler));
-                }
-                let axum_router = axum_router
-                    .fallback(fallback_handler)
-                    .with_state(state);
-                let listener = match tokio::net::TcpListener::bind(addr).await {
-                    Ok(l) => l,
-                    Err(e) => {
-                        return ExitReason::Abnormal(format!("endpoint error: {}", e));
-                    }
-                };
                 tracing::info!("Mahalo endpoint listening on {}", addr);
-                match axum::serve(
-                    listener,
-                    axum_router.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .await
-                {
+                match crate::worker::start_uring_server(
+                    addr,
+                    router,
+                    error_handler,
+                    after_plugs,
+                    runtime,
+                    DEFAULT_BODY_LIMIT,
+                ) {
                     Ok(()) => ExitReason::Normal,
                     Err(e) => ExitReason::Abnormal(format!("endpoint error: {}", e)),
                 }
@@ -168,105 +97,13 @@ impl MahaloEndpoint {
         })
     }
 
-    /// Start the endpoint as a supervised process tree with PubSub and HTTP server.
+    /// Start the endpoint as a supervised process tree.
     pub async fn start_supervised(self) -> SupervisorHandle {
         let runtime = Arc::clone(&self.runtime);
         let spec = SupervisorSpec::new(RestartStrategy::OneForOne);
-
-        let mut children = Vec::new();
-
-        // Add PubSub child if configured
-        if let Some(ref pubsub) = self.pubsub {
-            children.push(PubSub::child_entry(Arc::new(pubsub.clone())));
-        }
-
-        // Add HTTP server child
-        children.push(self.child_entry());
-
+        let children = vec![self.child_entry()];
         start_supervisor(runtime, spec, children).await
     }
-}
-
-/// Axum handler for WebSocket upgrades, delegating to the channel system.
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<EndpointState>,
-) -> impl IntoResponse {
-    let channel_router = state.channel_router.expect("ws route requires channel_router");
-    let pubsub = state.pubsub.expect("ws route requires pubsub");
-    let runtime = state.runtime;
-    ws.on_upgrade(move |socket| {
-        handle_websocket_with_runtime(socket, channel_router, pubsub, runtime)
-    })
-}
-
-/// Axum fallback handler that routes all requests through MahaloRouter.
-async fn fallback_handler(
-    State(state): State<EndpointState>,
-    connect_info: ConnectInfo<SocketAddr>,
-    request: Request,
-) -> impl IntoResponse {
-    let conn = request_to_conn(request, Some(connect_info.0), &state.runtime).await;
-
-    let conn = match state.router.resolve(&conn.method.clone(), conn.uri.path()) {
-        Some(resolved) => resolved.execute(conn).await,
-        None => {
-            if let Some(ref handler) = state.error_handler {
-                let mut conn = conn.put_status(StatusCode::NOT_FOUND);
-                conn = handler(StatusCode::NOT_FOUND, conn);
-                conn
-            } else {
-                return Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Body::from("Not Found"))
-                    .unwrap();
-            }
-        }
-    };
-
-    // Run after-plugs sequentially
-    let mut conn = conn;
-    for plug in state.after_plugs.iter() {
-        if conn.halted {
-            break;
-        }
-        conn = plug.call(conn).await;
-    }
-
-    conn_to_response(conn)
-}
-
-/// Convert an Axum Request into a Mahalo Conn.
-async fn request_to_conn(
-    request: Request,
-    remote_addr: Option<SocketAddr>,
-    runtime: &Arc<Runtime>,
-) -> Conn {
-    let method = request.method().clone();
-    let uri = request.uri().clone();
-    let headers = request.headers().clone();
-
-    let body_bytes = axum::body::to_bytes(request.into_body(), DEFAULT_BODY_LIMIT)
-        .await
-        .unwrap_or_default();
-
-    let mut conn = Conn::new(method, uri).with_runtime(Arc::clone(runtime));
-    conn.headers = headers;
-    conn.remote_addr = remote_addr;
-    conn.body = body_bytes;
-    conn.parse_query_params();
-    conn
-}
-
-/// Convert a Mahalo Conn into an Axum Response.
-fn conn_to_response(conn: Conn) -> Response {
-    let mut builder = Response::builder().status(conn.status);
-
-    if let Some(headers) = builder.headers_mut() {
-        headers.extend(conn.resp_headers);
-    }
-
-    builder.body(Body::from(conn.resp_body)).unwrap()
 }
 
 /// Returns an error handler that produces JSON responses like `{"error":"Not Found","status":404}`.
@@ -294,51 +131,6 @@ mod tests {
     use bytes::Bytes;
     use http::Method;
 
-    #[tokio::test]
-    async fn request_to_conn_conversion() {
-        let runtime = Arc::new(Runtime::new(1));
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri("/api/rooms?page=2")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"test"}"#))
-            .unwrap();
-
-        let conn = request_to_conn(request, None, &runtime).await;
-
-        assert_eq!(conn.method, Method::POST);
-        assert_eq!(conn.uri.path(), "/api/rooms");
-        assert_eq!(
-            conn.headers.get("content-type").unwrap(),
-            "application/json"
-        );
-        assert_eq!(conn.body, Bytes::from(r#"{"name":"test"}"#));
-        assert_eq!(conn.query_params.get("page").unwrap(), "2");
-        assert!(conn.runtime.is_some());
-    }
-
-    #[test]
-    fn conn_to_response_conversion() {
-        let conn = Conn::new(Method::GET, http::Uri::from_static("/"))
-            .put_status(StatusCode::CREATED)
-            .put_resp_header("x-custom", "value")
-            .put_resp_body("hello");
-
-        let response = conn_to_response(conn);
-
-        assert_eq!(response.status(), StatusCode::CREATED);
-        assert_eq!(response.headers().get("x-custom").unwrap(), "value");
-    }
-
-    #[test]
-    fn into_axum_router_creates_router() {
-        let runtime = Arc::new(Runtime::new(1));
-        let router = MahaloRouter::new();
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let endpoint = MahaloEndpoint::new(router, addr, runtime);
-        let _axum_router = endpoint.into_axum_router();
-    }
-
     #[test]
     fn child_entry_creates_entry() {
         let runtime = Arc::new(Runtime::new(1));
@@ -349,65 +141,49 @@ mod tests {
         assert_eq!(entry.spec.id, "mahalo_endpoint");
     }
 
-    #[tokio::test]
-    async fn builder_sets_channel_router_and_pubsub() {
-        let runtime = Arc::new(Runtime::new(1));
-        let router = MahaloRouter::new();
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let pubsub = PubSub::start();
-
-        let endpoint = MahaloEndpoint::new(router, addr, runtime)
-            .channel_router(ChannelRouter::new())
-            .pubsub(pubsub.clone());
-
-        assert!(endpoint.channel_router.is_some());
-        assert!(endpoint.pubsub.is_some());
-        pubsub.shutdown();
-    }
-
     #[test]
-    fn into_axum_router_without_ws_has_no_ws_route() {
+    fn default_404_preserved_without_error_handler() {
         let runtime = Arc::new(Runtime::new(1));
         let router = MahaloRouter::new();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let endpoint = MahaloEndpoint::new(router, addr, runtime);
-
-        // Without channel_router/pubsub, the endpoint should not panic
-        // and should produce a valid router (no /ws route)
-        assert!(endpoint.channel_router.is_none());
-        assert!(endpoint.pubsub.is_none());
-        let _axum_router = endpoint.into_axum_router();
+        assert!(endpoint.error_handler.is_none());
     }
 
-    #[tokio::test]
-    async fn into_axum_router_with_ws_creates_router() {
-        let runtime = Arc::new(Runtime::new(1));
-        let router = MahaloRouter::new();
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let pubsub = PubSub::start();
-
-        let endpoint = MahaloEndpoint::new(router, addr, runtime)
-            .channel_router(ChannelRouter::new())
-            .pubsub(pubsub.clone());
-
-        // Should not panic — /ws route is added
-        let _axum_router = endpoint.into_axum_router();
-        pubsub.shutdown();
+    #[test]
+    fn custom_error_handler_called_for_404() {
+        let handler = |status: StatusCode, conn: Conn| -> Conn {
+            conn.put_resp_body(format!("Custom: {}", status.as_u16()))
+        };
+        let conn = Conn::new(Method::GET, http::Uri::from_static("/missing"))
+            .put_status(StatusCode::NOT_FOUND);
+        let conn = handler(StatusCode::NOT_FOUND, conn);
+        assert_eq!(conn.resp_body, Bytes::from("Custom: 404"));
     }
 
-    #[tokio::test]
-    async fn request_to_conn_with_remote_addr() {
-        let runtime = Arc::new(Runtime::new(1));
-        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
+    #[test]
+    fn json_error_handler_produces_correct_json() {
+        let handler = json_error_handler();
+        let conn = Conn::new(Method::GET, http::Uri::from_static("/"))
+            .put_status(StatusCode::NOT_FOUND);
+        let conn = handler(StatusCode::NOT_FOUND, conn);
+        assert_eq!(
+            conn.resp_body,
+            Bytes::from(r#"{"error":"Not Found","status":404}"#)
+        );
+        assert_eq!(
+            conn.resp_headers.get("content-type").unwrap(),
+            "application/json"
+        );
+    }
 
-        let conn = request_to_conn(request, Some(addr), &runtime).await;
-
-        assert_eq!(conn.remote_addr, Some(addr));
+    #[test]
+    fn text_error_handler_produces_correct_text() {
+        let handler = text_error_handler();
+        let conn = Conn::new(Method::GET, http::Uri::from_static("/"))
+            .put_status(StatusCode::NOT_FOUND);
+        let conn = handler(StatusCode::NOT_FOUND, conn);
+        assert_eq!(conn.resp_body, Bytes::from("404 Not Found"));
     }
 
     #[tokio::test]
@@ -431,24 +207,27 @@ mod tests {
                 }),
             );
 
-        // Bind to port 0 to get a random available port
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        // For integration tests, we need to find a free port and start the server
+        let listener = std::net::TcpListener::bind(addr).unwrap();
+        let bound_addr = listener.local_addr().unwrap();
+        drop(listener);
 
-        let endpoint = MahaloEndpoint::new(router, addr, runtime);
-        let axum_router = endpoint.into_axum_router();
+        let endpoint = MahaloEndpoint::new(router, bound_addr, runtime);
 
-        // Spawn server in background
-        let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                axum_router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
+        // Spawn server in background thread (io_uring blocks)
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(endpoint.start()).unwrap();
         });
 
-        let base = format!("http://{addr}");
+        // Give the server a moment to bind
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let base = format!("http://{bound_addr}");
 
         // Test GET /health
         let resp = reqwest::get(format!("{base}/health")).await.unwrap();
@@ -470,59 +249,7 @@ mod tests {
         let resp = reqwest::get(format!("{base}/nonexistent")).await.unwrap();
         assert_eq!(resp.status(), 404);
 
-        server.abort();
-    }
-
-    #[test]
-    fn default_404_preserved_without_error_handler() {
-        // Without error handler, the endpoint has None
-        let runtime = Arc::new(Runtime::new(1));
-        let router = MahaloRouter::new();
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let endpoint = MahaloEndpoint::new(router, addr, runtime);
-        assert!(endpoint.error_handler.is_none());
-        // The fallback returns a hardcoded "Not Found" response when no handler is set
-        let response = Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::from("Not Found"))
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn custom_error_handler_called_for_404() {
-        let handler = |status: StatusCode, conn: Conn| -> Conn {
-            conn.put_resp_body(format!("Custom: {}", status.as_u16()))
-        };
-        let conn = Conn::new(Method::GET, http::Uri::from_static("/missing"))
-            .put_status(StatusCode::NOT_FOUND);
-        let conn = handler(StatusCode::NOT_FOUND, conn);
-        assert_eq!(conn.resp_body, bytes::Bytes::from("Custom: 404"));
-    }
-
-    #[test]
-    fn json_error_handler_produces_correct_json() {
-        let handler = json_error_handler();
-        let conn = Conn::new(Method::GET, http::Uri::from_static("/"))
-            .put_status(StatusCode::NOT_FOUND);
-        let conn = handler(StatusCode::NOT_FOUND, conn);
-        assert_eq!(
-            conn.resp_body,
-            bytes::Bytes::from(r#"{"error":"Not Found","status":404}"#)
-        );
-        assert_eq!(
-            conn.resp_headers.get("content-type").unwrap(),
-            "application/json"
-        );
-    }
-
-    #[test]
-    fn text_error_handler_produces_correct_text() {
-        let handler = text_error_handler();
-        let conn = Conn::new(Method::GET, http::Uri::from_static("/"))
-            .put_status(StatusCode::NOT_FOUND);
-        let conn = handler(StatusCode::NOT_FOUND, conn);
-        assert_eq!(conn.resp_body, bytes::Bytes::from("404 Not Found"));
+        drop(server);
     }
 
     #[tokio::test]
@@ -537,23 +264,24 @@ mod tests {
             }),
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        drop(listener);
 
         let endpoint = MahaloEndpoint::new(router, addr, runtime)
             .after(plug_fn(|conn: Conn| async {
                 conn.put_resp_header("x-after", "applied")
             }));
-        let axum_router = endpoint.into_axum_router();
 
-        let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                axum_router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(endpoint.start()).unwrap();
         });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         let base = format!("http://{addr}");
         let resp = reqwest::get(format!("{base}/test")).await.unwrap();
@@ -561,7 +289,7 @@ mod tests {
         assert_eq!(resp.headers().get("x-after").unwrap(), "applied");
         assert_eq!(resp.text().await.unwrap(), "ok");
 
-        server.abort();
+        drop(server);
     }
 
     #[tokio::test]
@@ -578,23 +306,24 @@ mod tests {
             }),
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        drop(listener);
 
         let endpoint = MahaloEndpoint::new(router, addr, runtime)
             .after(plug_fn(|conn: Conn| async {
                 conn.put_resp_header("x-should-not-run", "true")
             }));
-        let axum_router = endpoint.into_axum_router();
 
-        let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                axum_router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(endpoint.start()).unwrap();
         });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         let base = format!("http://{addr}");
         let resp = reqwest::get(format!("{base}/halted")).await.unwrap();
@@ -602,6 +331,6 @@ mod tests {
         assert!(resp.headers().get("x-should-not-run").is_none());
         assert_eq!(resp.text().await.unwrap(), "halted");
 
-        server.abort();
+        drop(server);
     }
 }
