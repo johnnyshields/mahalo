@@ -1,3 +1,4 @@
+pub mod date;
 pub mod endpoint;
 pub mod http_parse;
 #[cfg(target_os = "linux")]

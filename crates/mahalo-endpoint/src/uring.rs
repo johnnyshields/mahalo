@@ -13,6 +13,11 @@ use rebar_core::runtime::Runtime;
 use crate::endpoint::ErrorHandler;
 use crate::http_parse::{self, ParseError};
 
+/// Max number of recycled Conn objects per event loop thread.
+const CONN_POOL_CAP: usize = 128;
+/// Max number of recycled write buffers per event loop thread.
+const WRITE_BUF_POOL_CAP: usize = 128;
+
 /// Default peer address used when the actual peer address isn't captured.
 fn default_peer_addr() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], 0))
@@ -367,6 +372,12 @@ pub(crate) fn run_event_loop(
     let mut results: Vec<Conn> = Vec::with_capacity(64);
     let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::with_capacity(256);
 
+    // Conn object pool — recycle Conn structs to reuse HeaderMap/HashMap capacity.
+    let mut conn_recycle: Vec<Conn> = Vec::with_capacity(CONN_POOL_CAP);
+
+    // Write buffer pool — recycle Vec<u8> for ConnSlot write buffers.
+    let mut write_buf_pool: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BUF_POOL_CAP);
+
     loop {
         if let Err(e) = ring.submit_and_wait(1) {
             tracing::error!("io_uring submit_and_wait error: {}", e);
@@ -415,6 +426,14 @@ pub(crate) fn run_event_loop(
 
                     let generation = conn_pool.next_generation();
 
+                    // Reuse a write buffer from the pool, or allocate a new one.
+                    let write_buf = if let Some(mut wb) = write_buf_pool.pop() {
+                        wb.clear();
+                        wb
+                    } else {
+                        Vec::with_capacity(256)
+                    };
+
                     conn_pool.insert(
                         slot_idx,
                         ConnSlot {
@@ -422,7 +441,7 @@ pub(crate) fn run_event_loop(
                             generation,
                             read_buf_idx: buf_idx,
                             read_len: 0,
-                            write_buf: Vec::with_capacity(256),
+                            write_buf,
                             write_offset: 0,
                             keep_alive: true,
                         },
@@ -462,19 +481,52 @@ pub(crate) fn run_event_loop(
 
                     let buf = &buf_pool.slice(buf_idx)[..read_len];
 
-                    match http_parse::try_parse_request(buf, body_limit, peer_addr) {
-                        Ok(Some(parsed)) => {
-                            // Defer execution — collect for batched block_on.
-                            let conn = parsed.conn.with_runtime(Arc::clone(runtime));
-                            pending_meta.push(PendingRequest {
-                                slot_idx,
-                                generation,
-                                fd,
-                                keep_alive: parsed.keep_alive,
-                            });
-                            pending_conns.push(conn);
+                    // Try to reuse a recycled Conn, or parse into a new one.
+                    let parse_result = if let Some(mut recycled) = conn_recycle.pop() {
+                        match http_parse::try_parse_into_conn(&mut recycled, buf, body_limit, peer_addr) {
+                            Ok(Some(parsed)) => {
+                                let conn = recycled.with_runtime(Arc::clone(runtime));
+                                pending_meta.push(PendingRequest {
+                                    slot_idx,
+                                    generation,
+                                    fd,
+                                    keep_alive: parsed.keep_alive,
+                                });
+                                pending_conns.push(conn);
+                                None // consumed successfully
+                            }
+                            Ok(None) => {
+                                // Put it back — incomplete request.
+                                conn_recycle.push(recycled);
+                                Some(Ok(None))
+                            }
+                            Err(e) => {
+                                conn_recycle.push(recycled);
+                                Some(Err(e))
+                            }
                         }
-                        Ok(None) => {
+                    } else {
+                        match http_parse::try_parse_request(buf, body_limit, peer_addr) {
+                            Ok(Some(parsed)) => {
+                                let conn = parsed.conn.with_runtime(Arc::clone(runtime));
+                                pending_meta.push(PendingRequest {
+                                    slot_idx,
+                                    generation,
+                                    fd,
+                                    keep_alive: parsed.keep_alive,
+                                });
+                                pending_conns.push(conn);
+                                None
+                            }
+                            other => Some(other),
+                        }
+                    };
+
+                    match parse_result {
+                        None => {
+                            // Successfully parsed — already pushed to pending.
+                        }
+                        Some(Ok(None)) => {
                             if read_len >= chunk_size {
                                 write_static_error_and_close(
                                     ring, fd, http_parse::RESPONSE_413,
@@ -488,13 +540,14 @@ pub(crate) fn run_event_loop(
                                 );
                             }
                         }
-                        Err(ParseError::BodyTooLarge) => {
+                        Some(Ok(Some(_))) => unreachable!(),
+                        Some(Err(ParseError::BodyTooLarge)) => {
                             write_static_error_and_close(
                                 ring, fd, http_parse::RESPONSE_413,
                                 slot_idx, generation, conn_pool, buf_pool,
                             );
                         }
-                        Err(ParseError::InvalidRequest) => {
+                        Some(Err(ParseError::InvalidRequest)) => {
                             write_static_error_and_close(
                                 ring, fd, http_parse::RESPONSE_400,
                                 slot_idx, generation, conn_pool, buf_pool,
@@ -545,6 +598,14 @@ pub(crate) fn run_event_loop(
                 }
 
                 STATE_CLOSING => {
+                    // Recycle the write buffer before freeing the slot.
+                    if let Some(slot) = conn_pool.get_mut(slot_idx) {
+                        if write_buf_pool.len() < WRITE_BUF_POOL_CAP {
+                            let mut wb = std::mem::take(&mut slot.write_buf);
+                            wb.clear();
+                            write_buf_pool.push(wb);
+                        }
+                    }
                     conn_pool.free(slot_idx);
                 }
 
@@ -567,12 +628,23 @@ pub(crate) fn run_event_loop(
             for (meta, conn) in pending_meta.drain(..).zip(results.drain(..)) {
                 let slot = match conn_pool.get_mut(meta.slot_idx) {
                     Some(s) => s,
-                    None => continue,
+                    None => {
+                        // Recycle the Conn even if slot is gone.
+                        if conn_recycle.len() < CONN_POOL_CAP {
+                            conn_recycle.push(conn);
+                        }
+                        continue;
+                    }
                 };
                 // Serialize directly into the slot's existing write_buf (reuses capacity).
                 http_parse::serialize_response_into(&conn, meta.keep_alive, &mut slot.write_buf);
                 slot.write_offset = 0;
                 slot.keep_alive = meta.keep_alive;
+
+                // Recycle the Conn for future requests.
+                if conn_recycle.len() < CONN_POOL_CAP {
+                    conn_recycle.push(conn);
+                }
 
                 let ptr = slot.write_buf.as_ptr();
                 let len = slot.write_buf.len() as u32;

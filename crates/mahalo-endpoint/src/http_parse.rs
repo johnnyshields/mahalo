@@ -5,6 +5,11 @@ use bytes::Bytes;
 use http::{HeaderMap, Method, Uri};
 use mahalo_core::conn::Conn;
 
+use crate::date::write_date_header;
+
+/// Static server identification header.
+const SERVER_HEADER: &[u8] = b"server: mahalo\r\n";
+
 /// Result of successfully parsing a complete HTTP/1.1 request.
 pub struct ParsedRequest {
     pub conn: Conn,
@@ -41,7 +46,7 @@ pub fn try_parse_request(
     body_limit: usize,
     peer_addr: SocketAddr,
 ) -> Result<Option<ParsedRequest>, ParseError> {
-    let mut headers_buf = [httparse::EMPTY_HEADER; 64];
+    let mut headers_buf = [httparse::EMPTY_HEADER; 96];
     let mut req = httparse::Request::new(&mut headers_buf);
 
     let header_len = match req.parse(buf) {
@@ -62,8 +67,14 @@ pub fn try_parse_request(
     for h in req.headers.iter() {
         let name = http::header::HeaderName::from_bytes(h.name.as_bytes())
             .map_err(|_| ParseError::InvalidRequest)?;
-        let value = http::header::HeaderValue::from_bytes(h.value)
-            .map_err(|_| ParseError::InvalidRequest)?;
+        // SAFETY: httparse already validated that header values contain only
+        // visible ASCII characters and spaces/tabs (RFC 7230 field-value).
+        // Skipping re-validation avoids redundant work on the hot path.
+        let value = unsafe {
+            http::header::HeaderValue::from_maybe_shared_unchecked(
+                Bytes::copy_from_slice(h.value),
+            )
+        };
 
         if h.name.eq_ignore_ascii_case("content-length") {
             if let Ok(s) = std::str::from_utf8(h.value) {
@@ -122,6 +133,97 @@ pub fn try_parse_request(
     }))
 }
 
+/// Result of parsing into an existing Conn (avoids allocation).
+pub struct ParsedIntoResult {
+    pub keep_alive: bool,
+    pub bytes_consumed: usize,
+}
+
+/// Parse an HTTP request into an existing Conn, reusing its backing allocations.
+/// The Conn is `reset()` before populating.
+pub fn try_parse_into_conn(
+    conn: &mut Conn,
+    buf: &[u8],
+    body_limit: usize,
+    peer_addr: SocketAddr,
+) -> Result<Option<ParsedIntoResult>, ParseError> {
+    let mut headers_buf = [httparse::EMPTY_HEADER; 96];
+    let mut req = httparse::Request::new(&mut headers_buf);
+
+    let header_len = match req.parse(buf) {
+        Ok(httparse::Status::Partial) => return Ok(None),
+        Ok(httparse::Status::Complete(len)) => len,
+        Err(_) => return Err(ParseError::InvalidRequest),
+    };
+
+    let method = Method::from_bytes(req.method.ok_or(ParseError::InvalidRequest)?.as_bytes())
+        .map_err(|_| ParseError::InvalidRequest)?;
+    let uri = Uri::from_str(req.path.ok_or(ParseError::InvalidRequest)?)
+        .map_err(|_| ParseError::InvalidRequest)?;
+
+    // Reset and populate the existing Conn.
+    conn.reset(method, uri);
+
+    let mut content_length: Option<usize> = None;
+    let mut connection_header: Option<&str> = None;
+
+    for h in req.headers.iter() {
+        let name = http::header::HeaderName::from_bytes(h.name.as_bytes())
+            .map_err(|_| ParseError::InvalidRequest)?;
+        // SAFETY: httparse already validated header values.
+        let value = unsafe {
+            http::header::HeaderValue::from_maybe_shared_unchecked(
+                Bytes::copy_from_slice(h.value),
+            )
+        };
+
+        if h.name.eq_ignore_ascii_case("content-length") {
+            if let Ok(s) = std::str::from_utf8(h.value) {
+                content_length = s.trim().parse().ok();
+            }
+        }
+        if h.name.eq_ignore_ascii_case("connection") {
+            connection_header = std::str::from_utf8(h.value).ok();
+        }
+
+        conn.headers.append(name, value);
+    }
+
+    let body_len = match conn.method {
+        Method::GET | Method::HEAD | Method::DELETE => 0,
+        _ => content_length.unwrap_or(0),
+    };
+
+    if body_len > body_limit {
+        return Err(ParseError::BodyTooLarge);
+    }
+
+    let total = header_len + body_len;
+
+    if buf.len() < total {
+        return Ok(None);
+    }
+
+    conn.body = if body_len > 0 {
+        Bytes::copy_from_slice(&buf[header_len..total])
+    } else {
+        Bytes::new()
+    };
+
+    conn.remote_addr = Some(peer_addr);
+
+    let keep_alive = match connection_header {
+        Some(v) if v.eq_ignore_ascii_case("close") => false,
+        Some(v) if v.eq_ignore_ascii_case("keep-alive") => true,
+        _ => req.version.unwrap_or(1) >= 1,
+    };
+
+    Ok(Some(ParsedIntoResult {
+        keep_alive,
+        bytes_consumed: total,
+    }))
+}
+
 /// Fast status line lookup for common HTTP status codes (avoids allocation).
 #[inline]
 fn status_line(code: u16) -> &'static [u8] {
@@ -142,22 +244,6 @@ fn status_line(code: u16) -> &'static [u8] {
         503 => b"HTTP/1.1 503 Service Unavailable\r\n",
         _ => b"",
     }
-}
-
-/// Write a usize as decimal digits directly into buf (no String allocation).
-#[inline]
-fn write_usize(buf: &mut Vec<u8>, mut n: usize) {
-    if n == 0 {
-        buf.push(b'0');
-        return;
-    }
-    // Max 20 digits for u64.
-    let start = buf.len();
-    while n > 0 {
-        buf.push(b'0' + (n % 10) as u8);
-        n /= 10;
-    }
-    buf[start..].reverse();
 }
 
 /// Write a u16 as 3-digit decimal directly into buf (for HTTP status codes).
@@ -224,15 +310,22 @@ pub fn serialize_response_into(conn: &Conn, keep_alive: bool, buf: &mut Vec<u8>)
         buf.extend_from_slice(b"\r\n");
     }
 
-    // Content-length (manual integer formatting, no String alloc).
+    // Content-length (itoa: 2-digit lookup tables, no reverse step).
     if !has_content_length {
         buf.extend_from_slice(b"content-length: ");
-        write_usize(buf, body_len);
+        let mut itoa_buf = itoa::Buffer::new();
+        buf.extend_from_slice(itoa_buf.format(body_len).as_bytes());
         buf.extend_from_slice(b"\r\n");
     }
 
     // Connection header.
     buf.extend_from_slice(connection_hdr);
+
+    // Date header (thread-local cache, refreshed every 500ms).
+    write_date_header(buf);
+
+    // Server header (static bytes, zero cost).
+    buf.extend_from_slice(SERVER_HEADER);
 
     // Separator + body.
     buf.extend_from_slice(b"\r\n");
@@ -406,6 +499,54 @@ mod tests {
         serialize_response_into(&conn, true, &mut buf);
         assert_eq!(buf.len(), first_len);
         assert_eq!(buf.capacity(), cap_after_first);
+    }
+
+    #[test]
+    fn serialize_response_includes_date_and_server() {
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .put_status(StatusCode::OK)
+            .put_resp_body("ok");
+
+        let buf = serialize_response(&conn, true);
+        let response = String::from_utf8(buf).unwrap();
+
+        assert!(response.contains("date: "), "missing date header");
+        assert!(response.contains("server: mahalo\r\n"), "missing server header");
+    }
+
+    #[test]
+    fn try_parse_into_conn_basic() {
+        let raw = b"GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut conn = Conn::new(Method::POST, Uri::from_static("/old"));
+        conn.resp_headers.insert("x-old", "val".parse().unwrap());
+
+        let result = try_parse_into_conn(&mut conn, raw, 1024, addr())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(conn.method, Method::GET);
+        assert_eq!(conn.uri, "/hello");
+        assert!(conn.body.is_empty());
+        assert!(result.keep_alive);
+        assert_eq!(result.bytes_consumed, raw.len());
+        // Old response headers should be cleared.
+        assert!(conn.resp_headers.is_empty());
+    }
+
+    #[test]
+    fn try_parse_into_conn_partial_returns_none() {
+        let raw = b"GET /hello HT";
+        let mut conn = Conn::new(Method::GET, Uri::from_static("/"));
+        let result = try_parse_into_conn(&mut conn, raw, 1024, addr()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_parse_into_conn_body_too_large() {
+        let raw = b"POST /api HTTP/1.1\r\nContent-Length: 2000\r\n\r\n";
+        let mut conn = Conn::new(Method::GET, Uri::from_static("/"));
+        let result = try_parse_into_conn(&mut conn, raw, 1024, addr());
+        assert!(matches!(result, Err(ParseError::BodyTooLarge)));
     }
 
     #[test]

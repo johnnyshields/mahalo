@@ -45,6 +45,8 @@ httparse = "1"
 socket2 = { version = "0.5", features = ["all"] }
 nix = { version = "0.29", features = ["sched", "net"] }
 libc = "0.2"
+itoa = "1"
+httpdate = "1"
 
 [profile.release]
 opt-level = 3
