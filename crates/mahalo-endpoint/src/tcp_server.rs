@@ -177,7 +177,11 @@ async fn handle_connection(
                     let keep_alive = parsed.keep_alive;
                     let bytes_consumed = parsed.bytes_consumed;
 
-                    let conn = parsed.conn.with_runtime(Arc::clone(runtime));
+                    let conn = if ws_config.is_some() {
+                        parsed.conn.with_runtime(Arc::clone(runtime))
+                    } else {
+                        parsed.conn
+                    };
                     let conn = crate::handler::execute_request(
                         conn,
                         router,

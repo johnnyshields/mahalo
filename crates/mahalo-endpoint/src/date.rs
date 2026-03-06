@@ -4,35 +4,6 @@ use std::time::{Duration, Instant, SystemTime};
 const DATE_HEADER_LEN: usize = 29;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
-struct CachedDate {
-    bytes: [u8; DATE_HEADER_LEN],
-    last_updated: Instant,
-}
-
-impl CachedDate {
-    fn new() -> Self {
-        let mut cd = CachedDate {
-            bytes: [0u8; DATE_HEADER_LEN],
-            last_updated: Instant::now(),
-        };
-        cd.refresh();
-        cd
-    }
-
-    fn refresh(&mut self) {
-        let now = SystemTime::now();
-        let formatted = httpdate::HttpDate::from(now).to_string();
-        let bytes = formatted.as_bytes();
-        // httpdate always produces exactly 29 bytes (RFC 7231 IMF-fixdate).
-        self.bytes[..DATE_HEADER_LEN].copy_from_slice(&bytes[..DATE_HEADER_LEN]);
-        self.last_updated = Instant::now();
-    }
-}
-
-thread_local! {
-    static CACHED: RefCell<CachedDate> = RefCell::new(CachedDate::new());
-}
-
 /// Total bytes written by write_date_header: "date: " (6) + 29 + "\r\n" (2) = 37.
 pub const DATE_HEADER_WIRE_LEN: usize = 6 + DATE_HEADER_LEN + 2;
 

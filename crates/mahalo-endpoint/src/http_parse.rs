@@ -309,14 +309,6 @@ fn status_line(code: u16) -> &'static [u8] {
     }
 }
 
-/// Write a u16 as 3-digit decimal directly into buf (for HTTP status codes).
-#[inline]
-fn write_status_code(buf: &mut Vec<u8>, code: u16) {
-    buf.push(b'0' + (code / 100) as u8);
-    buf.push(b'0' + ((code / 10) % 10) as u8);
-    buf.push(b'0' + (code % 10) as u8);
-}
-
 /// Serialize a Conn's response into a raw HTTP/1.1 response buffer.
 ///
 /// Zero-allocation for common status codes (200, 404, etc.) — uses

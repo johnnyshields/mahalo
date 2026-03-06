@@ -417,6 +417,12 @@ pub(crate) fn run_event_loop(
 ) {
     let peer_addr = default_peer_addr();
     let mut accept_backoff_ms: u64 = 100;
+    // Pre-clone runtime once if WS is enabled; avoid per-request Arc::clone otherwise.
+    let runtime_for_conn: Option<Arc<Runtime>> = if ws_config.is_some() {
+        Some(Arc::clone(runtime))
+    } else {
+        None
+    };
     submit_accept(ring, listen_fd);
 
     // Reusable vectors to avoid per-iteration allocation.
@@ -591,7 +597,8 @@ pub(crate) fn run_event_loop(
                                     }
                                     None
                                 } else {
-                                    let conn = recycled.with_runtime(Arc::clone(runtime));
+                                    // Runtime is preserved across reset() — no Arc::clone needed.
+                                    let conn = recycled;
                                     pending_meta.push(PendingRequest {
                                         slot_idx,
                                         generation,
@@ -635,7 +642,11 @@ pub(crate) fn run_event_loop(
                                     }
                                     None
                                 } else {
-                                    let conn = parsed.conn.with_runtime(Arc::clone(runtime));
+                                    let conn = if let Some(ref rt) = runtime_for_conn {
+                                        parsed.conn.with_runtime(Arc::clone(rt))
+                                    } else {
+                                        parsed.conn
+                                    };
                                     pending_meta.push(PendingRequest {
                                         slot_idx,
                                         generation,

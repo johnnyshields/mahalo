@@ -61,6 +61,8 @@ impl Conn {
 
     /// Reset this Conn for reuse, preserving backing allocations.
     /// Clears all fields but keeps HashMap/HeaderMap capacity.
+    /// The runtime Arc is preserved (not dropped/re-cloned) since it
+    /// typically stays the same across keep-alive requests.
     pub fn reset(&mut self, method: Method, uri: Uri) {
         self.method = method;
         self.uri = uri;
@@ -76,7 +78,8 @@ impl Conn {
         if let Some(ref mut assigns) = self.assigns {
             assigns.clear();
         }
-        self.runtime = None;
+        // Intentionally preserve self.runtime — it's the same across keep-alive
+        // requests on the same worker thread, avoiding an Arc drop + clone cycle.
     }
 
     /// Get a path parameter by name. O(n) scan over the SmallVec, but
