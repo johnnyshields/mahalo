@@ -3,7 +3,7 @@ name = "mahalo-endpoint"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "io_uring HTTP server and supervised lifecycle for Mahalo"
+description = "HTTP server and supervised lifecycle for Mahalo"
 
 [dependencies]
 mahalo-core = { path = "../mahalo-core" }
@@ -13,12 +13,14 @@ tokio = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
-io-uring = { workspace = true }
 httparse = { workspace = true }
 socket2 = { workspace = true }
+futures = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
-futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -1,0 +1,6 @@
+[alias]
+build-linux-gnu = "build --target x86_64-unknown-linux-gnu"
+build-linux-musl = "build --target x86_64-unknown-linux-musl"
+build-macos-arm = "build --target aarch64-apple-darwin"
+build-windows-x64 = "build --target x86_64-pc-windows-msvc"
+build-windows-arm = "build --target aarch64-pc-windows-msvc"
