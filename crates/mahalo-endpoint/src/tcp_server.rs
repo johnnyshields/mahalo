@@ -1,9 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use mahalo_channel::socket::ChannelRouter;
 use mahalo_core::plug::Plug;
-use mahalo_pubsub::PubSub;
 use mahalo_router::MahaloRouter;
 use rebar_core::runtime::Runtime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -132,6 +130,7 @@ pub fn start_tcp_server(
 }
 
 /// Handle a single TCP connection, supporting keep-alive and WebSocket upgrade.
+#[allow(unused_variables)] // ws_config unused on Linux (WS handled by uring)
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,
@@ -158,7 +157,8 @@ async fn handle_connection(
         loop {
             match http_parse::try_parse_request(&buf[..filled], body_limit, peer_addr) {
                 Ok(Some(parsed)) => {
-                    // Check for WebSocket upgrade.
+                    // Check for WebSocket upgrade (tokio-tungstenite not available on Linux).
+                    #[cfg(not(target_os = "linux"))]
                     if let (Some(ws_key), Some(wsc)) =
                         (parsed.ws_key, ws_config)
                     {
@@ -170,7 +170,7 @@ async fn handle_connection(
                         }
 
                         // Upgrade the raw TCP stream to a WebSocket using tokio-tungstenite.
-                        handle_ws_upgraded(stream, &wsc.channel_router, &wsc.pubsub, runtime).await;
+                        handle_ws_upgraded(stream, wsc, runtime).await;
                         return;
                     }
 
@@ -233,10 +233,10 @@ async fn handle_connection(
 ///
 /// Uses tokio-tungstenite to wrap the raw TcpStream, then bridges to
 /// the mahalo-channel GenServer via the same mpsc-based ChannelSocket.
+#[cfg(not(target_os = "linux"))]
 async fn handle_ws_upgraded(
     stream: tokio::net::TcpStream,
-    channel_router: &Arc<ChannelRouter>,
-    pubsub: &PubSub,
+    ws_config: &WsConfig,
     runtime: &Arc<Runtime>,
 ) {
     use futures::{SinkExt, StreamExt};
@@ -252,8 +252,8 @@ async fn handle_ws_upgraded(
 
     // Start GenServer for this connection
     let server = mahalo_channel::ChannelConnectionServer::new(
-        Arc::clone(channel_router),
-        pubsub.clone(),
+        Arc::clone(&ws_config.channel_router),
+        ws_config.pubsub.clone(),
         tx,
         Arc::clone(runtime),
     );

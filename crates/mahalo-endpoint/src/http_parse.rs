@@ -47,8 +47,6 @@ struct RawParsed<'a> {
     connection_header: Option<&'a str>,
     http_version: Option<u8>,
     header_len: usize,
-    upgrade_websocket: bool,
-    ws_key: Option<String>,
 }
 
 /// Shared parsing core: runs httparse, extracts method/uri, scans for
@@ -70,8 +68,6 @@ fn parse_raw<'buf, 'hdr>(
 
     let mut content_length: Option<usize> = None;
     let mut connection_header: Option<&str> = None;
-    let mut upgrade_websocket = false;
-    let mut ws_key: Option<String> = None;
 
     for h in req.headers.iter() {
         if h.name.eq_ignore_ascii_case("content-length") {
@@ -81,18 +77,6 @@ fn parse_raw<'buf, 'hdr>(
         }
         if h.name.eq_ignore_ascii_case("connection") {
             connection_header = std::str::from_utf8(h.value).ok();
-        }
-        if h.name.eq_ignore_ascii_case("upgrade") {
-            if let Ok(v) = std::str::from_utf8(h.value) {
-                if v.eq_ignore_ascii_case("websocket") {
-                    upgrade_websocket = true;
-                }
-            }
-        }
-        if h.name.eq_ignore_ascii_case("sec-websocket-key") {
-            if let Ok(v) = std::str::from_utf8(h.value) {
-                ws_key = Some(v.trim().to_string());
-            }
         }
     }
 
@@ -104,8 +88,6 @@ fn parse_raw<'buf, 'hdr>(
         connection_header,
         http_version: req.version,
         header_len,
-        upgrade_websocket,
-        ws_key,
     }))
 }
 
@@ -213,13 +195,33 @@ pub fn try_parse_request(
     conn.body = body;
     conn.remote_addr = Some(peer_addr);
 
-    // WebSocket upgrade requires GET method and Sec-WebSocket-Version: 13 (RFC 6455 §4.2.1).
-    let ws_key = if raw.upgrade_websocket && raw.method == Method::GET {
-        // Check Sec-WebSocket-Version header.
-        let version_ok = conn.headers.get("sec-websocket-version")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.trim() == "13");
-        if version_ok { raw.ws_key } else { None }
+    // Scan for WebSocket upgrade headers (only needed for try_parse_request,
+    // not the try_parse_into_conn path which never returns ws_key).
+    let ws_key = if conn.method == Method::GET {
+        let mut upgrade_websocket = false;
+        let mut key: Option<String> = None;
+        for h in raw.headers {
+            if h.name.eq_ignore_ascii_case("upgrade") {
+                if let Ok(v) = std::str::from_utf8(h.value) {
+                    if v.eq_ignore_ascii_case("websocket") {
+                        upgrade_websocket = true;
+                    }
+                }
+            } else if h.name.eq_ignore_ascii_case("sec-websocket-key") {
+                if let Ok(v) = std::str::from_utf8(h.value) {
+                    key = Some(v.trim().to_string());
+                }
+            }
+        }
+        if upgrade_websocket && key.is_some() {
+            // RFC 6455 §4.2.1: Sec-WebSocket-Version must be 13.
+            let version_ok = conn.headers.get("sec-websocket-version")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.trim() == "13");
+            if version_ok { key } else { None }
+        } else {
+            None
+        }
     } else {
         None
     };
