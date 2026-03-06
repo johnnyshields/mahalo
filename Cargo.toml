@@ -19,7 +19,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-rebar-core = { path = "../rebar/crates/rebar-core" }
+rebar-core = { git = "https://github.com/johnnyshields/rebar", branch = "gen-server" }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
