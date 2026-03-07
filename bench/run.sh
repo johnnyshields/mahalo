@@ -20,7 +20,7 @@
 #   all           - Everything (default)
 #
 # Frameworks:
-#   Rust:    mahalo, axum, actix, hyper, xitca, may-minihttp
+#   Rust:    mahalo, axum, actix, hyper, xitca
 #   Node:    express
 #   Ruby:    puma, falcon
 #   Elixir:  elixir
@@ -59,7 +59,6 @@ PORT_FERRON=3006
 PORT_ELIXIR=3007
 PORT_GRANIAN=3008
 PORT_FALCON=3009
-PORT_MAY_MINIHTTP=3010
 PORT_XITCA=3011
 PORT_HYPER=3012
 
@@ -353,14 +352,6 @@ start_xitca() {
     wait_for_server $PORT_XITCA "xitca-web"
 }
 
-start_may_minihttp() {
-    should_run "may-minihttp" || return 0
-    log "Starting may-minihttp..."
-    run_pinned env PORT=$PORT_MAY_MINIHTTP "$BENCH_DIR/../target/release/bench-may-minihttp"
-    register_pid "may-minihttp"
-    wait_for_server $PORT_MAY_MINIHTTP "may-minihttp"
-}
-
 start_hyper() {
     should_run "hyper" || return 0
     log "Starting Hyper (raw)..."
@@ -465,7 +456,7 @@ start_granian() {
 # ─── Scenario definitions ───────────────────────────────────────────
 
 # Full-framework servers support all scenarios.
-# Low-level servers (xitca, may-minihttp, ferron) only support TechEmpower.
+# Low-level servers (xitca, ferron) only support TechEmpower.
 
 bench_plaintext() {
     local name=$1 port=$2
@@ -633,7 +624,6 @@ main() {
 
     # Low-level Rust servers
     start_xitca
-    start_may_minihttp
 
     # Non-Rust frameworks
     if [ "$RUST_ONLY" = false ]; then
@@ -658,7 +648,6 @@ main() {
 
     # Low-level Rust servers (TechEmpower only)
     should_run "xitca"         && run_scenarios_limited "xitca-web"     $PORT_XITCA         || true
-    should_run "may-minihttp"  && run_scenarios_limited "may-minihttp"  $PORT_MAY_MINIHTTP  || true
 
     # Non-Rust frameworks
     if [ "$RUST_ONLY" = false ]; then

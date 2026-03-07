@@ -20,10 +20,6 @@ name = "bench-xitca"
 path = "src/bin/xitca.rs"
 
 [[bin]]
-name = "bench-may-minihttp"
-path = "src/bin/may_minihttp.rs"
-
-[[bin]]
 name = "bench-hyper"
 path = "src/bin/hyper.rs"
 
@@ -40,7 +36,6 @@ mimalloc.workspace = true
 rand.workspace = true
 itoa.workspace = true
 xitca-web = "0.7"
-may_minihttp = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
