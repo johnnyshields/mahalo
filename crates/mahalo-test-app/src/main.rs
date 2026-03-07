@@ -446,10 +446,10 @@ impl Channel for OrderChannel {
                 let sim_pubsub = self.pubsub.clone();
                 let topic = topic.to_string();
                 let sim_order_id = order_id;
-                monoio::spawn(async move {
+                rebar_core::executor::spawn(async move {
                     let statuses = ["preparing", "ready", "delivered"];
                     for next_status in statuses {
-                        monoio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        rebar_core::time::sleep(std::time::Duration::from_secs(3)).await;
                         {
                             let mut orders = sim_store.data.orders.lock().unwrap();
                             if let Some(order) = orders.iter_mut().find(|o| o.id == sim_order_id) {

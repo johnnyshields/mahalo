@@ -77,7 +77,7 @@ mod tests {
         Conn::new(Method::GET, Uri::from_static("/"))
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn test_default_headers_applied() {
         let plug = SecureHeaders::new();
         let conn = plug.call(test_conn()).await;
@@ -114,7 +114,7 @@ mod tests {
         );
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn test_put_adds_header() {
         let plug = SecureHeaders::new().put("x-custom", "custom-value");
         let conn = plug.call(test_conn()).await;
@@ -130,7 +130,7 @@ mod tests {
         );
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn test_put_replaces_header() {
         let plug = SecureHeaders::new().put("x-frame-options", "DENY");
         let conn = plug.call(test_conn()).await;
@@ -138,7 +138,7 @@ mod tests {
         assert_eq!(conn.resp_headers.get("x-frame-options").unwrap(), "DENY");
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn test_remove_header() {
         let plug = SecureHeaders::new().remove("x-xss-protection");
         let conn = plug.call(test_conn()).await;
@@ -151,7 +151,7 @@ mod tests {
         );
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn test_existing_response_headers_preserved() {
         let plug = SecureHeaders::new();
         let conn = test_conn().put_resp_header("x-existing", "preserved");

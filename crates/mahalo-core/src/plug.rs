@@ -75,7 +75,7 @@ mod tests {
     use super::*;
     use http::{Method, StatusCode, Uri};
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn plug_fn_creates_callable_plug() {
         let plug = plug_fn(|conn: Conn| async {
             conn.put_status(StatusCode::IM_A_TEAPOT)
@@ -85,7 +85,7 @@ mod tests {
         assert_eq!(conn.status, StatusCode::IM_A_TEAPOT);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn plug_fn_can_modify_body() {
         let plug = plug_fn(|conn: Conn| async {
             conn.put_resp_body("hello from plug")
@@ -105,7 +105,7 @@ mod tests {
         }
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn sync_plug_fn_call_async_fallback() {
         let plug = sync_plug_fn(|conn: Conn| conn.put_resp_body("sync body"));
         let conn = Conn::new(Method::GET, Uri::from_static("/"));

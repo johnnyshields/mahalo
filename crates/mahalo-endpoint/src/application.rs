@@ -73,7 +73,7 @@ impl MahaloApplication {
         let handle = start_supervisor(&runtime, spec, children);
 
         // Give supervised processes a moment to start.
-        monoio::time::sleep(std::time::Duration::from_millis(10)).await;
+        rebar_core::time::sleep(std::time::Duration::from_millis(10)).await;
 
         (handle, pubsub, channel_supervisor)
     }

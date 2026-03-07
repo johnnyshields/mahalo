@@ -9,7 +9,6 @@ description = "Phoenix-style WebSocket Channels with rebar process per connectio
 mahalo-core = { path = "../mahalo-core" }
 mahalo-pubsub = { path = "../mahalo-pubsub" }
 rebar-core = { workspace = true }
-monoio = { workspace = true }
 crossbeam-channel = { workspace = true }
 local-sync = { workspace = true }
 serde = { workspace = true }

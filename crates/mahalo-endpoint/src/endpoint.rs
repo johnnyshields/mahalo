@@ -16,7 +16,7 @@ use mahalo_router::MahaloRouter;
 
 /// A custom error handler that receives a status code and a Conn, and returns a modified Conn.
 ///
-/// Uses `Rc` because it is thread-local (one per monoio worker).
+/// Uses `Rc` because it is thread-local (one per worker thread).
 pub type ErrorHandler = Rc<dyn Fn(StatusCode, Conn) -> Conn>;
 
 /// Default maximum request body size (2 MB).

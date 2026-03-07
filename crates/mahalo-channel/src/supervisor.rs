@@ -57,7 +57,7 @@ impl ChannelSupervisor {
                     // The supervisor runs independently; this just keeps the
                     // ChildEntry alive to signal the parent supervisor.
                     loop {
-                        monoio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        rebar_core::time::sleep(std::time::Duration::from_secs(60)).await;
                     }
                     #[allow(unreachable_code)]
                     ExitReason::Normal
@@ -124,37 +124,43 @@ pub fn connection_child_entry(
 mod tests {
     use super::*;
 
-    #[monoio::test(enable_timer = true)]
-    async fn channel_supervisor_starts() {
-        let runtime = Runtime::new(1);
-        let supervisor = ChannelSupervisor::start(&runtime);
-        supervisor.shutdown();
+    #[test]
+    fn channel_supervisor_starts() {
+        use rebar_core::executor::{RebarExecutor, ExecutorConfig};
+        RebarExecutor::new(ExecutorConfig::default()).unwrap().block_on(async {
+            let runtime = Runtime::new(1);
+            let supervisor = ChannelSupervisor::start(&runtime);
+            supervisor.shutdown();
+        });
     }
 
-    #[monoio::test(enable_timer = true)]
-    async fn channel_supervisor_add_connection_runs_factory() {
-        use std::cell::Cell;
-        let runtime = Runtime::new(1);
-        let supervisor = ChannelSupervisor::start(&runtime);
+    #[test]
+    fn channel_supervisor_add_connection_runs_factory() {
+        use rebar_core::executor::{RebarExecutor, ExecutorConfig};
+        RebarExecutor::new(ExecutorConfig::default()).unwrap().block_on(async {
+            use std::cell::Cell;
+            let runtime = Runtime::new(1);
+            let supervisor = ChannelSupervisor::start(&runtime);
 
-        let ran = Rc::new(Cell::new(false));
-        let ran_clone = Rc::clone(&ran);
+            let ran = Rc::new(Cell::new(false));
+            let ran_clone = Rc::clone(&ran);
 
-        let entry = ChildEntry::new(
-            ChildSpec::new("test_conn").restart(RestartType::Temporary),
-            move || {
-                let ran = Rc::clone(&ran_clone);
-                async move {
-                    ran.set(true);
-                    ExitReason::Normal
-                }
-            },
-        );
+            let entry = ChildEntry::new(
+                ChildSpec::new("test_conn").restart(RestartType::Temporary),
+                move || {
+                    let ran = Rc::clone(&ran_clone);
+                    async move {
+                        ran.set(true);
+                        ExitReason::Normal
+                    }
+                },
+            );
 
-        supervisor.add_connection(entry).await.unwrap();
-        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(ran.get());
+            supervisor.add_connection(entry).await.unwrap();
+            rebar_core::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(ran.get());
 
-        supervisor.shutdown();
+            supervisor.shutdown();
+        });
     }
 }

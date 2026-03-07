@@ -11,7 +11,6 @@ mahalo-router = { path = "../mahalo-router" }
 mahalo-channel = { path = "../mahalo-channel" }
 mahalo-pubsub = { path = "../mahalo-pubsub" }
 rebar-core = { workspace = true }
-monoio = { workspace = true }
 local-sync = { workspace = true }
 crossbeam-channel = { workspace = true }
 nix = { workspace = true }

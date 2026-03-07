@@ -1,8 +1,7 @@
 use std::net::SocketAddr;
 use std::rc::Rc;
 
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-use monoio::net::TcpListener;
+use rebar_core::io::{BufResult, TcpListener, TcpStream};
 
 use mahalo_core::plug::Plug;
 use mahalo_router::MahaloRouter;
@@ -11,7 +10,7 @@ use rebar_core::runtime::Runtime;
 use crate::endpoint::{ErrorHandler, WsConfig};
 use crate::http_parse::{self, ParseError};
 
-/// Run the accept loop on the current monoio runtime using an existing listener.
+/// Run the accept loop on the current executor using an existing listener.
 pub(crate) async fn run_accept_loop(
     listener: TcpListener,
     router: MahaloRouter,
@@ -35,7 +34,7 @@ pub(crate) async fn run_accept_loop(
                 let runtime = Rc::clone(&runtime);
                 let ws_config = Rc::clone(&ws_config);
 
-                monoio::spawn(async move {
+                rebar_core::executor::spawn(async move {
                     handle_connection(
                         stream,
                         peer_addr,
@@ -47,7 +46,8 @@ pub(crate) async fn run_accept_loop(
                         &ws_config,
                     )
                     .await;
-                });
+                })
+                .detach();
             }
             Err(e) => {
                 tracing::warn!("accept error: {e}");
@@ -58,7 +58,7 @@ pub(crate) async fn run_accept_loop(
 
 /// Handle a single TCP connection, supporting HTTP keep-alive and WebSocket upgrade.
 async fn handle_connection(
-    mut stream: monoio::net::TcpStream,
+    stream: TcpStream,
     peer_addr: SocketAddr,
     router: &MahaloRouter,
     error_handler: &Option<ErrorHandler>,
@@ -81,9 +81,9 @@ async fn handle_connection(
             buf.resize(buf.len() * 2, 0);
         }
 
-        // monoio ownership-based read: split off the unfilled portion.
+        // Ownership-based read: split off the unfilled portion.
         let read_buf = buf.split_off(filled);
-        let (result, returned_buf) = stream.read(read_buf).await;
+        let BufResult(result, returned_buf) = stream.read(read_buf).await;
         match result {
             Ok(0) => return, // EOF
             Ok(n) => {
@@ -105,15 +105,14 @@ async fn handle_connection(
                     if let (Some(ws_key), Some(_wsc)) = (&parsed.ws_key, ws_config.as_ref()) {
                         resp_buf.clear();
                         http_parse::serialize_ws_accept_response(ws_key, &mut resp_buf);
-                        let (result, _) = stream.write_all(resp_buf.clone()).await;
+                        let BufResult(result, _) = stream.write_all(resp_buf).await;
                         if result.is_err() {
                             return;
                         }
 
                         // TODO(phase4): WebSocket handling requires mahalo-channel
-                        // adaptation to monoio. For now, accept the upgrade but
-                        // close the connection immediately.
-                        tracing::warn!("WebSocket upgrade accepted but handler not yet implemented for monoio");
+                        // adaptation. For now, accept the upgrade but close immediately.
+                        tracing::warn!("WebSocket upgrade accepted but handler not yet implemented");
                         return;
                     }
 
@@ -134,8 +133,9 @@ async fn handle_connection(
                     resp_buf.clear();
                     http_parse::serialize_response_into(&conn, keep_alive, &mut resp_buf);
 
-                    // monoio write — takes ownership of buffer.
-                    let (result, _) = stream.write_all(resp_buf.clone()).await;
+                    // Ownership-based write.
+                    let BufResult(result, returned) = stream.write_all(resp_buf).await;
+                    resp_buf = returned;
                     if result.is_err() {
                         return;
                     }

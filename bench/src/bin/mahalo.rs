@@ -20,7 +20,6 @@ use rand::Rng;
 static CT_TEXT: HeaderValue = HeaderValue::from_static("text/plain");
 static CT_JSON: HeaderValue = HeaderValue::from_static("application/json");
 static CT_HTML: HeaderValue = HeaderValue::from_static("text/html; charset=utf-8");
-static SRV: HeaderValue = HeaderValue::from_static("mahalo");
 
 fn main() {
     let port = parse_port(3000);

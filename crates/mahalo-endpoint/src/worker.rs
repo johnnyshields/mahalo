@@ -4,11 +4,13 @@ use std::sync::Arc;
 
 use mahalo_core::plug::Plug;
 use mahalo_router::MahaloRouter;
+use rebar_core::executor::{ExecutorConfig, RebarExecutor};
+use rebar_core::io::TcpListener;
 use rebar_core::runtime::Runtime;
 
 use crate::endpoint::{ErrorHandler, WsConfig};
 
-/// Spawn monoio worker threads without joining them. Returns immediately.
+/// Spawn worker threads without joining them. Returns immediately.
 ///
 /// Used by `child_entry` (supervision) where the supervisor manages the lifetime.
 /// Takes Arc-wrapped factories that can be shared across worker threads.
@@ -31,7 +33,7 @@ pub(crate) fn spawn_workers(
         let ws_config_factory = ws_config_factory.clone();
 
         std::thread::Builder::new()
-            .name(format!("monoio-worker-{i}"))
+            .name(format!("mahalo-worker-{i}"))
             .spawn(move || {
                 run_worker_arc(
                     i, addr,
@@ -73,7 +75,7 @@ pub(crate) fn start_server(
             let wcf = ws_config_factory.as_deref();
 
             let handle = std::thread::Builder::new()
-                .name(format!("monoio-worker-{i}"))
+                .name(format!("mahalo-worker-{i}"))
                 .spawn_scoped(scope, move || {
                     run_worker(i, addr, rf, ehf, apf, body_limit, wcf);
                 })
@@ -108,25 +110,17 @@ fn run_worker_arc(
 ) {
     setup_cpu_affinity(worker_id);
 
-    let socket = match crate::handler::bind_socket(addr, true) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("monoio-worker-{worker_id}: bind failed: {e}");
-            return;
-        }
-    };
+    let ex = RebarExecutor::new(ExecutorConfig::default())
+        .expect("failed to build RebarExecutor");
 
-    let std_listener: std::net::TcpListener = socket.into();
-    std_listener.set_nonblocking(true).expect("set_nonblocking failed");
-
-    let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
-        .enable_timer()
-        .build()
-        .expect("failed to build monoio runtime");
-
-    rt.block_on(async {
-        let listener = monoio::net::TcpListener::from_std(std_listener)
-            .expect("failed to create monoio TcpListener from std");
+    ex.block_on(async {
+        let listener = match TcpListener::bind(addr) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("mahalo-worker-{worker_id}: bind failed: {e}");
+                return;
+            }
+        };
 
         let runtime = Rc::new(Runtime::new(worker_id as u64 + 1));
         let router = router_factory();

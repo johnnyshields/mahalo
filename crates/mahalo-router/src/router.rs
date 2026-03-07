@@ -721,7 +721,7 @@ mod tests {
         assert_eq!(resolved.pipelines[0].name, "api");
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn execute_resolved_route() {
         let router = MahaloRouter::new()
             .scope("/api", &[], |s| {
@@ -735,7 +735,7 @@ mod tests {
         assert_eq!(conn.resp_body, "index");
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn execute_with_path_params() {
         let router = MahaloRouter::new()
             .scope("/api", &[], |s| {
@@ -750,7 +750,7 @@ mod tests {
         assert_eq!(conn.path_param("id").unwrap(), "99");
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn execute_with_pipeline() {
         use mahalo_core::conn::AssignKey;
 
@@ -833,7 +833,7 @@ mod tests {
         assert!(router.resolve(&Method::DELETE, "/api/items/1").is_some());
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn pipeline_halt_skips_handler() {
         let auth_pipeline = Pipeline::new("auth").plug(plug_fn(|conn: Conn| async {
             conn.put_status(StatusCode::UNAUTHORIZED).halt()

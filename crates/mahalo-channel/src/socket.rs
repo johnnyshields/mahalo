@@ -119,11 +119,11 @@ impl ChannelSocket {
         if let (Some(pid), Some(runtime)) = (self.self_pid, &self.runtime) {
             let runtime = Rc::clone(runtime);
             let key = format!("{TIMER_PREFIX}{}{TIMER_SEP}{}", self.topic, event.into());
-            monoio::spawn(async move {
-                monoio::time::sleep(delay).await;
+            rebar_core::executor::spawn(async move {
+                rebar_core::time::sleep(delay).await;
                 let msg = rmpv::Value::String(rmpv::Utf8String::from(key));
                 let _ = runtime.send(pid, msg);
-            });
+            }).detach();
         }
     }
 
@@ -136,15 +136,15 @@ impl ChannelSocket {
         if let (Some(pid), Some(runtime)) = (self.self_pid, &self.runtime) {
             let runtime = Rc::clone(runtime);
             let key = format!("{TIMER_PREFIX}{}{TIMER_SEP}{}", self.topic, event.into());
-            monoio::spawn(async move {
+            rebar_core::executor::spawn(async move {
                 loop {
-                    monoio::time::sleep(interval).await;
+                    rebar_core::time::sleep(interval).await;
                     let msg = rmpv::Value::String(rmpv::Utf8String::from(key.clone()));
                     if runtime.send(pid, msg).is_err() {
                         break;
                     }
                 }
-            });
+            }).detach();
         }
     }
 
@@ -287,7 +287,7 @@ async fn handle_join(
             if let Some(pubsub_rx) = pubsub.subscribe(&phoenix_msg.topic) {
                 let runtime = Rc::clone(runtime);
                 let pid = self_pid;
-                monoio::spawn(async move {
+                rebar_core::executor::spawn(async move {
                     loop {
                         match pubsub_rx.try_recv() {
                             Ok(pubsub_msg) => {
@@ -299,12 +299,12 @@ async fn handle_join(
                                 }
                             }
                             Err(crossbeam_channel::TryRecvError::Empty) => {
-                                monoio::time::sleep(Duration::from_millis(5)).await;
+                                rebar_core::time::sleep(Duration::from_millis(5)).await;
                             }
                             Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                         }
                     }
-                });
+                }).detach();
             } else {
                 tracing::warn!(
                     topic = %phoenix_msg.topic,
@@ -707,7 +707,7 @@ mod tests {
         type Value = bool;
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn channel_socket_assigns() {
         let (mut socket, _rx, pubsub) = test_socket("test:topic");
 
@@ -772,7 +772,7 @@ mod tests {
 
     // -- ChannelSocket push/reply/broadcast ------------------------------------
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn channel_socket_push() {
         let (socket, mut rx, pubsub) = test_socket("test:topic");
 
@@ -786,7 +786,7 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn channel_socket_push_closed_sender() {
         let (socket, rx, pubsub) = test_socket("test:topic");
 
@@ -797,7 +797,7 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn channel_socket_broadcast() {
         let (socket, _rx, pubsub) = test_socket("test:topic");
 
@@ -813,7 +813,7 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn channel_socket_reply() {
         let (socket, mut rx, pubsub) = test_socket("test:topic");
 
@@ -829,7 +829,7 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn channel_socket_reply_closed() {
         let (socket, rx, pubsub) = test_socket("test:topic");
 
@@ -893,35 +893,38 @@ mod tests {
         }
     }
 
-    #[monoio::test(enable_timer = true)]
-    async fn handle_join_success() {
-        let pubsub = PubSub::start();
-        let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
-        let (tx, mut rx) = unbounded::channel();
-        let channel: Rc<dyn Channel> = Rc::new(DummyChannel);
-        let mut joined_channels = HashMap::new();
+    #[test]
+    fn handle_join_success() {
+        use rebar_core::executor::{RebarExecutor, ExecutorConfig};
+        RebarExecutor::new(ExecutorConfig::default()).unwrap().block_on(async {
+            let pubsub = PubSub::start();
+            let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
+            let (tx, mut rx) = unbounded::channel();
+            let channel: Rc<dyn Channel> = Rc::new(DummyChannel);
+            let mut joined_channels = HashMap::new();
 
-        let pid = rebar_core::process::ProcessId::new(1, 0, 1);
-        let msg = PhoenixMessage {
-            topic: "room:lobby".into(),
-            event: "phx_join".into(),
-            payload: serde_json::json!({}),
-            msg_ref: Some("join-1".into()),
-        };
+            let pid = rebar_core::process::ProcessId::new(1, 0, 1);
+            let msg = PhoenixMessage {
+                topic: "room:lobby".into(),
+                event: "phx_join".into(),
+                payload: serde_json::json!({}),
+                msg_ref: Some("join-1".into()),
+            };
 
-        handle_join(&msg, &channel, &tx, &pubsub, &mut joined_channels, pid, &runtime).await;
+            handle_join(&msg, &channel, &tx, &pubsub, &mut joined_channels, pid, &runtime).await;
 
-        let parsed = parse_ws_json(rx.try_recv().expect("should receive join reply"));
-        assert_eq!(parsed["event"], "phx_reply");
-        assert_eq!(parsed["payload"]["status"], "ok");
-        assert_eq!(parsed["ref"], "join-1");
+            let parsed = parse_ws_json(rx.try_recv().expect("should receive join reply"));
+            assert_eq!(parsed["event"], "phx_reply");
+            assert_eq!(parsed["payload"]["status"], "ok");
+            assert_eq!(parsed["ref"], "join-1");
 
-        assert!(joined_channels.contains_key("room:lobby"));
+            assert!(joined_channels.contains_key("room:lobby"));
 
-        pubsub.shutdown();
+            pubsub.shutdown();
+        });
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn handle_join_failure() {
         let pubsub = PubSub::start();
         let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
@@ -951,7 +954,7 @@ mod tests {
 
     // -- handle_leave ----------------------------------------------------------
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn handle_leave_known_topic() {
         let (socket, tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
         let channel: Rc<dyn Channel> = Rc::new(DummyChannel);
@@ -978,7 +981,7 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn handle_leave_unknown_topic() {
         let mut joined_channels: HashMap<String, (Rc<dyn Channel>, ChannelSocket)> = HashMap::new();
 
@@ -1039,7 +1042,7 @@ mod tests {
         }
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn dispatch_event_with_reply() {
         let (socket, _tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
         let channel: Rc<dyn Channel> = Rc::new(ReplyChannel);
@@ -1065,7 +1068,7 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn dispatch_event_no_reply() {
         let (socket, _tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
         let channel: Rc<dyn Channel> = Rc::new(DummyChannel); // returns Ok(None)
@@ -1088,7 +1091,7 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn dispatch_event_error() {
         let (socket, _tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
         let channel: Rc<dyn Channel> = Rc::new(ErrorChannel);
@@ -1184,148 +1187,163 @@ mod tests {
         msgs
     }
 
-    #[monoio::test(enable_timer = true)]
-    async fn genserver_handle_cast_join_and_event() {
-        let (pid, mut rx, runtime, pubsub) =
-            start_genserver_with_channel(Rc::new(EchoChannel), "room:*").await;
+    #[test]
+    fn genserver_handle_cast_join_and_event() {
+        use rebar_core::executor::{RebarExecutor, ExecutorConfig};
+        RebarExecutor::new(ExecutorConfig::default()).unwrap().block_on(async {
+            let (pid, mut rx, runtime, pubsub) =
+                start_genserver_with_channel(Rc::new(EchoChannel), "room:*").await;
 
-        // Join
-        cast_phoenix_msg(&runtime, pid, &serde_json::json!({
-            "topic": "room:lobby", "event": "phx_join", "payload": {}, "ref": "j1"
-        })).await;
-        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Join
+            cast_phoenix_msg(&runtime, pid, &serde_json::json!({
+                "topic": "room:lobby", "event": "phx_join", "payload": {}, "ref": "j1"
+            })).await;
+            rebar_core::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let msgs = drain_rx(&mut rx);
-        assert!(!msgs.is_empty(), "should receive join reply");
-        assert_eq!(msgs[0]["event"], "phx_reply");
-        assert_eq!(msgs[0]["payload"]["status"], "ok");
-        assert_eq!(msgs[0]["ref"], "j1");
+            let msgs = drain_rx(&mut rx);
+            assert!(!msgs.is_empty(), "should receive join reply");
+            assert_eq!(msgs[0]["event"], "phx_reply");
+            assert_eq!(msgs[0]["payload"]["status"], "ok");
+            assert_eq!(msgs[0]["ref"], "j1");
 
-        // Custom event
-        cast_phoenix_msg(&runtime, pid, &serde_json::json!({
-            "topic": "room:lobby", "event": "new_msg", "payload": {"text": "hi"}, "ref": "m1"
-        })).await;
-        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Custom event
+            cast_phoenix_msg(&runtime, pid, &serde_json::json!({
+                "topic": "room:lobby", "event": "new_msg", "payload": {"text": "hi"}, "ref": "m1"
+            })).await;
+            rebar_core::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let msgs = drain_rx(&mut rx);
-        assert!(!msgs.is_empty(), "should receive event reply");
-        assert_eq!(msgs[0]["payload"]["response"]["echo_event"], "new_msg");
-        assert_eq!(msgs[0]["ref"], "m1");
+            let msgs = drain_rx(&mut rx);
+            assert!(!msgs.is_empty(), "should receive event reply");
+            assert_eq!(msgs[0]["payload"]["response"]["echo_event"], "new_msg");
+            assert_eq!(msgs[0]["ref"], "m1");
 
-        runtime.kill(pid);
-        pubsub.shutdown();
+            runtime.kill(pid);
+            pubsub.shutdown();
+        });
     }
 
-    #[monoio::test(enable_timer = true)]
-    async fn genserver_handle_cast_heartbeat() {
-        let (pid, mut rx, runtime, pubsub) =
-            start_genserver_with_channel(Rc::new(DummyChannel), "room:*").await;
+    #[test]
+    fn genserver_handle_cast_heartbeat() {
+        use rebar_core::executor::{RebarExecutor, ExecutorConfig};
+        RebarExecutor::new(ExecutorConfig::default()).unwrap().block_on(async {
+            let (pid, mut rx, runtime, pubsub) =
+                start_genserver_with_channel(Rc::new(DummyChannel), "room:*").await;
 
-        cast_phoenix_msg(&runtime, pid, &serde_json::json!({
-            "topic": "phoenix", "event": "heartbeat", "payload": {}, "ref": "hb-1"
-        })).await;
-        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cast_phoenix_msg(&runtime, pid, &serde_json::json!({
+                "topic": "phoenix", "event": "heartbeat", "payload": {}, "ref": "hb-1"
+            })).await;
+            rebar_core::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let msgs = drain_rx(&mut rx);
-        assert!(!msgs.is_empty());
-        assert_eq!(msgs[0]["event"], "phx_reply");
-        assert_eq!(msgs[0]["payload"]["status"], "ok");
-        assert_eq!(msgs[0]["ref"], "hb-1");
+            let msgs = drain_rx(&mut rx);
+            assert!(!msgs.is_empty());
+            assert_eq!(msgs[0]["event"], "phx_reply");
+            assert_eq!(msgs[0]["payload"]["status"], "ok");
+            assert_eq!(msgs[0]["ref"], "hb-1");
 
-        runtime.kill(pid);
-        pubsub.shutdown();
+            runtime.kill(pid);
+            pubsub.shutdown();
+        });
     }
 
-    #[monoio::test(enable_timer = true)]
-    async fn genserver_handle_cast_leave() {
-        let (pid, mut rx, runtime, pubsub) =
-            start_genserver_with_channel(Rc::new(DummyChannel), "room:*").await;
+    #[test]
+    fn genserver_handle_cast_leave() {
+        use rebar_core::executor::{RebarExecutor, ExecutorConfig};
+        RebarExecutor::new(ExecutorConfig::default()).unwrap().block_on(async {
+            let (pid, mut rx, runtime, pubsub) =
+                start_genserver_with_channel(Rc::new(DummyChannel), "room:*").await;
 
-        // Join first
-        cast_phoenix_msg(&runtime, pid, &serde_json::json!({
-            "topic": "room:test", "event": "phx_join", "payload": {}, "ref": "j1"
-        })).await;
-        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
-        drain_rx(&mut rx); // consume join reply
+            // Join first
+            cast_phoenix_msg(&runtime, pid, &serde_json::json!({
+                "topic": "room:test", "event": "phx_join", "payload": {}, "ref": "j1"
+            })).await;
+            rebar_core::time::sleep(std::time::Duration::from_millis(50)).await;
+            drain_rx(&mut rx); // consume join reply
 
-        // Leave
-        cast_phoenix_msg(&runtime, pid, &serde_json::json!({
-            "topic": "room:test", "event": "phx_leave", "payload": {}, "ref": "l1"
-        })).await;
-        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Leave
+            cast_phoenix_msg(&runtime, pid, &serde_json::json!({
+                "topic": "room:test", "event": "phx_leave", "payload": {}, "ref": "l1"
+            })).await;
+            rebar_core::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let msgs = drain_rx(&mut rx);
-        assert!(!msgs.is_empty());
-        assert_eq!(msgs[0]["event"], "phx_reply");
-        assert_eq!(msgs[0]["payload"]["status"], "ok");
-        assert_eq!(msgs[0]["ref"], "l1");
+            let msgs = drain_rx(&mut rx);
+            assert!(!msgs.is_empty());
+            assert_eq!(msgs[0]["event"], "phx_reply");
+            assert_eq!(msgs[0]["payload"]["status"], "ok");
+            assert_eq!(msgs[0]["ref"], "l1");
 
-        runtime.kill(pid);
-        pubsub.shutdown();
+            runtime.kill(pid);
+            pubsub.shutdown();
+        });
     }
 
-    #[monoio::test(enable_timer = true)]
-    async fn genserver_handle_cast_invalid_json_ignored() {
-        let (pid, mut rx, runtime, pubsub) =
-            start_genserver_with_channel(Rc::new(DummyChannel), "room:*").await;
+    #[test]
+    fn genserver_handle_cast_invalid_json_ignored() {
+        use rebar_core::executor::{RebarExecutor, ExecutorConfig};
+        RebarExecutor::new(ExecutorConfig::default()).unwrap().block_on(async {
+            let (pid, mut rx, runtime, pubsub) =
+                start_genserver_with_channel(Rc::new(DummyChannel), "room:*").await;
 
-        // Send non-JSON text — should be silently ignored.
-        let cast_val = rmpv::Value::String(rmpv::Utf8String::from("not valid json"));
-        gen_server::cast_from_runtime(&runtime, pid, cast_val).unwrap();
-        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Send non-JSON text — should be silently ignored.
+            let cast_val = rmpv::Value::String(rmpv::Utf8String::from("not valid json"));
+            gen_server::cast_from_runtime(&runtime, pid, cast_val).unwrap();
+            rebar_core::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        assert!(drain_rx(&mut rx).is_empty(), "invalid JSON should produce no output");
+            assert!(drain_rx(&mut rx).is_empty(), "invalid JSON should produce no output");
 
-        runtime.kill(pid);
-        pubsub.shutdown();
+            runtime.kill(pid);
+            pubsub.shutdown();
+        });
     }
 
-    #[monoio::test(enable_timer = true)]
-    async fn genserver_handle_info_pubsub_broadcast() {
-        // Use a channel that pushes on handle_info
-        struct InfoPushChannel;
+    #[test]
+    fn genserver_handle_info_pubsub_broadcast() {
+        use rebar_core::executor::{RebarExecutor, ExecutorConfig};
+        RebarExecutor::new(ExecutorConfig::default()).unwrap().block_on(async {
+            // Use a channel that pushes on handle_info
+            struct InfoPushChannel;
 
-        impl Channel for InfoPushChannel {
-            fn join<'a>(
-                &'a self, _topic: &'a str, _payload: &'a Value, _socket: &'a mut ChannelSocket,
-            ) -> BoxFuture<'a, Result<Value, crate::channel::ChannelError>> {
-                Box::pin(async { Ok(serde_json::json!({})) })
+            impl Channel for InfoPushChannel {
+                fn join<'a>(
+                    &'a self, _topic: &'a str, _payload: &'a Value, _socket: &'a mut ChannelSocket,
+                ) -> BoxFuture<'a, Result<Value, crate::channel::ChannelError>> {
+                    Box::pin(async { Ok(serde_json::json!({})) })
+                }
+                fn handle_in<'a>(
+                    &'a self, _event: &'a str, _payload: &'a Value, _socket: &'a mut ChannelSocket,
+                ) -> BoxFuture<'a, Result<Option<Reply>, crate::channel::ChannelError>> {
+                    Box::pin(async { Ok(None) })
+                }
+                fn handle_info<'a>(
+                    &'a self, msg: &'a mahalo_pubsub::PubSubMessage, socket: &'a mut ChannelSocket,
+                ) -> BoxFuture<'a, Result<(), crate::channel::ChannelError>> {
+                    Box::pin(async move {
+                        socket.push(&msg.event, &msg.payload).await;
+                        Ok(())
+                    })
+                }
             }
-            fn handle_in<'a>(
-                &'a self, _event: &'a str, _payload: &'a Value, _socket: &'a mut ChannelSocket,
-            ) -> BoxFuture<'a, Result<Option<Reply>, crate::channel::ChannelError>> {
-                Box::pin(async { Ok(None) })
-            }
-            fn handle_info<'a>(
-                &'a self, msg: &'a mahalo_pubsub::PubSubMessage, socket: &'a mut ChannelSocket,
-            ) -> BoxFuture<'a, Result<(), crate::channel::ChannelError>> {
-                Box::pin(async move {
-                    socket.push(&msg.event, &msg.payload).await;
-                    Ok(())
-                })
-            }
-        }
 
-        let (pid, mut rx, runtime, pubsub) =
-            start_genserver_with_channel(Rc::new(InfoPushChannel), "room:*").await;
+            let (pid, mut rx, runtime, pubsub) =
+                start_genserver_with_channel(Rc::new(InfoPushChannel), "room:*").await;
 
-        // Join to establish PubSub subscription
-        cast_phoenix_msg(&runtime, pid, &serde_json::json!({
-            "topic": "room:lobby", "event": "phx_join", "payload": {}, "ref": "j1"
-        })).await;
-        monoio::time::sleep(std::time::Duration::from_millis(100)).await;
-        drain_rx(&mut rx); // consume join reply
+            // Join to establish PubSub subscription
+            cast_phoenix_msg(&runtime, pid, &serde_json::json!({
+                "topic": "room:lobby", "event": "phx_join", "payload": {}, "ref": "j1"
+            })).await;
+            rebar_core::time::sleep(std::time::Duration::from_millis(100)).await;
+            drain_rx(&mut rx); // consume join reply
 
-        // Broadcast via PubSub — should arrive via handle_info
-        pubsub.broadcast("room:lobby", "server_push", serde_json::json!({"data": 42}));
-        monoio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Broadcast via PubSub — should arrive via handle_info
+            pubsub.broadcast("room:lobby", "server_push", serde_json::json!({"data": 42}));
+            rebar_core::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let msgs = drain_rx(&mut rx);
-        assert!(!msgs.is_empty(), "should receive handle_info push from PubSub broadcast");
-        assert_eq!(msgs[0]["event"], "server_push");
-        assert_eq!(msgs[0]["payload"]["data"], 42);
+            let msgs = drain_rx(&mut rx);
+            assert!(!msgs.is_empty(), "should receive handle_info push from PubSub broadcast");
+            assert_eq!(msgs[0]["event"], "server_push");
+            assert_eq!(msgs[0]["payload"]["data"], 42);
 
-        runtime.kill(pid);
-        pubsub.shutdown();
+            runtime.kill(pid);
+            pubsub.shutdown();
+        });
     }
 }

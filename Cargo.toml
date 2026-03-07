@@ -21,8 +21,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-rebar-core = { git = "https://github.com/johnnyshields/rebar.git", branch = "rebar-v4" }
-monoio = { version = "0.2", features = ["sync", "utils", "macros"] }
+rebar-core = { git = "https://github.com/johnnyshields/rebar.git", branch = "rebar-v5" }
 local-sync = "0.1"
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }

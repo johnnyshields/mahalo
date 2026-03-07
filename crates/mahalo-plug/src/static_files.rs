@@ -263,7 +263,7 @@ mod tests {
         dir
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn serves_file_with_correct_content_type() {
         let dir = temp_dir("serve");
         fs::write(dir.join("style.css"), "body { color: red; }").unwrap();
@@ -281,7 +281,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn rejects_path_traversal() {
         let dir = temp_dir("traversal");
         fs::write(dir.join("secret.txt"), "secret").unwrap();
@@ -295,7 +295,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn passes_through_non_matching_prefix() {
         let dir = temp_dir("prefix");
         fs::write(dir.join("index.html"), "<html></html>").unwrap();
@@ -309,7 +309,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn passes_through_for_post() {
         let dir = temp_dir("post");
         fs::write(dir.join("file.txt"), "hello").unwrap();
@@ -323,7 +323,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn head_returns_headers_but_empty_body() {
         let dir = temp_dir("head");
         fs::write(dir.join("page.html"), "<h1>Hello</h1>").unwrap();
@@ -340,7 +340,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn nonexistent_file_passes_through() {
         let dir = temp_dir("missing");
 
@@ -353,7 +353,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn serves_precompressed_brotli() {
         let dir = temp_dir("precomp_br");
         fs::write(dir.join("app.js"), "console.log('hello')").unwrap();
@@ -373,7 +373,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn skips_precompressed_for_non_compressible() {
         let dir = temp_dir("precomp_skip");
         fs::write(dir.join("photo.png"), "png-data").unwrap();
@@ -392,7 +392,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn compressible_file_sets_vary() {
         let dir = temp_dir("vary");
         fs::write(dir.join("style.css"), "body {}").unwrap();
@@ -407,7 +407,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn head_on_precompressed_returns_headers_no_body() {
         let dir = temp_dir("head_precomp");
         fs::write(dir.join("app.js"), "console.log('hello')").unwrap();
@@ -427,7 +427,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn gzip_fallback_when_br_missing() {
         let dir = temp_dir("gz_fallback");
         fs::write(dir.join("app.js"), "console.log('hello')").unwrap();
@@ -446,7 +446,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn serves_zstd_variant() {
         let dir = temp_dir("zstd");
         fs::write(dir.join("app.js"), "console.log('hello')").unwrap();
@@ -464,7 +464,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn br_preferred_over_gzip_when_both_available() {
         let dir = temp_dir("priority");
         fs::write(dir.join("app.js"), "console.log('hello')").unwrap();
@@ -483,7 +483,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn etag_set_on_static_file() {
         let dir = temp_dir("etag");
         fs::write(dir.join("style.css"), "body {}").unwrap();
@@ -500,7 +500,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn static_file_304_on_matching_if_none_match() {
         let dir = temp_dir("etag304");
         fs::write(dir.join("style.css"), "body {}").unwrap();
@@ -524,7 +524,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn precompressed_etag_and_304() {
         let dir = temp_dir("etag_precomp");
         fs::write(dir.join("app.js"), "console.log('hello')").unwrap();

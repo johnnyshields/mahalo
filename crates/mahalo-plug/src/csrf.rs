@@ -103,7 +103,7 @@ mod tests {
         Conn::new(method, Uri::from_static("/test"))
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn safe_method_generates_token_and_sets_header() {
         let plug = CsrfProtection::new("test-secret");
         let conn = make_conn(Method::GET);
@@ -122,7 +122,7 @@ mod tests {
         assert_eq!(header, assign);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn valid_token_on_post_passes_through() {
         let plug = CsrfProtection::new("test-secret");
 
@@ -140,7 +140,7 @@ mod tests {
         assert!(conn.get_assign::<CsrfToken>().is_some());
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn missing_token_on_post_returns_403() {
         let plug = CsrfProtection::new("test-secret");
         let conn = make_conn(Method::POST);
@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(conn.status, StatusCode::FORBIDDEN);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn invalid_token_returns_403() {
         let plug = CsrfProtection::new("test-secret");
 
@@ -165,7 +165,7 @@ mod tests {
         assert_eq!(conn.status, StatusCode::FORBIDDEN);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn tampered_token_returns_403() {
         let plug = CsrfProtection::new("test-secret");
         let token = plug.generate_token();
@@ -192,7 +192,7 @@ mod tests {
         assert!(!conn2.halted);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn head_generates_token() {
         let plug = CsrfProtection::new("test-secret");
         let conn = make_conn(Method::HEAD);
@@ -203,7 +203,7 @@ mod tests {
         assert!(conn.resp_headers.get("x-csrf-token").is_some());
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn options_generates_token() {
         let plug = CsrfProtection::new("test-secret");
         let conn = make_conn(Method::OPTIONS);
@@ -214,7 +214,7 @@ mod tests {
         assert!(conn.resp_headers.get("x-csrf-token").is_some());
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn put_without_token_returns_403() {
         let plug = CsrfProtection::new("test-secret");
         let conn = make_conn(Method::PUT);
@@ -224,7 +224,7 @@ mod tests {
         assert_eq!(conn.status, StatusCode::FORBIDDEN);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn patch_without_token_returns_403() {
         let plug = CsrfProtection::new("test-secret");
         let conn = make_conn(Method::PATCH);
@@ -234,7 +234,7 @@ mod tests {
         assert_eq!(conn.status, StatusCode::FORBIDDEN);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn delete_without_token_returns_403() {
         let plug = CsrfProtection::new("test-secret");
         let conn = make_conn(Method::DELETE);
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(conn.status, StatusCode::FORBIDDEN);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn put_with_valid_token_passes() {
         let plug = CsrfProtection::new("test-secret");
         let token = plug.generate_token();
@@ -255,7 +255,7 @@ mod tests {
         assert!(!conn.halted);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn patch_with_valid_token_passes() {
         let plug = CsrfProtection::new("test-secret");
         let token = plug.generate_token();
@@ -266,7 +266,7 @@ mod tests {
         assert!(!conn.halted);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn delete_with_valid_token_passes() {
         let plug = CsrfProtection::new("test-secret");
         let token = plug.generate_token();
@@ -277,7 +277,7 @@ mod tests {
         assert!(!conn.halted);
     }
 
-    #[monoio::test(enable_timer = true)]
+    #[tokio::test]
     async fn get_passes_through_without_token() {
         let plug = CsrfProtection::new("test-secret");
         let conn = make_conn(Method::GET);

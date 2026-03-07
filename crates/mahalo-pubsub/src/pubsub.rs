@@ -140,7 +140,7 @@ impl PubSub {
                 match done_rx.try_recv() {
                     Ok(()) | Err(crossbeam::TryRecvError::Disconnected) => break,
                     Err(crossbeam::TryRecvError::Empty) => {
-                        monoio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        rebar_core::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                 }
             }
@@ -220,7 +220,7 @@ impl PubSub {
                     match done_rx.try_recv() {
                         Ok(()) | Err(crossbeam::TryRecvError::Disconnected) => break,
                         Err(crossbeam::TryRecvError::Empty) => {
-                            monoio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            rebar_core::time::sleep(std::time::Duration::from_millis(10)).await;
                         }
                     }
                 }
@@ -338,21 +338,24 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[monoio::test(enable_timer = true)]
-    async fn start_with_runtime_creates_working_pubsub() {
-        let runtime = rebar_core::runtime::Runtime::new(1);
-        let pubsub = PubSub::start_with_runtime(&runtime);
-        let rx = pubsub.subscribe("test:topic").unwrap();
+    #[test]
+    fn start_with_runtime_creates_working_pubsub() {
+        use rebar_core::executor::{RebarExecutor, ExecutorConfig};
+        RebarExecutor::new(ExecutorConfig::default()).unwrap().block_on(async {
+            let runtime = rebar_core::runtime::Runtime::new(1);
+            let pubsub = PubSub::start_with_runtime(&runtime);
+            let rx = pubsub.subscribe("test:topic").unwrap();
 
-        pubsub.broadcast("test:topic", "hello", serde_json::json!({"msg": "hi"}));
+            pubsub.broadcast("test:topic", "hello", serde_json::json!({"msg": "hi"}));
 
-        let msg = rx.recv_timeout(Duration::from_secs(1)).expect("recv error");
+            let msg = rx.recv_timeout(Duration::from_secs(1)).expect("recv error");
 
-        assert_eq!(msg.topic, "test:topic");
-        assert_eq!(msg.event, "hello");
-        assert_eq!(msg.payload, serde_json::json!({"msg": "hi"}));
+            assert_eq!(msg.topic, "test:topic");
+            assert_eq!(msg.event, "hello");
+            assert_eq!(msg.payload, serde_json::json!({"msg": "hi"}));
 
-        pubsub.shutdown();
+            pubsub.shutdown();
+        });
     }
 
     #[test]
@@ -361,30 +364,33 @@ mod tests {
         assert_clone_send_sync::<PubSub>();
     }
 
-    #[monoio::test(enable_timer = true)]
-    async fn new_supervised_subscribe_and_broadcast() {
+    #[test]
+    fn new_supervised_subscribe_and_broadcast() {
+        use rebar_core::executor::{RebarExecutor, ExecutorConfig};
         use rebar_core::supervisor::spec::{RestartStrategy, SupervisorSpec};
         use rebar_core::supervisor::engine::start_supervisor;
 
-        let runtime = rebar_core::runtime::Runtime::new(1);
-        let (pubsub, entry) = PubSub::new_supervised();
+        RebarExecutor::new(ExecutorConfig::default()).unwrap().block_on(async {
+            let runtime = rebar_core::runtime::Runtime::new(1);
+            let (pubsub, entry) = PubSub::new_supervised();
 
-        assert_eq!(entry.spec.id, "mahalo_pubsub");
+            assert_eq!(entry.spec.id, "mahalo_pubsub");
 
-        // Start the supervisor which will start the actual server loop.
-        let _supervisor = start_supervisor(
-            &runtime,
-            SupervisorSpec::new(RestartStrategy::OneForOne),
-            vec![entry],
-        );
+            // Start the supervisor which will start the actual server loop.
+            let _supervisor = start_supervisor(
+                &runtime,
+                SupervisorSpec::new(RestartStrategy::OneForOne),
+                vec![entry],
+            );
 
-        // Give the server thread a moment to start.
-        monoio::time::sleep(Duration::from_millis(50)).await;
+            // Give the server thread a moment to start.
+            rebar_core::time::sleep(Duration::from_millis(50)).await;
 
-        let rx = pubsub.subscribe("supervised:topic").unwrap();
-        pubsub.broadcast("supervised:topic", "hello", serde_json::json!({"ok": true}));
+            let rx = pubsub.subscribe("supervised:topic").unwrap();
+            pubsub.broadcast("supervised:topic", "hello", serde_json::json!({"ok": true}));
 
-        let msg = rx.recv_timeout(Duration::from_secs(1)).expect("recv error");
-        assert_eq!(msg.event, "hello");
+            let msg = rx.recv_timeout(Duration::from_secs(1)).expect("recv error");
+            assert_eq!(msg.event, "hello");
+        });
     }
 }

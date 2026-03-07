@@ -1,41 +1,12 @@
-use std::net::SocketAddr;
-
 use http::StatusCode;
 use mahalo_core::conn::Conn;
 use mahalo_core::plug::Plug;
 use mahalo_router::MahaloRouter;
-use socket2::{Domain, Protocol, Socket, Type};
-
 use crate::endpoint::ErrorHandler;
-
-/// Create and bind a TCP socket with optional `SO_REUSEPORT`.
-///
-/// Shared by all worker threads for per-thread listener binding.
-pub(crate) fn bind_socket(
-    addr: SocketAddr,
-    reuse_port: bool,
-) -> Result<Socket, Box<dyn std::error::Error + Send + Sync>> {
-    let domain = if addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
-    if reuse_port {
-        #[cfg(not(target_os = "windows"))]
-        socket.set_reuse_port(true)?;
-    }
-    socket.set_nodelay(true)?;
-    socket.set_nonblocking(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(8192)?;
-    Ok(socket)
-}
 
 /// Execute a request through the router and after-plugs.
 ///
-/// Runtime-agnostic — works on both monoio and tokio.
+/// Runtime-agnostic — works on any async executor.
 #[inline]
 pub async fn execute_request(
     conn: Conn,
@@ -151,6 +122,25 @@ mod tests {
 
         assert_eq!(result.resp_body, Bytes::from("halted"));
         assert!(result.get_resp_header("x-should-not-run").is_none());
+    }
+
+    fn bind_socket(
+        addr: std::net::SocketAddr,
+        reuse_port: bool,
+    ) -> Result<socket2::Socket, Box<dyn std::error::Error + Send + Sync>> {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        if reuse_port {
+            #[cfg(not(target_os = "windows"))]
+            socket.set_reuse_port(true)?;
+        }
+        socket.set_nodelay(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(8192)?;
+        Ok(socket)
     }
 
     #[test]
