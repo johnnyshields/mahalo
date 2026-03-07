@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use http::StatusCode;
 use http::header::{HeaderValue, CONTENT_TYPE};
-use mahalo::{Conn, MahaloEndpoint, MahaloRouter, plug_fn};
+use mahalo::{Conn, MahaloEndpoint, MahaloRouter, sync_plug_fn};
 use rebar_core::runtime::Runtime;
 
 /// Pre-validated header values — avoids per-request parsing.
@@ -25,18 +25,18 @@ async fn main() {
     let router = MahaloRouter::new()
         .get(
             "/plaintext",
-            plug_fn(|conn: Conn| async {
+            sync_plug_fn(|conn: Conn| {
                 conn.put_status(StatusCode::OK)
                     .put_resp_header_static(CONTENT_TYPE, CT_TEXT.clone())
-                    .put_resp_body("Hello, World!")
+                    .put_resp_body_static(b"Hello, World!")
             }),
         )
         .get(
             "/json",
-            plug_fn(|conn: Conn| async {
+            sync_plug_fn(|conn: Conn| {
                 conn.put_status(StatusCode::OK)
                     .put_resp_header_static(CONTENT_TYPE, CT_JSON.clone())
-                    .put_resp_body(r#"{"message":"Hello, World!"}"#)
+                    .put_resp_body_static(br#"{"message":"Hello, World!"}"#)
             }),
         );
 

@@ -27,7 +27,11 @@ impl Pipeline {
             if conn.halted {
                 break;
             }
-            conn = plug.call(conn).await;
+            // Try zero-alloc sync path first; fall back to async BoxFuture.
+            conn = match plug.call_sync(conn) {
+                Ok(c) => c,
+                Err(c) => plug.call(c).await,
+            };
         }
         conn
     }

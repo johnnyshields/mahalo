@@ -2,7 +2,7 @@
 pub use mahalo_core::conn::{AssignKey, Conn, PathParams};
 pub use mahalo_core::controller::Controller;
 pub use mahalo_core::pipeline::Pipeline;
-pub use mahalo_core::plug::{plug_fn, BoxFuture, Plug, PlugFn};
+pub use mahalo_core::plug::{plug_fn, sync_plug_fn, BoxFuture, Plug, PlugFn, SyncPlugFn};
 
 // Router
 pub use mahalo_router::MahaloRouter;

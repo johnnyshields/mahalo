@@ -225,15 +225,30 @@ impl BufferPool {
     pub fn chunk_size(&self) -> usize {
         self.chunk_size
     }
+
+    /// Build iovecs suitable for io_uring register_buffers.
+    /// Each iovec maps one chunk in the buffer pool.
+    pub fn iovecs(&self) -> Vec<libc::iovec> {
+        let count = self.data.len() / self.chunk_size;
+        let base = self.data.as_ptr();
+        (0..count)
+            .map(|i| libc::iovec {
+                iov_base: unsafe { base.add(i * self.chunk_size) as *mut libc::c_void },
+                iov_len: self.chunk_size,
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
 // submit helpers
 // ---------------------------------------------------------------------------
 
+/// Submit a multishot accept — a single SQE that produces one CQE per accepted connection.
+/// Re-arm only when the kernel signals the multishot is done (no IORING_CQE_F_MORE flag).
 #[inline]
-fn submit_accept(ring: &mut IoUring, listen_fd: RawFd) {
-    let entry = opcode::Accept::new(types::Fd(listen_fd), std::ptr::null_mut(), std::ptr::null_mut())
+fn submit_accept_multi(ring: &mut IoUring, listen_fd: RawFd) {
+    let entry = opcode::AcceptMulti::new(types::Fd(listen_fd))
         .build()
         .user_data(encode_user_data(STATE_ACCEPTING, 0, 0));
     unsafe {
@@ -241,8 +256,25 @@ fn submit_accept(ring: &mut IoUring, listen_fd: RawFd) {
     }
 }
 
+/// Set TCP_CORK on a raw fd (best-effort). Coalesces small writes into fewer packets.
 #[inline]
-fn submit_read_with_state(
+fn set_tcp_cork(fd: RawFd, enable: bool) {
+    unsafe {
+        let flag: libc::c_int = if enable { 1 } else { 0 };
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CORK,
+            &flag as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+/// Submit a read — uses ReadFixed (zero-copy kernel I/O) when buffers are registered,
+/// falls back to plain Read otherwise.
+#[inline]
+fn submit_read_impl(
     ring: &mut IoUring,
     fd: RawFd,
     buf_ptr: *mut u8,
@@ -251,12 +283,20 @@ fn submit_read_with_state(
     slot_idx: u32,
     generation: u32,
     state: u8,
+    buf_pool_idx: u16,
+    bufs_registered: bool,
 ) {
-    let entry = opcode::Read::new(types::Fd(fd), buf_ptr.wrapping_add(offset), len.saturating_sub(offset as u32))
-        .build()
-        .user_data(encode_user_data(state, slot_idx, generation));
+    let ptr = buf_ptr.wrapping_add(offset);
+    let remaining = len.saturating_sub(offset as u32);
+    let entry = if bufs_registered {
+        opcode::ReadFixed::new(types::Fd(fd), ptr, remaining, buf_pool_idx)
+            .build()
+    } else {
+        opcode::Read::new(types::Fd(fd), ptr, remaining)
+            .build()
+    };
     unsafe {
-        ring.submission().push(&entry).ok();
+        ring.submission().push(&entry.user_data(encode_user_data(state, slot_idx, generation))).ok();
     }
 }
 
@@ -269,8 +309,10 @@ fn submit_read(
     offset: usize,
     slot_idx: u32,
     generation: u32,
+    buf_pool_idx: u16,
+    bufs_registered: bool,
 ) {
-    submit_read_with_state(ring, fd, buf_ptr, len, offset, slot_idx, generation, STATE_READING);
+    submit_read_impl(ring, fd, buf_ptr, len, offset, slot_idx, generation, STATE_READING, buf_pool_idx, bufs_registered);
 }
 
 #[inline]
@@ -282,8 +324,10 @@ fn submit_ws_read(
     offset: usize,
     slot_idx: u32,
     generation: u32,
+    buf_pool_idx: u16,
+    bufs_registered: bool,
 ) {
-    submit_read_with_state(ring, fd, buf_ptr, len, offset, slot_idx, generation, STATE_WS_READING);
+    submit_read_impl(ring, fd, buf_ptr, len, offset, slot_idx, generation, STATE_WS_READING, buf_pool_idx, bufs_registered);
 }
 
 #[inline]
@@ -383,10 +427,10 @@ struct WsPendingDispatch {
     text: String,
 }
 
-/// Synchronously write a 503 response and close the fd, then re-arm accept.
+/// Synchronously write a 503 response and close the fd.
 /// Used when the server is out of connection or buffer slots.
 #[inline]
-fn reject_and_close(ring: &mut IoUring, fd: RawFd, listen_fd: RawFd) {
+fn reject_and_close(fd: RawFd) {
     unsafe {
         libc::write(
             fd,
@@ -395,7 +439,6 @@ fn reject_and_close(ring: &mut IoUring, fd: RawFd, listen_fd: RawFd) {
         );
         libc::close(fd);
     }
-    submit_accept(ring, listen_fd);
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +457,7 @@ pub(crate) fn run_event_loop(
     body_limit: usize,
     tokio_rt: &tokio::runtime::Runtime,
     ws_config: Option<&WsConfig>,
+    bufs_registered: bool,
 ) {
     let peer_addr = default_peer_addr();
     let mut accept_backoff_ms: u64 = 100;
@@ -423,7 +467,7 @@ pub(crate) fn run_event_loop(
     } else {
         None
     };
-    submit_accept(ring, listen_fd);
+    submit_accept_multi(ring, listen_fd);
 
     // Reusable vectors to avoid per-iteration allocation.
     let mut pending_meta: Vec<PendingRequest> = Vec::with_capacity(64);
@@ -466,12 +510,14 @@ pub(crate) fn run_event_loop(
 
             match state {
                 STATE_ACCEPTING => {
+                    // Multishot accept: IORING_CQE_F_MORE means more CQEs coming.
+                    // Only re-arm when multishot is exhausted (no MORE flag).
+                    let multishot_active = io_uring::cqueue::more(cqe.flags());
+
                     if result < 0 {
                         let errno = -result;
                         if errno == libc::EMFILE || errno == libc::ENFILE {
                             tracing::warn!("accept error (fd exhaustion, backoff {}ms): {}", accept_backoff_ms, std::io::Error::from_raw_os_error(errno));
-                            // Use io_uring timeout to delay before re-arming accept.
-                            // Store timespec outside CQE loop so pointer stays valid until submit_and_wait.
                             emfile_timespec = Some(types::Timespec::from(
                                 std::time::Duration::from_millis(accept_backoff_ms),
                             ));
@@ -484,20 +530,24 @@ pub(crate) fn run_event_loop(
                             accept_backoff_ms = (accept_backoff_ms * 2).min(1000);
                         } else {
                             tracing::warn!("accept error: {}", std::io::Error::from_raw_os_error(errno));
-                            submit_accept(ring, listen_fd);
+                            if !multishot_active {
+                                submit_accept_multi(ring, listen_fd);
+                            }
                         }
                         continue;
                     }
-                    accept_backoff_ms = 100; // Reset on successful accept
+                    accept_backoff_ms = 100;
                     let new_fd = result;
 
-                    // TCP_NODELAY on accepted connection — critical for small responses.
                     set_tcp_nodelay(new_fd);
 
                     let slot_idx = match conn_pool.alloc() {
                         Some(idx) => idx,
                         None => {
-                            reject_and_close(ring, new_fd, listen_fd);
+                            reject_and_close(new_fd);
+                            if !multishot_active {
+                                submit_accept_multi(ring, listen_fd);
+                            }
                             continue;
                         }
                     };
@@ -506,14 +556,16 @@ pub(crate) fn run_event_loop(
                         Some(idx) => idx,
                         None => {
                             conn_pool.free(slot_idx);
-                            reject_and_close(ring, new_fd, listen_fd);
+                            reject_and_close(new_fd);
+                            if !multishot_active {
+                                submit_accept_multi(ring, listen_fd);
+                            }
                             continue;
                         }
                     };
 
                     let generation = conn_pool.next_generation();
 
-                    // Reuse a write buffer from the pool, or allocate a new one.
                     let write_buf = if let Some(mut wb) = write_buf_pool.pop() {
                         wb.clear();
                         wb
@@ -537,8 +589,11 @@ pub(crate) fn run_event_loop(
 
                     let buf_ptr = buf_pool.slice_mut(buf_idx).as_mut_ptr();
                     let chunk_len = buf_pool.chunk_size() as u32;
-                    submit_read(ring, new_fd, buf_ptr, chunk_len, 0, slot_idx, generation);
-                    submit_accept(ring, listen_fd);
+                    submit_read(ring, new_fd, buf_ptr, chunk_len, 0, slot_idx, generation, buf_idx, bufs_registered);
+                    // Multishot: no re-arm needed when MORE flag is set.
+                    if !multishot_active {
+                        submit_accept_multi(ring, listen_fd);
+                    }
                 }
 
                 STATE_READING => {
@@ -675,7 +730,8 @@ pub(crate) fn run_event_loop(
                                 let buf_ptr = buf_pool.slice_mut(buf_idx).as_mut_ptr();
                                 submit_read(
                                     ring, fd, buf_ptr, chunk_size as u32,
-                                    read_len, slot_idx, generation,
+                                    read_len, slot_idx, generation, buf_idx,
+                                    bufs_registered,
                                 );
                             }
                         }
@@ -772,7 +828,7 @@ pub(crate) fn run_event_loop(
                     let fd = slot.fd;
                     let buf_ptr = buf_pool.slice_mut(new_buf_idx).as_mut_ptr();
                     let chunk_len = buf_pool.chunk_size() as u32;
-                    submit_ws_read(ring, fd, buf_ptr, chunk_len, 0, slot_idx, generation);
+                    submit_ws_read(ring, fd, buf_ptr, chunk_len, 0, slot_idx, generation, new_buf_idx, bufs_registered);
 
                     ws_active_slots.push((slot_idx, generation));
                 }
@@ -887,10 +943,9 @@ pub(crate) fn run_event_loop(
                     // Re-arm the read if not closing.
                     let ws = slot.ws.as_ref().unwrap();
                     if !ws.closing || !ws.outbox.is_empty() {
-                        // Continue reading.
                         let buf_ptr = buf_pool.slice_mut(buf_idx).as_mut_ptr();
                         let chunk_len = buf_pool.chunk_size() as u32;
-                        submit_ws_read(ring, fd, buf_ptr, chunk_len, 0, slot_idx, generation);
+                        submit_ws_read(ring, fd, buf_ptr, chunk_len, 0, slot_idx, generation, buf_idx, bufs_registered);
                     }
                 }
 
@@ -921,6 +976,8 @@ pub(crate) fn run_event_loop(
                         let remaining = (slot.write_buf.len() - slot.write_offset) as u32;
                         submit_write(ring, fd, ptr, remaining, slot_idx, generation);
                     } else if slot.keep_alive {
+                        // Uncork to flush the coalesced response.
+                        set_tcp_cork(fd, false);
                         let buf_idx = slot.read_buf_idx;
                         slot.read_len = 0;
                         slot.write_buf.clear();
@@ -928,8 +985,9 @@ pub(crate) fn run_event_loop(
 
                         let buf_ptr = buf_pool.slice_mut(buf_idx).as_mut_ptr();
                         let chunk_len = buf_pool.chunk_size() as u32;
-                        submit_read(ring, fd, buf_ptr, chunk_len, 0, slot_idx, generation);
+                        submit_read(ring, fd, buf_ptr, chunk_len, 0, slot_idx, generation, buf_idx, bufs_registered);
                     } else {
+                        set_tcp_cork(fd, false);
                         buf_pool.free(slot.read_buf_idx);
                         submit_close(ring, fd, slot_idx, generation);
                     }
@@ -1035,6 +1093,8 @@ pub(crate) fn run_event_loop(
                     conn_recycle.push(conn);
                 }
 
+                // TCP_CORK coalesces header + body into a single packet.
+                set_tcp_cork(meta.fd, true);
                 let ptr = slot.write_buf.as_ptr();
                 let len = slot.write_buf.len() as u32;
                 submit_write(ring, meta.fd, ptr, len, meta.slot_idx, meta.generation);

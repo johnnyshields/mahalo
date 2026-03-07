@@ -25,7 +25,7 @@ pub struct Conn {
     pub uri: Uri,
     pub headers: HeaderMap,
     pub path_params: PathParams,
-    pub query_params: HashMap<String, String>,
+    pub query_params: Option<HashMap<String, String>>,
     pub remote_addr: Option<SocketAddr>,
     pub body: Bytes,
 
@@ -47,7 +47,7 @@ impl Conn {
             uri,
             headers: HeaderMap::new(),
             path_params: SmallVec::new(),
-            query_params: HashMap::new(),
+            query_params: None,
             remote_addr: None,
             body: Bytes::new(),
             status: StatusCode::OK,
@@ -68,7 +68,9 @@ impl Conn {
         self.uri = uri;
         self.headers.clear();
         self.path_params.clear();
-        self.query_params.clear();
+        if let Some(ref mut qp) = self.query_params {
+            qp.clear();
+        }
         self.remote_addr = None;
         self.body = Bytes::new();
         self.status = StatusCode::OK;
@@ -130,6 +132,13 @@ impl Conn {
         self
     }
 
+    /// Zero-copy static body — avoids atomic ref-count overhead of Bytes::from().
+    #[inline]
+    pub fn put_resp_body_static(mut self, body: &'static [u8]) -> Self {
+        self.resp_body = Bytes::from_static(body);
+        self
+    }
+
     #[inline]
     pub fn halt(mut self) -> Self {
         self.halted = true;
@@ -167,10 +176,10 @@ impl Conn {
     }
 
     /// Parse the query string from the URI into `query_params`.
-    /// Keys and values are percent-decoded.
+    /// Keys and values are percent-decoded. Lazily allocates the HashMap.
     pub fn parse_query_params(&mut self) {
         if let Some(query) = self.uri.query() {
-            self.query_params = query
+            let map: HashMap<String, String> = query
                 .split('&')
                 .filter_map(|pair| {
                     let mut parts = pair.splitn(2, '=');
@@ -181,7 +190,14 @@ impl Conn {
                     Some((key, value))
                 })
                 .collect();
+            self.query_params = Some(map);
         }
+    }
+
+    /// Get a query parameter by name, returning None if query params haven't been parsed yet.
+    #[inline]
+    pub fn query_param(&self, name: &str) -> Option<&str> {
+        self.query_params.as_ref()?.get(name).map(|s| s.as_str())
     }
 }
 
@@ -247,15 +263,15 @@ mod tests {
     fn parse_query_params_works() {
         let mut conn = Conn::new(Method::GET, Uri::from_static("/search?q=rust&page=2"));
         conn.parse_query_params();
-        assert_eq!(conn.query_params.get("q").unwrap(), "rust");
-        assert_eq!(conn.query_params.get("page").unwrap(), "2");
+        assert_eq!(conn.query_param("q").unwrap(), "rust");
+        assert_eq!(conn.query_param("page").unwrap(), "2");
     }
 
     #[test]
     fn parse_query_params_empty() {
         let mut conn = Conn::new(Method::GET, Uri::from_static("/search"));
         conn.parse_query_params();
-        assert!(conn.query_params.is_empty());
+        assert!(conn.query_params.is_none());
     }
 
     #[test]
@@ -265,8 +281,8 @@ mod tests {
             "/search?name=hello%20world&city=S%C3%A3o%20Paulo".parse::<Uri>().unwrap(),
         );
         conn.parse_query_params();
-        assert_eq!(conn.query_params.get("name").unwrap(), "hello world");
-        assert_eq!(conn.query_params.get("city").unwrap(), "São Paulo");
+        assert_eq!(conn.query_param("name").unwrap(), "hello world");
+        assert_eq!(conn.query_param("city").unwrap(), "São Paulo");
     }
 
     #[test]
@@ -277,7 +293,7 @@ mod tests {
         );
         conn.parse_query_params();
         // percent-encoding does not decode '+' as space (that's form-urlencoded)
-        assert_eq!(conn.query_params.get("q").unwrap(), "a+b");
+        assert_eq!(conn.query_param("q").unwrap(), "a+b");
     }
 
     #[test]
@@ -307,7 +323,7 @@ mod tests {
         let mut conn = conn;
         conn.headers.insert("host", "example.com".parse().unwrap());
         conn.path_params.push(("id", SmallVec::from_slice(b"1")));
-        conn.query_params.insert("q".into(), "test".into());
+        conn.query_params = Some(HashMap::from([("q".into(), "test".into())]));
         conn.remote_addr = Some("1.2.3.4:80".parse().unwrap());
 
         conn.reset(Method::GET, Uri::from_static("/new"));
@@ -316,7 +332,7 @@ mod tests {
         assert_eq!(conn.uri, "/new");
         assert!(conn.headers.is_empty());
         assert!(conn.path_params.is_empty());
-        assert!(conn.query_params.is_empty());
+        assert!(conn.query_params.as_ref().map_or(true, |qp| qp.is_empty()));
         assert!(conn.remote_addr.is_none());
         assert!(conn.body.is_empty());
         assert_eq!(conn.status, StatusCode::OK);

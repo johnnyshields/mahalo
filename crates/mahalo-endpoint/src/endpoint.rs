@@ -131,8 +131,12 @@ impl MahaloEndpoint {
             async move {
                 tracing::info!("Mahalo endpoint listening on {}", addr);
 
+                // Spawn workers on OS threads (they run the io_uring event loops).
+                // We do NOT join them — instead we park this async task with pending(),
+                // which keeps the supervisor child alive. The supervisor can shut us down
+                // via the oneshot shutdown signal (handled by tokio::select in start_child).
                 #[cfg(target_os = "linux")]
-                let result = crate::worker::start_uring_server(
+                let spawn_result = crate::worker::spawn_uring_workers(
                     addr,
                     router,
                     error_handler,
@@ -143,7 +147,7 @@ impl MahaloEndpoint {
                 );
 
                 #[cfg(not(target_os = "linux"))]
-                let result = crate::tcp_server::start_tcp_server(
+                let spawn_result = crate::tcp_server::start_tcp_server(
                     addr,
                     router,
                     error_handler,
@@ -151,10 +155,16 @@ impl MahaloEndpoint {
                     runtime,
                     DEFAULT_BODY_LIMIT,
                     ws_config,
-                );
+                )
+                .await
+                .map(|_| ());
 
-                match result {
-                    Ok(()) => ExitReason::Normal,
+                match spawn_result {
+                    Ok(()) => {
+                        // Workers are running. Park forever — supervisor controls our lifetime.
+                        std::future::pending::<()>().await;
+                        ExitReason::Normal
+                    }
                     Err(e) => ExitReason::Abnormal(format!("endpoint error: {}", e)),
                 }
             }

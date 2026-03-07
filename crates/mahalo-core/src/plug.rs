@@ -7,6 +7,14 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// The core Plug trait -- every middleware is a Plug.
 pub trait Plug: Send + Sync + 'static {
     fn call(&self, conn: Conn) -> BoxFuture<'_, Conn>;
+
+    /// Optional synchronous fast-path. If a plug can execute without async,
+    /// override this to return `Ok(conn)` and avoid the BoxFuture allocation.
+    /// The default returns `Err(conn)` (giving it back), meaning `call()` will be used.
+    #[inline]
+    fn call_sync(&self, conn: Conn) -> Result<Conn, Conn> {
+        Err(conn)
+    }
 }
 
 /// Wrapper to make async functions into Plugs.
@@ -29,6 +37,32 @@ where
     Fut: Future<Output = Conn> + Send + 'static,
 {
     PlugFn(f)
+}
+
+/// Wrapper for synchronous plug functions — avoids BoxFuture heap allocation.
+pub struct SyncPlugFn<F>(pub F);
+
+impl<F> Plug for SyncPlugFn<F>
+where
+    F: Fn(Conn) -> Conn + Send + Sync + 'static,
+{
+    fn call(&self, conn: Conn) -> BoxFuture<'_, Conn> {
+        Box::pin(std::future::ready(self.0(conn)))
+    }
+
+    #[inline]
+    fn call_sync(&self, conn: Conn) -> Result<Conn, Conn> {
+        Ok(self.0(conn))
+    }
+}
+
+/// Create a plug from a synchronous function. Zero-allocation fast path —
+/// avoids BoxFuture heap allocation when used with the optimized pipeline.
+pub fn sync_plug_fn<F>(f: F) -> SyncPlugFn<F>
+where
+    F: Fn(Conn) -> Conn + Send + Sync + 'static,
+{
+    SyncPlugFn(f)
 }
 
 #[cfg(test)]

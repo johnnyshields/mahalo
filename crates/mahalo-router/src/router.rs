@@ -92,9 +92,12 @@ impl<'a> ResolvedRoute<'a> {
             return conn;
         }
 
-        // Run the handler.
+        // Run the handler — try zero-alloc sync path first.
         match self.handler {
-            Handler::Plug(plug) => plug.call(conn).await,
+            Handler::Plug(plug) => match plug.call_sync(conn) {
+                Ok(c) => c,
+                Err(c) => plug.call(c).await,
+            },
             Handler::Controller { controller, action } => {
                 controller.call_action(action, conn).await
             }

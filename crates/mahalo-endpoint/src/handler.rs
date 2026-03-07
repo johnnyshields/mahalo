@@ -62,7 +62,10 @@ pub async fn execute_request(
         if conn.halted {
             break;
         }
-        conn = plug.call(conn).await;
+        conn = match plug.call_sync(conn) {
+            Ok(c) => c,
+            Err(c) => plug.call(c).await,
+        };
     }
     conn
 }

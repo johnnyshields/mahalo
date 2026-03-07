@@ -166,22 +166,28 @@ mod tests {
         assert!(app.channel_router.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn start_creates_supervision_tree() {
         let router = MahaloRouter::new().get(
             "/health",
             plug_fn(|conn: Conn| async { conn.put_status(StatusCode::OK).put_resp_body("ok") }),
         );
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        // Bind to a free port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
 
-        let (supervisor, pubsub, _channel_sup) = MahaloApplication::builder()
+        let (_supervisor, pubsub, _channel_sup) = MahaloApplication::builder()
             .bind(addr)
             .router(router)
             .build()
             .start()
             .await;
 
-        // PubSub should be functional
+        // Give the server a moment to bind.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // PubSub should be functional.
         let mut rx = pubsub.subscribe("test:topic").await.unwrap();
         pubsub.broadcast("test:topic", "hello", serde_json::json!({}));
         let msg = tokio::time::timeout(
@@ -193,6 +199,10 @@ mod tests {
         .expect("recv error");
         assert_eq!(msg.event, "hello");
 
-        supervisor.shutdown();
+        // Verify the HTTP endpoint is serving requests.
+        let base = format!("http://{addr}");
+        let resp = reqwest::get(format!("{base}/health")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "ok");
     }
 }
