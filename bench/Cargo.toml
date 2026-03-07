@@ -15,12 +15,25 @@ path = "src/bin/axum_raw.rs"
 name = "bench-actix"
 path = "src/bin/actix.rs"
 
+[[bin]]
+name = "bench-xitca"
+path = "src/bin/xitca.rs"
+
+[[bin]]
+name = "bench-may-minihttp"
+path = "src/bin/may_minihttp.rs"
+
 [dependencies]
 mahalo = { path = "../crates/mahalo" }
 rebar-core.workspace = true
 tokio.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
 http.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 actix-web = "4"
 mimalloc.workspace = true
+rand.workspace = true
+itoa.workspace = true
+xitca-web = "0.7"
+may_minihttp = "0.1"
