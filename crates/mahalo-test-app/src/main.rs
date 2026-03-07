@@ -14,6 +14,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -402,7 +403,6 @@ impl Controller for OrderController {
 struct OrderChannel {
     store: Store,
     pubsub: PubSub,
-    runtime: Arc<rebar_core::runtime::Runtime>,
 }
 
 #[async_trait]
@@ -433,16 +433,16 @@ impl Channel for OrderChannel {
                 .unwrap_or_else(|| "not_found".to_string())
         };
 
-        // Spawn a rebar process to simulate order status progression
+        // Spawn a local task to simulate order status progression
         if status == "pending" {
             let sim_store = self.store.clone();
             let sim_pubsub = self.pubsub.clone();
             let topic = topic.to_string();
             let sim_order_id = order_id;
-            self.runtime.spawn(move |mut _ctx| async move {
+            monoio::spawn(async move {
                 let statuses = ["preparing", "ready", "delivered"];
                 for next_status in statuses {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    monoio::time::sleep(std::time::Duration::from_secs(3)).await;
                     {
                         let mut orders = sim_store.orders.lock().unwrap();
                         if let Some(order) = orders.iter_mut().find(|o| o.id == sim_order_id) {
@@ -459,7 +459,7 @@ impl Channel for OrderChannel {
                         }),
                     );
                 }
-            }).await;
+            });
         }
 
         Ok(serde_json::json!({
@@ -931,8 +931,7 @@ fn specials_json() -> String {
 // Main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -944,28 +943,24 @@ async fn main() {
     // Start PubSub
     let pubsub = PubSub::start();
 
-    // Set up telemetry
+    // Set up telemetry (thread-local, will be created per-worker via factory)
     let telemetry = Telemetry::new(512);
 
-    telemetry
-        .attach(&["mahalo"], |event| {
-            tracing::debug!(
-                name = ?event.name,
-                measurements = ?event.measurements,
-                "[telemetry] framework event"
-            );
-        })
-        .await;
+    telemetry.attach(&["mahalo"], |event| {
+        tracing::debug!(
+            name = ?event.name,
+            measurements = ?event.measurements,
+            "[telemetry] framework event"
+        );
+    });
 
-    telemetry
-        .attach(&["ice_cream"], |event| {
-            tracing::info!(
-                name = ?event.name,
-                metadata = ?event.metadata,
-                "[telemetry] app event"
-            );
-        })
-        .await;
+    telemetry.attach(&["ice_cream"], |event| {
+        tracing::info!(
+            name = ?event.name,
+            metadata = ?event.metadata,
+            "[telemetry] app event"
+        );
+    });
 
     // Create the store
     let store = Store::new(telemetry.clone());
@@ -976,9 +971,8 @@ async fn main() {
 
     // Static files plug
     let static_dir = format!("{}/static", env!("CARGO_MANIFEST_DIR"));
-    let static_files = StaticFiles::new("/static", static_dir);
 
-    // Build controllers
+    // Build controllers (Arc so they can be shared into factory closures)
     let flavor_controller = Arc::new(FlavorController {
         store: store.clone(),
     });
@@ -987,6 +981,134 @@ async fn main() {
         pubsub: pubsub.clone(),
     });
 
+    let addr: std::net::SocketAddr = "127.0.0.1:4000".parse().unwrap();
+
+    // --- Build endpoint with factory pattern ---
+
+    let endpoint = MahaloEndpoint::new(
+        {
+            let store = store.clone();
+            let tera = tera.clone();
+            let telemetry = telemetry.clone();
+            let flavor_controller = flavor_controller.clone();
+            let order_controller = order_controller.clone();
+            move || {
+                build_router(
+                    store.clone(),
+                    tera.clone(),
+                    telemetry.clone(),
+                    flavor_controller.clone(),
+                    order_controller.clone(),
+                )
+            }
+        },
+        addr,
+    )
+    .channels({
+        let store = store.clone();
+        let pubsub = pubsub.clone();
+        move || {
+            use mahalo::WsConfig;
+            let channel_router = ChannelRouter::new()
+                .channel(
+                    "order:*",
+                    Rc::new(OrderChannel {
+                        store: store.clone(),
+                        pubsub: pubsub.clone(),
+                    }),
+                )
+                .channel("store:lobby", Rc::new(StoreChannel { store: store.clone() }))
+                .channel("support:*", Rc::new(SupportChannel));
+            WsConfig {
+                channel_router: Rc::new(channel_router),
+                pubsub: pubsub.clone(),
+            }
+        }
+    })
+    .error_handler(|status: StatusCode, conn: Conn| {
+        conn.put_status(status)
+            .put_resp_header("content-type", "text/html; charset=utf-8")
+            .put_resp_body(format!(
+                r#"<!DOCTYPE html><html><head><title>{code} - Mahalo Ice Cream</title>
+<link rel="stylesheet" href="/static/css/style.css"></head>
+<body><nav class="nav"><div class="nav-content"><a href="/" class="nav-logo">🍦 Mahalo Ice Cream</a>
+<div class="nav-links"><a href="/">🏠 Home</a><a href="/menu">📋 Menu</a><a href="/order">🛒 Order</a><a href="/about">🌺 About</a></div></div></nav>
+<div class="container" style="text-align:center;padding:4rem 1rem">
+<h1>🏝️ {code}</h1><p>Oops! We couldn't find what you're looking for. 😅</p>
+<a href="/" class="btn">🏠 Back to Home</a></div>
+<footer class="footer"><p>🌴 &copy; 2024 Mahalo Ice Cream Store 🌴</p></footer></body></html>"#,
+                code = status.as_u16()
+            ))
+    })
+    .after({
+        let static_dir = static_dir.clone();
+        move || Box::new(StaticFiles::new("/static", static_dir.clone())) as Box<dyn mahalo::Plug>
+    });
+
+    // Background task: fluctuate prices every 15 seconds for real-time demo
+    let price_store = store.clone();
+    let price_pubsub = pubsub.clone();
+    let startup_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    std::thread::spawn(move || {
+        let mut tick = 0u64;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            tick += 1;
+
+            let update = {
+                let mut flavors = price_store.flavors.lock().unwrap();
+                // Pick a flavor to update based on tick
+                let idx = (tick as usize) % flavors.len();
+                let flavor = &mut flavors[idx];
+
+                // Fluctuate price by -25 to +25 cents (seed adds per-session variance)
+                let delta = ((tick * 7 + idx as u64 * 13 + startup_seed) % 51) as i64 - 25;
+                let new_price = (flavor.price_cents as i64 + delta).max(200) as u64;
+                flavor.price_cents = new_price;
+
+                (flavor.id, flavor.name.clone(), new_price)
+            };
+
+            let price_str = format_price(update.2);
+            tracing::info!(
+                flavor = %update.1,
+                new_price = %price_str,
+                "💰 Price updated!"
+            );
+
+            price_pubsub.broadcast(
+                "store:lobby",
+                "price_updated",
+                serde_json::json!({
+                    "flavor_id": update.0,
+                    "price": price_str,
+                    "flavor_name": update.1,
+                }),
+            );
+        }
+    });
+
+    tracing::info!("🍦 Starting Mahalo Ice Cream Store on http://{addr}");
+    tracing::info!("🔌 WebSocket available at ws://{addr}/ws");
+    tracing::info!("💬 Support chat on the About page!");
+    tracing::info!("💰 Prices update in real-time every 15s!");
+    tracing::info!("🌐 Try: curl http://{addr}/api/menu");
+
+    if let Err(e) = endpoint.start() {
+        tracing::error!("Server error: {e}");
+    }
+}
+
+fn build_router(
+    store: Store,
+    tera: Arc<Tera>,
+    telemetry: Telemetry,
+    flavor_controller: Arc<FlavorController>,
+    order_controller: Arc<OrderController>,
+) -> MahaloRouter {
     // --- Pipelines ---
 
     let browser_pipeline = Pipeline::new("browser").plug(plug_fn(|conn: Conn| async {
@@ -1019,7 +1141,7 @@ async fn main() {
 
     // --- Router ---
 
-    let router = MahaloRouter::new()
+    MahaloRouter::new()
         .pipeline(browser_pipeline)
         .pipeline(api_pipeline)
         .pipeline(auth_pipeline)
@@ -1157,102 +1279,7 @@ async fn main() {
         // Orders scope - auth-protected
         .scope("/api", &["api", "auth"], |s| {
             s.resources("/orders", order_controller);
-        });
-
-    // --- Runtime & Channel Router ---
-
-    let runtime = Arc::new(rebar_core::runtime::Runtime::new(4));
-
-    let channel_router = ChannelRouter::new()
-        .channel(
-            "order:*",
-            Arc::new(OrderChannel {
-                store: store.clone(),
-                pubsub: pubsub.clone(),
-                runtime: runtime.clone(),
-            }),
-        )
-        .channel("store:lobby", Arc::new(StoreChannel { store: store.clone() }))
-        .channel("support:*", Arc::new(SupportChannel));
-
-    // --- Start Server ---
-
-    let addr: std::net::SocketAddr = "127.0.0.1:4000".parse().unwrap();
-
-    let endpoint = MahaloEndpoint::new(router, addr, runtime)
-        .channels(channel_router, pubsub.clone())
-        .error_handler(|status: StatusCode, conn: Conn| {
-            conn.put_status(status)
-                .put_resp_header("content-type", "text/html; charset=utf-8")
-                .put_resp_body(format!(
-                    r#"<!DOCTYPE html><html><head><title>{code} - Mahalo Ice Cream</title>
-<link rel="stylesheet" href="/static/css/style.css"></head>
-<body><nav class="nav"><div class="nav-content"><a href="/" class="nav-logo">🍦 Mahalo Ice Cream</a>
-<div class="nav-links"><a href="/">🏠 Home</a><a href="/menu">📋 Menu</a><a href="/order">🛒 Order</a><a href="/about">🌺 About</a></div></div></nav>
-<div class="container" style="text-align:center;padding:4rem 1rem">
-<h1>🏝️ {code}</h1><p>Oops! We couldn't find what you're looking for. 😅</p>
-<a href="/" class="btn">🏠 Back to Home</a></div>
-<footer class="footer"><p>🌴 &copy; 2024 Mahalo Ice Cream Store 🌴</p></footer></body></html>"#,
-                    code = status.as_u16()
-                ))
         })
-        .after(static_files);
-
-    // Background task: fluctuate prices every 15 seconds for real-time demo
-    let price_store = store.clone();
-    let price_pubsub = pubsub.clone();
-    let startup_seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    tokio::spawn(async move {
-        let mut tick = 0u64;
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-            tick += 1;
-
-            let update = {
-                let mut flavors = price_store.flavors.lock().unwrap();
-                // Pick a flavor to update based on tick
-                let idx = (tick as usize) % flavors.len();
-                let flavor = &mut flavors[idx];
-
-                // Fluctuate price by -25 to +25 cents (seed adds per-session variance)
-                let delta = ((tick * 7 + idx as u64 * 13 + startup_seed) % 51) as i64 - 25;
-                let new_price = (flavor.price_cents as i64 + delta).max(200) as u64;
-                flavor.price_cents = new_price;
-
-                (flavor.id, flavor.name.clone(), new_price)
-            };
-
-            let price_str = format_price(update.2);
-            tracing::info!(
-                flavor = %update.1,
-                new_price = %price_str,
-                "💰 Price updated!"
-            );
-
-            price_pubsub.broadcast(
-                "store:lobby",
-                "price_updated",
-                serde_json::json!({
-                    "flavor_id": update.0,
-                    "price": price_str,
-                    "flavor_name": update.1,
-                }),
-            );
-        }
-    });
-
-    tracing::info!("🍦 Starting Mahalo Ice Cream Store on http://{addr}");
-    tracing::info!("🔌 WebSocket available at ws://{addr}/ws");
-    tracing::info!("💬 Support chat on the About page!");
-    tracing::info!("💰 Prices update in real-time every 15s!");
-    tracing::info!("🌐 Try: curl http://{addr}/api/menu");
-
-    if let Err(e) = endpoint.start().await {
-        tracing::error!("Server error: {e}");
-    }
 }
 
 /// Simple pseudo-random ID generator (no external dep needed).

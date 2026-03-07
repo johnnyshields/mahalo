@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use rebar_core::process::ExitReason;
 use rebar_core::runtime::Runtime;
@@ -18,9 +19,9 @@ pub struct ChannelSupervisor {
 
 impl ChannelSupervisor {
     /// Start a ChannelSupervisor under the given runtime.
-    pub async fn start(runtime: Arc<Runtime>) -> Self {
+    pub fn start(runtime: &Runtime) -> Self {
         let spec = SupervisorSpec::new(RestartStrategy::OneForOne);
-        let handle = start_supervisor(runtime, spec, vec![]).await;
+        let handle = start_supervisor(runtime, spec, vec![]);
         Self { handle }
     }
 
@@ -37,34 +38,26 @@ impl ChannelSupervisor {
     /// The returned `ChannelSupervisor` handle is usable immediately — it is
     /// backed by a channel that the spawned supervisor will consume when its
     /// `ChildEntry` factory is called.
-    pub fn child_entry(runtime: Arc<Runtime>) -> (ChannelSupervisorHandle, ChildEntry) {
-        use std::sync::Mutex;
-
-        // We pre-create the supervisor so the handle is usable before the
-        // ChildEntry factory runs.
-        //
-        // The ChildEntry factory simply waits until the supervisor exits, which
-        // will happen when the runtime shuts down.
-        let runtime_clone = Arc::clone(&runtime);
-        let handle_cell: Arc<Mutex<Option<SupervisorHandle>>> = Arc::new(Mutex::new(None));
-        let handle_cell_factory = Arc::clone(&handle_cell);
+    pub fn child_entry(runtime: &Runtime) -> (ChannelSupervisorHandle, ChildEntry) {
+        // Pre-create the supervisor synchronously so the handle is usable immediately.
+        let spec = SupervisorSpec::new(RestartStrategy::OneForOne);
+        let handle = start_supervisor(runtime, spec, vec![]);
+        let handle_cell: Rc<RefCell<Option<SupervisorHandle>>> = Rc::new(RefCell::new(None));
+        // Store handle immediately — no need to wait for factory.
+        *handle_cell.borrow_mut() = Some(handle);
+        let handle_cell_factory = Rc::clone(&handle_cell);
 
         let entry = ChildEntry::new(
             ChildSpec::new("mahalo_channel_supervisor").restart(RestartType::Permanent),
             move || {
-                let runtime = Arc::clone(&runtime_clone);
-                let handle_cell = Arc::clone(&handle_cell_factory);
+                let _handle_cell = Rc::clone(&handle_cell_factory);
                 async move {
-                    let spec = SupervisorSpec::new(RestartStrategy::OneForOne);
-                    let handle = start_supervisor(Arc::clone(&runtime), spec, vec![]).await;
-                    // Store handle so outer code can use it.
-                    *handle_cell.lock().unwrap() = Some(handle);
 
                     // Keep this child alive until the runtime is dropped.
                     // The supervisor runs independently; this just keeps the
                     // ChildEntry alive to signal the parent supervisor.
                     loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        monoio::time::sleep(std::time::Duration::from_secs(60)).await;
                     }
                     #[allow(unreachable_code)]
                     ExitReason::Normal
@@ -90,7 +83,7 @@ impl ChannelSupervisor {
 /// populated once the `ChildEntry` factory runs.
 #[derive(Clone)]
 pub struct ChannelSupervisorHandle {
-    handle_cell: Arc<std::sync::Mutex<Option<SupervisorHandle>>>,
+    handle_cell: Rc<RefCell<Option<SupervisorHandle>>>,
 }
 
 impl ChannelSupervisorHandle {
@@ -98,8 +91,7 @@ impl ChannelSupervisorHandle {
     pub async fn add_connection(&self, entry: ChildEntry) -> Result<(), SupervisorError> {
         let handle = self
             .handle_cell
-            .lock()
-            .unwrap()
+            .borrow()
             .clone()
             .ok_or(SupervisorError::Gone)?;
         handle.add_child(entry).await.map(|_| ())
@@ -110,23 +102,17 @@ impl ChannelSupervisorHandle {
 ///
 /// The entry wraps the connection's read-loop and GenServer startup, and
 /// returns `ExitReason::Normal` when the client disconnects.
-///
-/// `factory` only needs `Send`, not `Sync` — `WebSocket` and other connection
-/// types are typically `!Sync`. The `Arc<Mutex<Option<F>>>` wrapper makes the
-/// outer closure satisfy the `Sync` bound required by `ChildEntry`.
 pub fn connection_child_entry(
-    factory: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ExitReason> + Send>>
-        + Send
+    factory: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ExitReason>>>
         + 'static,
 ) -> ChildEntry {
-    let factory = Arc::new(std::sync::Mutex::new(Some(factory)));
+    let factory = Rc::new(RefCell::new(Some(factory)));
     ChildEntry::new(
         ChildSpec::new("conn").restart(RestartType::Temporary),
         move || {
-            let factory = Arc::clone(&factory);
+            let factory = Rc::clone(&factory);
             let f = factory
-                .lock()
-                .unwrap()
+                .borrow_mut()
                 .take()
                 .expect("connection factory called twice");
             f()
@@ -138,36 +124,36 @@ pub fn connection_child_entry(
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn channel_supervisor_starts() {
-        let runtime = Arc::new(Runtime::new(1));
-        let supervisor = ChannelSupervisor::start(Arc::clone(&runtime)).await;
+        let runtime = Runtime::new(1);
+        let supervisor = ChannelSupervisor::start(&runtime);
         supervisor.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn channel_supervisor_add_connection_runs_factory() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let runtime = Arc::new(Runtime::new(1));
-        let supervisor = ChannelSupervisor::start(Arc::clone(&runtime)).await;
+        use std::cell::Cell;
+        let runtime = Runtime::new(1);
+        let supervisor = ChannelSupervisor::start(&runtime);
 
-        let ran = Arc::new(AtomicBool::new(false));
-        let ran_clone = Arc::clone(&ran);
+        let ran = Rc::new(Cell::new(false));
+        let ran_clone = Rc::clone(&ran);
 
         let entry = ChildEntry::new(
             ChildSpec::new("test_conn").restart(RestartType::Temporary),
             move || {
-                let ran = Arc::clone(&ran_clone);
+                let ran = Rc::clone(&ran_clone);
                 async move {
-                    ran.store(true, Ordering::SeqCst);
+                    ran.set(true);
                     ExitReason::Normal
                 }
             },
         );
 
         supervisor.add_connection(entry).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(ran.load(Ordering::SeqCst));
+        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(ran.get());
 
         supervisor.shutdown();
     }

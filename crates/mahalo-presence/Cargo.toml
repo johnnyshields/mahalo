@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 rebar-core = { workspace = true }
-tokio = { workspace = true }
+tokio = { version = "1", features = ["full"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

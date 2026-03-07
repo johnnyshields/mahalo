@@ -11,31 +11,24 @@ mahalo-router = { path = "../mahalo-router" }
 mahalo-channel = { path = "../mahalo-channel" }
 mahalo-pubsub = { path = "../mahalo-pubsub" }
 rebar-core = { workspace = true }
-tokio = { workspace = true }
+monoio = { workspace = true }
+local-sync = { workspace = true }
+crossbeam-channel = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 httparse = { workspace = true }
 socket2 = { workspace = true }
-futures = { workspace = true }
 sha1 = { workspace = true }
 base64 = { workspace = true }
+httpdate = { workspace = true }
+itoa = { workspace = true }
 serde_json = { workspace = true }
 rmpv = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-io-uring = { workspace = true }
-nix = { workspace = true }
-libc = { workspace = true }
-itoa = { workspace = true }
-httpdate = { workspace = true }
-
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-tokio-tungstenite = { workspace = true }
-tungstenite = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 serde_json = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
-async-trait = { workspace = true }

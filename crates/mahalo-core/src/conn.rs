@@ -1,7 +1,7 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, Uri};
@@ -10,8 +10,8 @@ use rebar_core::runtime::Runtime;
 use smallvec::SmallVec;
 
 /// Typed key for the assigns map.
-pub trait AssignKey: Send + Sync + 'static {
-    type Value: Send + Sync + 'static;
+pub trait AssignKey: 'static {
+    type Value: 'static;
 }
 
 /// Inline key-value pair for path parameters. Avoids HashMap allocation for
@@ -36,8 +36,8 @@ pub struct Conn {
 
     // State
     pub halted: bool,
-    assigns: Option<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
-    pub runtime: Option<Arc<Runtime>>,
+    assigns: Option<HashMap<TypeId, Box<dyn Any>>>,
+    pub runtime: Option<Rc<Runtime>>,
 }
 
 impl Conn {
@@ -160,7 +160,7 @@ impl Conn {
     }
 
     #[inline]
-    pub fn with_runtime(mut self, runtime: Arc<Runtime>) -> Self {
+    pub fn with_runtime(mut self, runtime: Rc<Runtime>) -> Self {
         self.runtime = Some(runtime);
         self
     }
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn with_runtime() {
-        let runtime = Arc::new(Runtime::new(1));
+        let runtime = Rc::new(Runtime::new(1));
         let conn = Conn::new(Method::GET, Uri::from_static("/"))
             .with_runtime(runtime);
         assert!(conn.runtime.is_some());

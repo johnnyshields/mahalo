@@ -1,9 +1,9 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{broadcast, RwLock};
 use tracing::trace;
 
 // ---------------------------------------------------------------------------
@@ -56,7 +56,7 @@ pub fn event_name(segments: &[&str]) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// A telemetry handler receives events matching its registered prefix.
-type Handler = Arc<dyn Fn(&TelemetryEvent) + Send + Sync>;
+type Handler = Rc<dyn Fn(&TelemetryEvent)>;
 
 struct HandlerEntry {
     /// The event name prefix this handler is attached to.
@@ -70,35 +70,25 @@ struct HandlerEntry {
 
 /// The Telemetry system for Mahalo.
 ///
-/// Uses its own `broadcast` channel (separate from rebar's `EventBus` which
-/// is typed to `LifecycleEvent`) so that application-level telemetry events
-/// can flow independently of runtime lifecycle events.
+/// Handlers are invoked inline when events are emitted via `execute()`.
+/// Single-threaded — designed for use within one event loop.
 ///
-/// `Telemetry` is `Clone + Send + Sync` and can be shared across handlers.
+/// `Telemetry` is `Clone` and can be shared within the same thread.
 #[derive(Clone)]
 pub struct Telemetry {
-    tx: broadcast::Sender<TelemetryEvent>,
-    handlers: Arc<RwLock<Vec<HandlerEntry>>>,
+    handlers: Rc<RefCell<Vec<HandlerEntry>>>,
 }
 
 impl Telemetry {
-    /// Create a new Telemetry instance with the given broadcast channel capacity.
-    pub fn new(capacity: usize) -> Self {
-        let (tx, _) = broadcast::channel(capacity);
+    /// Create a new Telemetry instance.
+    pub fn new(_capacity: usize) -> Self {
         Telemetry {
-            tx,
-            handlers: Arc::new(RwLock::new(Vec::new())),
+            handlers: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
-    /// Subscribe to the raw event stream.
-    pub fn subscribe(&self) -> broadcast::Receiver<TelemetryEvent> {
-        self.tx.subscribe()
-    }
-
-    /// Emit a telemetry event synchronously. Attached handlers are invoked
-    /// inline, and the event is also sent on the broadcast channel.
-    pub async fn execute(
+    /// Emit a telemetry event. Attached handlers are invoked inline.
+    pub fn execute(
         &self,
         event_name: &[&str],
         measurements: HashMap<String, f64>,
@@ -112,31 +102,26 @@ impl Telemetry {
         };
 
         // Invoke matching handlers.
-        {
-            let handlers = self.handlers.read().await;
-            for entry in handlers.iter() {
-                if event_matches(&event.name, &entry.prefix) {
-                    (entry.handler)(&event);
-                }
+        let handlers = self.handlers.borrow();
+        for entry in handlers.iter() {
+            if event_matches(&event.name, &entry.prefix) {
+                (entry.handler)(&event);
             }
         }
-
-        // Broadcast to subscribers (no receivers is normal for telemetry).
-        let _ = self.tx.send(event);
     }
 
     /// Attach a handler that is called for every event whose name starts with
     /// the given prefix.
-    pub async fn attach<F>(&self, event_name: &[&str], handler: F)
+    pub fn attach<F>(&self, event_name: &[&str], handler: F)
     where
-        F: Fn(&TelemetryEvent) + Send + Sync + 'static,
+        F: Fn(&TelemetryEvent) + 'static,
     {
         let prefix: Vec<String> = event_name.iter().map(|s| (*s).to_string()).collect();
         trace!(prefix = ?prefix, "attaching telemetry handler");
-        let mut handlers = self.handlers.write().await;
+        let mut handlers = self.handlers.borrow_mut();
         handlers.push(HandlerEntry {
             prefix,
-            handler: Arc::new(handler),
+            handler: Rc::new(handler),
         });
     }
 
@@ -160,8 +145,7 @@ impl Telemetry {
         stop_name.push("stop");
 
         // Emit start event.
-        self.execute(&start_name, HashMap::new(), metadata.clone())
-            .await;
+        self.execute(&start_name, HashMap::new(), metadata.clone());
 
         let now = Instant::now();
         let result = f().await;
@@ -170,7 +154,7 @@ impl Telemetry {
         // Emit stop event with duration measurement.
         let mut measurements = HashMap::new();
         measurements.insert("duration_ms".to_string(), duration_ms);
-        self.execute(&stop_name, measurements, metadata).await;
+        self.execute(&stop_name, measurements, metadata);
 
         result
     }
@@ -193,82 +177,74 @@ fn event_matches(name: &[String], prefix: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use tokio::time::{timeout, Duration};
+    use std::cell::Cell;
 
-    #[tokio::test]
-    async fn execute_sends_to_broadcast() {
+    #[test]
+    fn execute_invokes_handler() {
         let telemetry = Telemetry::new(64);
-        let mut rx = telemetry.subscribe();
+
+        let called = Rc::new(Cell::new(false));
+        let called_clone = Rc::clone(&called);
+
+        telemetry.attach(ENDPOINT_STOP, move |event| {
+            assert_eq!(event.measurements["duration_ms"], 42.0);
+            called_clone.set(true);
+        });
 
         let mut measurements = HashMap::new();
         measurements.insert("duration_ms".to_string(), 42.0);
 
-        telemetry
-            .execute(ENDPOINT_STOP, measurements, HashMap::new())
-            .await;
+        telemetry.execute(ENDPOINT_STOP, measurements, HashMap::new());
 
-        let event = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("timed out")
-            .expect("recv error");
-
-        assert_eq!(event.name, event_name(ENDPOINT_STOP));
-        assert_eq!(event.measurements["duration_ms"], 42.0);
+        assert!(called.get());
     }
 
-    #[tokio::test]
-    async fn attach_handler_is_called() {
+    #[test]
+    fn attach_handler_is_called() {
         let telemetry = Telemetry::new(64);
 
-        let counter = Arc::new(AtomicU32::new(0));
-        let counter_clone = Arc::clone(&counter);
+        let counter = Rc::new(Cell::new(0u32));
+        let counter_clone = Rc::clone(&counter);
 
-        telemetry
-            .attach(ENDPOINT_STOP, move |_event| {
-                counter_clone.fetch_add(1, Ordering::SeqCst);
-            })
-            .await;
+        telemetry.attach(ENDPOINT_STOP, move |_event| {
+            counter_clone.set(counter_clone.get() + 1);
+        });
 
-        telemetry
-            .execute(ENDPOINT_STOP, HashMap::new(), HashMap::new())
-            .await;
+        telemetry.execute(ENDPOINT_STOP, HashMap::new(), HashMap::new());
 
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(counter.get(), 1);
     }
 
-    #[tokio::test]
-    async fn handler_matches_by_prefix() {
+    #[test]
+    fn handler_matches_by_prefix() {
         let telemetry = Telemetry::new(64);
 
-        let counter = Arc::new(AtomicU32::new(0));
-        let counter_clone = Arc::clone(&counter);
+        let counter = Rc::new(Cell::new(0u32));
+        let counter_clone = Rc::clone(&counter);
 
         // Attach to ["mahalo", "endpoint"] -- should match both start and stop.
-        telemetry
-            .attach(&["mahalo", "endpoint"], move |_event| {
-                counter_clone.fetch_add(1, Ordering::SeqCst);
-            })
-            .await;
+        telemetry.attach(&["mahalo", "endpoint"], move |_event| {
+            counter_clone.set(counter_clone.get() + 1);
+        });
 
-        telemetry
-            .execute(ENDPOINT_START, HashMap::new(), HashMap::new())
-            .await;
-        telemetry
-            .execute(ENDPOINT_STOP, HashMap::new(), HashMap::new())
-            .await;
+        telemetry.execute(ENDPOINT_START, HashMap::new(), HashMap::new());
+        telemetry.execute(ENDPOINT_STOP, HashMap::new(), HashMap::new());
         // This should NOT match.
-        telemetry
-            .execute(ROUTER_DISPATCH, HashMap::new(), HashMap::new())
-            .await;
+        telemetry.execute(ROUTER_DISPATCH, HashMap::new(), HashMap::new());
 
-        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(counter.get(), 2);
     }
 
     #[tokio::test]
     async fn span_emits_start_and_stop_with_duration() {
         let telemetry = Telemetry::new(64);
-        let mut rx = telemetry.subscribe();
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let events_clone = Rc::clone(&events);
+
+        telemetry.attach(&["mahalo", "endpoint"], move |event| {
+            events_clone.borrow_mut().push(event.clone());
+        });
 
         let result = telemetry
             .span(&["mahalo", "endpoint"], HashMap::new(), || async { 42 })
@@ -276,95 +252,73 @@ mod tests {
 
         assert_eq!(result, 42);
 
-        // Should receive start event first.
-        let start = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("timed out")
-            .expect("recv error");
-        assert_eq!(
-            start.name,
-            event_name(&["mahalo", "endpoint", "start"])
-        );
-
-        // Then stop event with duration_ms.
-        let stop = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("timed out")
-            .expect("recv error");
-        assert_eq!(
-            stop.name,
-            event_name(&["mahalo", "endpoint", "stop"])
-        );
-        assert!(stop.measurements.contains_key("duration_ms"));
+        let captured = events.borrow();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].name, event_name(&["mahalo", "endpoint", "start"]));
+        assert_eq!(captured[1].name, event_name(&["mahalo", "endpoint", "stop"]));
+        assert!(captured[1].measurements.contains_key("duration_ms"));
     }
 
-    #[tokio::test]
-    async fn execute_with_no_handlers_does_not_panic() {
+    #[test]
+    fn execute_with_no_handlers_does_not_panic() {
         let telemetry = Telemetry::new(64);
-        telemetry
-            .execute(ENDPOINT_START, HashMap::new(), HashMap::new())
-            .await;
+        telemetry.execute(ENDPOINT_START, HashMap::new(), HashMap::new());
     }
 
-    #[tokio::test]
-    async fn metadata_is_forwarded() {
+    #[test]
+    fn metadata_is_forwarded() {
         let telemetry = Telemetry::new(64);
-        let mut rx = telemetry.subscribe();
+
+        let captured = Rc::new(RefCell::new(None));
+        let captured_clone = Rc::clone(&captured);
+
+        telemetry.attach(ENDPOINT_START, move |event| {
+            *captured_clone.borrow_mut() = Some(event.clone());
+        });
 
         let mut meta = HashMap::new();
         meta.insert("method".to_string(), serde_json::json!("GET"));
         meta.insert("path".to_string(), serde_json::json!("/api/users"));
 
-        telemetry
-            .execute(ENDPOINT_START, HashMap::new(), meta)
-            .await;
+        telemetry.execute(ENDPOINT_START, HashMap::new(), meta);
 
-        let event = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("timed out")
-            .expect("recv error");
-
+        let event = captured.borrow();
+        let event = event.as_ref().unwrap();
         assert_eq!(event.metadata["method"], serde_json::json!("GET"));
         assert_eq!(event.metadata["path"], serde_json::json!("/api/users"));
     }
 
-    #[tokio::test]
-    async fn telemetry_is_clone_send_sync() {
-        fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
-        assert_clone_send_sync::<Telemetry>();
-    }
-
-    #[tokio::test]
-    async fn event_name_helper() {
+    #[test]
+    fn event_name_helper() {
         assert_eq!(
             event_name(ENDPOINT_START),
             vec!["mahalo".to_string(), "endpoint".to_string(), "start".to_string()]
         );
     }
 
-    #[tokio::test]
-    async fn event_has_timestamp() {
+    #[test]
+    fn event_has_timestamp() {
         let telemetry = Telemetry::new(64);
-        let mut rx = telemetry.subscribe();
+
+        let captured = Rc::new(RefCell::new(None));
+        let captured_clone = Rc::clone(&captured);
+
+        telemetry.attach(ENDPOINT_START, move |event| {
+            *captured_clone.borrow_mut() = Some(event.clone());
+        });
 
         let before = now_ms();
-        telemetry
-            .execute(ENDPOINT_START, HashMap::new(), HashMap::new())
-            .await;
+        telemetry.execute(ENDPOINT_START, HashMap::new(), HashMap::new());
 
-        let event = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("timed out")
-            .expect("recv error");
-
+        let event = captured.borrow();
+        let event = event.as_ref().unwrap();
         assert!(event.timestamp >= before);
         assert!(event.timestamp <= now_ms());
     }
 
-    #[tokio::test]
-    async fn telemetry_default() {
-        let telemetry = Telemetry::default();
-        let _rx = telemetry.subscribe();
+    #[test]
+    fn telemetry_default() {
+        let _telemetry = Telemetry::default();
     }
 
     #[test]
@@ -382,8 +336,16 @@ mod tests {
 
     #[tokio::test]
     async fn span_measures_duration() {
+        use tokio::time::Duration;
+
         let telemetry = Telemetry::new(64);
-        let mut rx = telemetry.subscribe();
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let events_clone = Rc::clone(&events);
+
+        telemetry.attach(&["mahalo", "endpoint"], move |event| {
+            events_clone.borrow_mut().push(event.clone());
+        });
 
         telemetry
             .span(&["mahalo", "endpoint"], HashMap::new(), || async {
@@ -391,17 +353,8 @@ mod tests {
             })
             .await;
 
-        // Skip start event.
-        let _ = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("timed out")
-            .expect("recv error");
-
-        let stop = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("timed out")
-            .expect("recv error");
-
+        let captured = events.borrow();
+        let stop = &captured[1];
         let duration = stop.measurements["duration_ms"];
         assert!(duration >= 5.0, "duration_ms should be >= 5ms, got {duration}");
     }

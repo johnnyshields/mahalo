@@ -1,108 +1,166 @@
 use std::net::SocketAddr;
-use std::os::unix::io::AsRawFd;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
-use io_uring::IoUring;
 use mahalo_core::plug::Plug;
 use mahalo_router::MahaloRouter;
 use rebar_core::runtime::Runtime;
 
 use crate::endpoint::{ErrorHandler, WsConfig};
-use crate::uring::{BufferPool, ConnectionPool, run_event_loop};
 
-/// Spawn io_uring worker threads, returning their join handles.
+/// Spawn monoio worker threads without joining them. Returns immediately.
 ///
-/// Each worker gets its own listening socket (SO_REUSEPORT), io_uring instance,
-/// connection pool, buffer pool, and single-threaded tokio runtime.
-fn spawn_workers(
+/// Used by `child_entry` (supervision) where the supervisor manages the lifetime.
+/// Takes Arc-wrapped factories that can be shared across worker threads.
+pub(crate) fn spawn_workers(
     addr: SocketAddr,
-    router: Arc<MahaloRouter>,
-    error_handler: Option<ErrorHandler>,
-    after_plugs: Arc<Vec<Box<dyn Plug>>>,
-    runtime: Arc<Runtime>,
+    router_factory: Arc<dyn Fn() -> MahaloRouter + Send + Sync>,
+    error_handler_factory: Option<Arc<dyn Fn() -> ErrorHandler + Send + Sync>>,
+    after_plug_factories: Arc<Vec<Arc<dyn Fn() -> Box<dyn Plug> + Send + Sync>>>,
     body_limit: usize,
-    ws_config: Option<WsConfig>,
-) -> Result<Vec<JoinHandle<()>>, Box<dyn std::error::Error + Send + Sync>> {
+    ws_config_factory: Option<Arc<dyn Fn() -> WsConfig + Send + Sync>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
 
-    let error_handler = Arc::new(error_handler);
-    let mut handles = Vec::with_capacity(num_workers);
-
     for i in 0..num_workers {
-        let router = Arc::clone(&router);
-        let error_handler = Arc::clone(&error_handler);
-        let after_plugs = Arc::clone(&after_plugs);
-        let runtime = Arc::clone(&runtime);
-        let ws_config = ws_config.clone();
+        let router_factory = Arc::clone(&router_factory);
+        let error_handler_factory = error_handler_factory.clone();
+        let after_plug_factories = Arc::clone(&after_plug_factories);
+        let ws_config_factory = ws_config_factory.clone();
 
-        let handle = std::thread::Builder::new()
-            .name(format!("uring-worker-{i}"))
+        std::thread::Builder::new()
+            .name(format!("monoio-worker-{i}"))
             .spawn(move || {
-                run_worker(i, addr, router, error_handler, after_plugs, runtime, body_limit, ws_config);
+                run_worker_arc(
+                    i, addr,
+                    &*router_factory,
+                    error_handler_factory.as_deref(),
+                    &*after_plug_factories,
+                    body_limit,
+                    ws_config_factory.as_deref(),
+                );
             })?;
-
-        handles.push(handle);
-    }
-
-    Ok(handles)
-}
-
-/// Spawn io_uring worker threads without joining them. Returns immediately.
-///
-/// Used by `child_entry` (supervision) where the supervisor manages the lifetime.
-pub fn spawn_uring_workers(
-    addr: SocketAddr,
-    router: Arc<MahaloRouter>,
-    error_handler: Option<ErrorHandler>,
-    after_plugs: Arc<Vec<Box<dyn Plug>>>,
-    runtime: Arc<Runtime>,
-    body_limit: usize,
-    ws_config: Option<WsConfig>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Detach handles — supervisor manages lifetime.
-    let _handles = spawn_workers(addr, router, error_handler, after_plugs, runtime, body_limit, ws_config)?;
-    Ok(())
-}
-
-/// Start a multi-threaded io_uring HTTP server (blocking).
-///
-/// Spawns workers and joins them. Blocks forever. Used by `MahaloEndpoint::start()`.
-pub fn start_uring_server(
-    addr: SocketAddr,
-    router: Arc<MahaloRouter>,
-    error_handler: Option<ErrorHandler>,
-    after_plugs: Arc<Vec<Box<dyn Plug>>>,
-    runtime: Arc<Runtime>,
-    body_limit: usize,
-    ws_config: Option<WsConfig>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let handles = spawn_workers(addr, router, error_handler, after_plugs, runtime, body_limit, ws_config)?;
-
-    // Wait for all workers (they run forever unless something goes wrong).
-    for handle in handles {
-        handle
-            .join()
-            .map_err(|e| format!("worker thread panicked: {:?}", e))?;
     }
 
     Ok(())
 }
 
-/// Single worker thread body. Runs the io_uring event loop (blocks forever).
+/// Start the HTTP server, blocking until all workers complete.
+///
+/// Uses `std::thread::scope` so factory references can be borrowed across threads.
+/// Used by `MahaloEndpoint::start()`.
+pub(crate) fn start_server(
+    addr: SocketAddr,
+    router_factory: Arc<dyn Fn() -> MahaloRouter + Send + Sync>,
+    error_handler_factory: Option<Arc<dyn Fn() -> ErrorHandler + Send + Sync>>,
+    after_plug_factories: Vec<Arc<dyn Fn() -> Box<dyn Plug> + Send + Sync>>,
+    body_limit: usize,
+    ws_config_factory: Option<Arc<dyn Fn() -> WsConfig + Send + Sync>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(num_workers);
+
+        for i in 0..num_workers {
+            let rf = &*router_factory;
+            let ehf = error_handler_factory.as_deref();
+            let apf = &after_plug_factories;
+            let wcf = ws_config_factory.as_deref();
+
+            let handle = std::thread::Builder::new()
+                .name(format!("monoio-worker-{i}"))
+                .spawn_scoped(scope, move || {
+                    run_worker(i, addr, rf, ehf, apf, body_limit, wcf);
+                })
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::new(e)
+                })?;
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("worker thread panicked: {:?}", e).into()
+                })?;
+        }
+
+        Ok(())
+    })
+}
+
+/// Worker body for Arc-based factories (used by spawn_workers).
+fn run_worker_arc(
+    worker_id: usize,
+    addr: SocketAddr,
+    router_factory: &(dyn Fn() -> MahaloRouter + Send + Sync),
+    error_handler_factory: Option<&(dyn Fn() -> ErrorHandler + Send + Sync)>,
+    after_plug_factories: &[Arc<dyn Fn() -> Box<dyn Plug> + Send + Sync>],
+    body_limit: usize,
+    ws_config_factory: Option<&(dyn Fn() -> WsConfig + Send + Sync)>,
+) {
+    setup_cpu_affinity(worker_id);
+
+    let socket = match crate::handler::bind_socket(addr, true) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("monoio-worker-{worker_id}: bind failed: {e}");
+            return;
+        }
+    };
+
+    let std_listener: std::net::TcpListener = socket.into();
+    std_listener.set_nonblocking(true).expect("set_nonblocking failed");
+
+    let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+        .enable_timer()
+        .build()
+        .expect("failed to build monoio runtime");
+
+    rt.block_on(async {
+        let listener = monoio::net::TcpListener::from_std(std_listener)
+            .expect("failed to create monoio TcpListener from std");
+
+        let runtime = Rc::new(Runtime::new(worker_id as u64 + 1));
+        let router = router_factory();
+        let error_handler = error_handler_factory.map(|f| f());
+        let after_plugs: Vec<Box<dyn Plug>> = after_plug_factories.iter().map(|f| f()).collect();
+        let ws_config = ws_config_factory.map(|f| f());
+
+        crate::server::run_accept_loop(
+            listener, router, error_handler, after_plugs,
+            runtime, body_limit, ws_config,
+        )
+        .await;
+    });
+}
+
+/// Worker body for reference-based factories (used by start_server via scoped threads).
 fn run_worker(
     worker_id: usize,
     addr: SocketAddr,
-    router: Arc<MahaloRouter>,
-    error_handler: Arc<Option<ErrorHandler>>,
-    after_plugs: Arc<Vec<Box<dyn Plug>>>,
-    runtime: Arc<Runtime>,
+    router_factory: &(dyn Fn() -> MahaloRouter + Send + Sync),
+    error_handler_factory: Option<&(dyn Fn() -> ErrorHandler + Send + Sync)>,
+    after_plug_factories: &[Arc<dyn Fn() -> Box<dyn Plug> + Send + Sync>],
     body_limit: usize,
-    ws_config: Option<WsConfig>,
+    ws_config_factory: Option<&(dyn Fn() -> WsConfig + Send + Sync)>,
 ) {
-    // Best-effort CPU affinity pinning.
+    // Same implementation — delegate to shared code.
+    run_worker_arc(
+        worker_id, addr, router_factory, error_handler_factory,
+        after_plug_factories, body_limit, ws_config_factory,
+    );
+}
+
+/// Best-effort CPU affinity pinning (Linux only).
+fn setup_cpu_affinity(worker_id: usize) {
     #[cfg(target_os = "linux")]
     {
         let mut cpuset = nix::sched::CpuSet::new();
@@ -116,77 +174,6 @@ fn run_worker(
             );
         }
     }
-
-    // Create the listening socket with SO_REUSEPORT.
-    let socket = match crate::handler::bind_socket(addr, true) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("uring-worker-{worker_id}: bind failed: {e}");
-            return;
-        }
-    };
-
-    let listen_fd = socket.as_raw_fd();
-
-    // Build io_uring with optimal flags for single-threaded use.
-    let mut ring = match IoUring::builder()
-        .setup_sqpoll(2000)
-        .setup_coop_taskrun()
-        .setup_single_issuer()
-        .build(4096)
-        .or_else(|_| {
-            IoUring::builder()
-                .setup_coop_taskrun()
-                .setup_single_issuer()
-                .build(4096)
-        })
-        .or_else(|_| IoUring::new(4096))
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("uring-worker-{worker_id}: io_uring init failed: {e}");
-            return;
-        }
-    };
-
-    // Per-worker pools.
-    let mut buf_pool = BufferPool::new(4096, 8192);
-    let mut conn_pool = ConnectionPool::new(10_000);
-
-    // Register read buffers with io_uring for zero-copy kernel I/O.
-    let iovecs = buf_pool.iovecs();
-    let bufs_registered = unsafe { ring.submitter().register_buffers(&iovecs) }.is_ok();
-
-    // Per-worker single-threaded tokio runtime for async handlers.
-    let tokio_rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            tracing::error!("uring-worker-{worker_id}: tokio init failed: {e}");
-            return;
-        }
-    };
-
-    let error_handler_ref: &Option<ErrorHandler> = &*error_handler;
-
-    // Run the event loop (blocks forever).
-    run_event_loop(
-        &mut ring,
-        listen_fd,
-        &mut conn_pool,
-        &mut buf_pool,
-        &router,
-        error_handler_ref,
-        &after_plugs,
-        &runtime,
-        body_limit,
-        &tokio_rt,
-        ws_config.as_ref(),
-        bufs_registered,
-    );
-
-    // Keep socket alive so the fd isn't closed during the event loop.
-    drop(socket);
+    #[cfg(not(target_os = "linux"))]
+    let _ = worker_id;
 }

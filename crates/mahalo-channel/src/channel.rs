@@ -1,4 +1,4 @@
-use async_trait::async_trait;
+use mahalo_core::plug::BoxFuture;
 use serde_json::Value;
 
 use crate::socket::ChannelSocket;
@@ -54,52 +54,61 @@ pub enum ShouldStop {
     No,
 }
 
-#[async_trait]
-pub trait Channel: Send + Sync + 'static {
+pub trait Channel: 'static {
     /// Called when a client joins a topic.
-    async fn join(
-        &self,
-        topic: &str,
-        payload: &Value,
-        socket: &mut ChannelSocket,
-    ) -> Result<Value, ChannelError>;
+    fn join<'a>(
+        &'a self,
+        topic: &'a str,
+        payload: &'a Value,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, Result<Value, ChannelError>>;
 
     /// Called when a client pushes an event.
-    async fn handle_in(
-        &self,
-        event: &str,
-        payload: &Value,
-        socket: &mut ChannelSocket,
-    ) -> Result<Option<Reply>, ChannelError>;
+    fn handle_in<'a>(
+        &'a self,
+        event: &'a str,
+        payload: &'a Value,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, Result<Option<Reply>, ChannelError>>;
 
     /// Called for PubSub messages from other processes.
-    async fn handle_info(
-        &self,
-        msg: &mahalo_pubsub::PubSubMessage,
-        socket: &mut ChannelSocket,
-    ) -> Result<(), ChannelError> {
-        // Default: push to client
-        socket.push(&msg.event, &msg.payload).await;
-        Ok(())
+    fn handle_info<'a>(
+        &'a self,
+        msg: &'a mahalo_pubsub::PubSubMessage,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, Result<(), ChannelError>> {
+        Box::pin(async move {
+            // Default: push to client
+            socket.push(&msg.event, &msg.payload).await;
+            Ok(())
+        })
     }
 
     /// Called after a successful join reply is sent. Use this to schedule
     /// timers, fetch initial state, or subscribe to additional topics.
     ///
     /// Actix equivalent: `Actor::started()`.
-    async fn started(&self, _socket: &mut ChannelSocket) {}
+    fn started<'a>(&'a self, _socket: &'a mut ChannelSocket) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
 
     /// Called before channel cleanup begins. Returning [`ShouldStop::No`]
     /// keeps the channel alive (e.g., to flush pending messages). The default
     /// is [`ShouldStop::Yes`] — proceed with shutdown.
     ///
     /// Actix equivalent: `Actor::stopping()`.
-    async fn stopping(&self, _socket: &mut ChannelSocket) -> ShouldStop {
-        ShouldStop::Yes
+    fn stopping<'a>(&'a self, _socket: &'a mut ChannelSocket) -> BoxFuture<'a, ShouldStop> {
+        Box::pin(async { ShouldStop::Yes })
     }
 
     /// Called when the channel process terminates.
-    async fn terminate(&self, _reason: &str, _socket: &mut ChannelSocket) {}
+    fn terminate<'a>(
+        &'a self,
+        _reason: &'a str,
+        _socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
 }
 
 #[cfg(test)]
@@ -149,34 +158,33 @@ mod tests {
 
     struct MinimalChannel;
 
-    #[async_trait]
     impl Channel for MinimalChannel {
-        async fn join(
-            &self,
-            _topic: &str,
-            _payload: &Value,
-            _socket: &mut ChannelSocket,
-        ) -> Result<Value, ChannelError> {
-            Ok(serde_json::json!({}))
+        fn join<'a>(
+            &'a self,
+            _topic: &'a str,
+            _payload: &'a Value,
+            _socket: &'a mut ChannelSocket,
+        ) -> BoxFuture<'a, Result<Value, ChannelError>> {
+            Box::pin(async { Ok(serde_json::json!({})) })
         }
 
-        async fn handle_in(
-            &self,
-            _event: &str,
-            _payload: &Value,
-            _socket: &mut ChannelSocket,
-        ) -> Result<Option<Reply>, ChannelError> {
-            Ok(None)
+        fn handle_in<'a>(
+            &'a self,
+            _event: &'a str,
+            _payload: &'a Value,
+            _socket: &'a mut ChannelSocket,
+        ) -> BoxFuture<'a, Result<Option<Reply>, ChannelError>> {
+            Box::pin(async { Ok(None) })
         }
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn handle_info_default_pushes_to_client() {
         use mahalo_pubsub::{PubSub, PubSubMessage};
-        use tokio::sync::mpsc;
+        use local_sync::mpsc::unbounded;
 
         let pubsub = PubSub::start();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = unbounded::channel();
         let mut socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
 
         let msg = PubSubMessage {
@@ -196,13 +204,13 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn terminate_default_does_nothing() {
         use mahalo_pubsub::PubSub;
-        use tokio::sync::mpsc;
+        use local_sync::mpsc::unbounded;
 
         let pubsub = PubSub::start();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = unbounded::channel();
         let mut socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
 
         let ch = MinimalChannel;
@@ -212,13 +220,13 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn started_default_does_nothing() {
         use mahalo_pubsub::PubSub;
-        use tokio::sync::mpsc;
+        use local_sync::mpsc::unbounded;
 
         let pubsub = PubSub::start();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = unbounded::channel();
         let mut socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
 
         let ch = MinimalChannel;
@@ -228,13 +236,13 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn stopping_default_returns_yes() {
         use mahalo_pubsub::PubSub;
-        use tokio::sync::mpsc;
+        use local_sync::mpsc::unbounded;
 
         let pubsub = PubSub::start();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = unbounded::channel();
         let mut socket = ChannelSocket::new("test:topic".into(), tx, pubsub.clone());
 
         let ch = MinimalChannel;

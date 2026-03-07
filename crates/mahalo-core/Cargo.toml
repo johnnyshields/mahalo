@@ -7,13 +7,12 @@ description = "Core abstractions for Mahalo: Conn, Plug, Pipeline, Controller"
 
 [dependencies]
 rebar-core = { workspace = true }
-tokio = { workspace = true }
+monoio = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-async-trait = { workspace = true }
 percent-encoding = "2"
 smallvec = { workspace = true }
 

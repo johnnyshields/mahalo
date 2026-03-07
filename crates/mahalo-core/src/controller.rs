@@ -3,7 +3,7 @@ use crate::plug::BoxFuture;
 use http::StatusCode;
 
 /// RESTful controller trait with default 404 implementations for each action.
-pub trait Controller: Send + Sync + 'static {
+pub trait Controller: 'static {
     fn index(&self, conn: Conn) -> BoxFuture<'_, Conn> {
         Box::pin(async { conn.put_status(StatusCode::NOT_FOUND) })
     }
@@ -52,7 +52,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn overridden_action() {
         let ctrl = TestController;
         let conn = Conn::new(Method::GET, Uri::from_static("/"));
@@ -61,7 +61,7 @@ mod tests {
         assert_eq!(conn.resp_body, "index response");
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn default_action_returns_404() {
         let ctrl = TestController;
         let conn = Conn::new(Method::GET, Uri::from_static("/"));
@@ -69,7 +69,7 @@ mod tests {
         assert_eq!(conn.status, StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn unknown_action_returns_404() {
         let ctrl = TestController;
         let conn = Conn::new(Method::GET, Uri::from_static("/"));
@@ -77,7 +77,7 @@ mod tests {
         assert_eq!(conn.status, StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn default_create_returns_404() {
         let ctrl = TestController;
         let conn = Conn::new(Method::POST, Uri::from_static("/"));
@@ -85,7 +85,7 @@ mod tests {
         assert_eq!(conn.status, StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn default_update_returns_404() {
         let ctrl = TestController;
         let conn = Conn::new(Method::PUT, Uri::from_static("/"));
@@ -93,7 +93,7 @@ mod tests {
         assert_eq!(conn.status, StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn default_delete_returns_404() {
         let ctrl = TestController;
         let conn = Conn::new(Method::DELETE, Uri::from_static("/"));

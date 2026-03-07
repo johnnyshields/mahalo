@@ -14,7 +14,6 @@ use mahalo_bench::shared::{
     Fortune, User, World, fortune_rows, parse_count, render_fortunes_html, users_db, world_rows,
 };
 use rand::Rng;
-use rebar_core::runtime::Runtime;
 
 // ── Pre-validated header values ─────────────────────────────────────
 static CT_TEXT: HeaderValue = HeaderValue::from_static("text/plain");
@@ -22,22 +21,44 @@ static CT_JSON: HeaderValue = HeaderValue::from_static("application/json");
 static CT_HTML: HeaderValue = HeaderValue::from_static("text/html; charset=utf-8");
 static SRV: HeaderValue = HeaderValue::from_static("mahalo");
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
-    let runtime = Arc::new(Runtime::new(1));
-
-    // Pre-populate in-memory data
+    // Pre-populate in-memory data (Send + Sync, shared across factories)
     let worlds: Arc<Vec<World>> = Arc::new(world_rows());
     let fortunes: Arc<Vec<Fortune>> = Arc::new(fortune_rows());
     let users: Arc<Vec<User>> = Arc::new(users_db());
 
-    // ── Pipelines ───────────────────────────────────────────────────
-    let (log_start, log_finish) = request_logger();
+    let addr: SocketAddr = ([0, 0, 0, 0], port).into();
+    eprintln!("Mahalo listening on {addr}");
+
+    let endpoint = MahaloEndpoint::new(
+        {
+            let worlds = worlds.clone();
+            let fortunes = fortunes.clone();
+            let users = users.clone();
+            move || build_router(worlds.clone(), fortunes.clone(), users.clone())
+        },
+        addr,
+    )
+    .after(|| Box::new(ETag::new()))
+    .after(|| {
+        let (_start, finish) = request_logger();
+        Box::new(finish)
+    });
+
+    endpoint.start().unwrap();
+}
+
+fn build_router(
+    worlds: Arc<Vec<World>>,
+    fortunes: Arc<Vec<Fortune>>,
+    users: Arc<Vec<User>>,
+) -> MahaloRouter {
+    let (log_start, _log_finish) = request_logger();
 
     // "bare" pipeline — zero middleware, raw speed
     let bare = Pipeline::new("bare");
@@ -58,7 +79,7 @@ async fn main() {
             conn.put_resp_header_static(SERVER, SRV.clone())
         }));
 
-    let router = MahaloRouter::new()
+    MahaloRouter::new()
         .pipeline(bare)
         .pipeline(api)
         .pipeline(browser)
@@ -250,13 +271,5 @@ async fn main() {
                     http::header::LOCATION,
                     HeaderValue::from_static("/plaintext"),
                 )
-        }));
-
-    let addr: SocketAddr = ([0, 0, 0, 0], port).into();
-    eprintln!("Mahalo listening on {addr}");
-
-    let endpoint = MahaloEndpoint::new(router, addr, runtime)
-        .after(ETag::new())
-        .after(log_finish);
-    endpoint.start().await.unwrap();
+        }))
 }

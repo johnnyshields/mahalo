@@ -1,5 +1,6 @@
+use std::cell::OnceCell;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::rc::Rc;
 
 use http::Method;
 use mahalo_core::conn::{Conn, PathParams};
@@ -14,7 +15,7 @@ enum Handler {
     Plug(Box<dyn Plug>),
     /// A controller + action name (for resourceful routes).
     Controller {
-        controller: Arc<dyn Controller>,
+        controller: Rc<dyn Controller>,
         action: String,
     },
 }
@@ -201,7 +202,7 @@ impl ScopeBuilder {
     ///   POST   /path       -> create
     ///   PUT    /path/:id   -> update
     ///   DELETE /path/:id   -> delete
-    pub fn resources(&mut self, path: &str, controller: Arc<dyn Controller>) {
+    pub fn resources(&mut self, path: &str, controller: Rc<dyn Controller>) {
         let base = path;
         let with_id = format!("{}/:id", path);
         let prefix = path.trim_start_matches('/');
@@ -211,7 +212,7 @@ impl ScopeBuilder {
             base,
             &format!("{}_index", prefix),
             Handler::Controller {
-                controller: Arc::clone(&controller),
+                controller: Rc::clone(&controller),
                 action: "index".to_string(),
             },
         );
@@ -220,7 +221,7 @@ impl ScopeBuilder {
             &with_id,
             &format!("{}_show", prefix),
             Handler::Controller {
-                controller: Arc::clone(&controller),
+                controller: Rc::clone(&controller),
                 action: "show".to_string(),
             },
         );
@@ -229,7 +230,7 @@ impl ScopeBuilder {
             base,
             &format!("{}_create", prefix),
             Handler::Controller {
-                controller: Arc::clone(&controller),
+                controller: Rc::clone(&controller),
                 action: "create".to_string(),
             },
         );
@@ -238,7 +239,7 @@ impl ScopeBuilder {
             &with_id,
             &format!("{}_update", prefix),
             Handler::Controller {
-                controller: Arc::clone(&controller),
+                controller: Rc::clone(&controller),
                 action: "update".to_string(),
             },
         );
@@ -247,7 +248,7 @@ impl ScopeBuilder {
             &with_id,
             &format!("{}_delete", prefix),
             Handler::Controller {
-                controller: Arc::clone(&controller),
+                controller: Rc::clone(&controller),
                 action: "delete".to_string(),
             },
         );
@@ -261,7 +262,7 @@ pub struct MahaloRouter {
     routes: Vec<Route>,
     name_index: HashMap<String, usize>,
     /// Lazily compiled matchit routers, one per HTTP method.
-    compiled: OnceLock<CompiledRouters>,
+    compiled: OnceCell<CompiledRouters>,
 }
 
 impl MahaloRouter {
@@ -270,7 +271,7 @@ impl MahaloRouter {
             pipelines: HashMap::new(),
             routes: Vec::new(),
             name_index: HashMap::new(),
-            compiled: OnceLock::new(),
+            compiled: OnceCell::new(),
         }
     }
 
@@ -677,7 +678,7 @@ mod tests {
     fn resolve_scoped_resources() {
         let router = MahaloRouter::new()
             .scope("/api", &[], |s| {
-                s.resources("/rooms", Arc::new(TestController));
+                s.resources("/rooms", Rc::new(TestController));
             });
 
         // GET /api/rooms -> index
@@ -720,11 +721,11 @@ mod tests {
         assert_eq!(resolved.pipelines[0].name, "api");
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn execute_resolved_route() {
         let router = MahaloRouter::new()
             .scope("/api", &[], |s| {
-                s.resources("/rooms", Arc::new(TestController));
+                s.resources("/rooms", Rc::new(TestController));
             });
 
         let resolved = router.resolve(&Method::GET, "/api/rooms").unwrap();
@@ -734,11 +735,11 @@ mod tests {
         assert_eq!(conn.resp_body, "index");
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn execute_with_path_params() {
         let router = MahaloRouter::new()
             .scope("/api", &[], |s| {
-                s.resources("/rooms", Arc::new(TestController));
+                s.resources("/rooms", Rc::new(TestController));
             });
 
         let resolved = router.resolve(&Method::GET, "/api/rooms/99").unwrap();
@@ -749,7 +750,7 @@ mod tests {
         assert_eq!(conn.path_param("id").unwrap(), "99");
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn execute_with_pipeline() {
         use mahalo_core::conn::AssignKey;
 
@@ -832,7 +833,7 @@ mod tests {
         assert!(router.resolve(&Method::DELETE, "/api/items/1").is_some());
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn pipeline_halt_skips_handler() {
         let auth_pipeline = Pipeline::new("auth").plug(plug_fn(|conn: Conn| async {
             conn.put_status(StatusCode::UNAUTHORIZED).halt()
@@ -889,7 +890,7 @@ mod tests {
     fn resources_auto_naming() {
         let router = MahaloRouter::new()
             .scope("/api", &[], |s| {
-                s.resources("/rooms", Arc::new(TestController));
+                s.resources("/rooms", Rc::new(TestController));
             });
 
         assert!(router.path_for("rooms_index", &[]).is_some());

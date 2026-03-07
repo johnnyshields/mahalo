@@ -8,11 +8,10 @@ description = "Declarative routing with scoped pipelines for Mahalo"
 [dependencies]
 mahalo-core = { path = "../mahalo-core" }
 rebar-core = { workspace = true }
-tokio = { workspace = true }
+monoio = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
-async-trait = { workspace = true }
 matchit = { workspace = true }
 smallvec = { workspace = true }
 

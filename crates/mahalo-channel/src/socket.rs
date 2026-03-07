@@ -1,19 +1,16 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
-use axum::extract::ws::{Message as WsMessage, WebSocket};
-use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{mpsc, Notify};
 
 /// The type carried over the internal channel from ChannelSocket → WebSocket sink.
-/// Decoupled from any specific WebSocket library (axum, tungstenite, etc.).
+/// Decoupled from any specific WebSocket library.
 pub type WsSendItem = String;
 
-use async_trait::async_trait;
+use local_sync::mpsc::unbounded;
 use rebar_core::gen_server::{self, CastReply, CallReply, GenServer, GenServerContext, InfoReply, From as GsFrom};
 use rebar_core::process::ProcessId;
 use rebar_core::runtime::Runtime;
@@ -47,12 +44,12 @@ pub struct PhoenixMessage {
 #[derive(Clone)]
 pub struct ChannelAddr {
     pid: ProcessId,
-    runtime: Arc<Runtime>,
+    runtime: Rc<Runtime>,
 }
 
 impl ChannelAddr {
     /// Send a synthetic event to the channel as if it came from a PubSub message.
-    pub async fn send_event(&self, topic: &str, event: &str, payload: Value) {
+    pub fn send_event(&self, topic: &str, event: &str, payload: Value) {
         let msg = PhoenixMessage {
             topic: topic.to_string(),
             event: event.to_string(),
@@ -61,7 +58,7 @@ impl ChannelAddr {
         };
         if let Ok(json) = serde_json::to_string(&msg) {
             let cast_val = rmpv::Value::String(json.into());
-            let _ = gen_server::cast_from_runtime(&self.runtime, self.pid, cast_val).await;
+            let _ = gen_server::cast_from_runtime(&self.runtime, self.pid, cast_val);
         }
     }
 }
@@ -75,16 +72,16 @@ const TIMER_SEP: char = '\0';
 /// State for a single channel connection.
 pub struct ChannelSocket {
     pub topic: String,
-    assigns: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
-    sender: mpsc::UnboundedSender<WsSendItem>,
+    assigns: HashMap<TypeId, Box<dyn Any>>,
+    sender: unbounded::Tx<WsSendItem>,
     pubsub: PubSub,
     /// Set when running inside a GenServer process — enables timer scheduling.
     self_pid: Option<ProcessId>,
-    runtime: Option<Arc<Runtime>>,
+    runtime: Option<Rc<Runtime>>,
 }
 
 impl ChannelSocket {
-    pub fn new(topic: String, sender: mpsc::UnboundedSender<WsSendItem>, pubsub: PubSub) -> Self {
+    pub fn new(topic: String, sender: unbounded::Tx<WsSendItem>, pubsub: PubSub) -> Self {
         Self {
             topic,
             assigns: HashMap::new(),
@@ -98,10 +95,10 @@ impl ChannelSocket {
     /// Create a ChannelSocket with GenServer context for timer scheduling.
     pub fn new_with_pid(
         topic: String,
-        sender: mpsc::UnboundedSender<WsSendItem>,
+        sender: unbounded::Tx<WsSendItem>,
         pubsub: PubSub,
         self_pid: ProcessId,
-        runtime: Arc<Runtime>,
+        runtime: Rc<Runtime>,
     ) -> Self {
         Self {
             topic,
@@ -120,12 +117,12 @@ impl ChannelSocket {
     /// the socket is not backed by a GenServer process.
     pub fn run_later(&self, delay: Duration, event: impl Into<String>) {
         if let (Some(pid), Some(runtime)) = (self.self_pid, &self.runtime) {
-            let runtime = Arc::clone(runtime);
+            let runtime = Rc::clone(runtime);
             let key = format!("{TIMER_PREFIX}{}{TIMER_SEP}{}", self.topic, event.into());
-            tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
+            monoio::spawn(async move {
+                monoio::time::sleep(delay).await;
                 let msg = rmpv::Value::String(rmpv::Utf8String::from(key));
-                let _ = runtime.send(pid, msg).await;
+                let _ = runtime.send(pid, msg);
             });
         }
     }
@@ -137,13 +134,13 @@ impl ChannelSocket {
     /// the socket is not backed by a GenServer process.
     pub fn run_interval(&self, interval: Duration, event: impl Into<String>) {
         if let (Some(pid), Some(runtime)) = (self.self_pid, &self.runtime) {
-            let runtime = Arc::clone(runtime);
+            let runtime = Rc::clone(runtime);
             let key = format!("{TIMER_PREFIX}{}{TIMER_SEP}{}", self.topic, event.into());
-            tokio::spawn(async move {
+            monoio::spawn(async move {
                 loop {
-                    tokio::time::sleep(interval).await;
+                    monoio::time::sleep(interval).await;
                     let msg = rmpv::Value::String(rmpv::Utf8String::from(key.clone()));
-                    if runtime.send(pid, msg).await.is_err() {
+                    if runtime.send(pid, msg).is_err() {
                         break;
                     }
                 }
@@ -158,7 +155,7 @@ impl ChannelSocket {
         match (self.self_pid, &self.runtime) {
             (Some(pid), Some(runtime)) => Some(ChannelAddr {
                 pid,
-                runtime: Arc::clone(runtime),
+                runtime: Rc::clone(runtime),
             }),
             _ => None,
         }
@@ -215,7 +212,7 @@ impl ChannelSocket {
 
 /// Channel router mapping topic patterns to channel implementations.
 pub struct ChannelRouter {
-    routes: Vec<(String, Arc<dyn Channel>)>,
+    routes: Vec<(String, Rc<dyn Channel>)>,
 }
 
 impl ChannelRouter {
@@ -224,13 +221,13 @@ impl ChannelRouter {
     }
 
     /// Register a channel for a topic pattern (e.g., "room:*").
-    pub fn channel(mut self, topic_pattern: &str, handler: Arc<dyn Channel>) -> Self {
+    pub fn channel(mut self, topic_pattern: &str, handler: Rc<dyn Channel>) -> Self {
         self.routes.push((topic_pattern.to_string(), handler));
         self
     }
 
     /// Find a channel matching the given topic.
-    pub fn find(&self, topic: &str) -> Option<&Arc<dyn Channel>> {
+    pub fn find(&self, topic: &str) -> Option<&Rc<dyn Channel>> {
         for (pattern, channel) in &self.routes {
             if topic_matches(pattern, topic) {
                 return Some(channel);
@@ -259,19 +256,19 @@ fn topic_matches(pattern: &str, topic: &str) -> bool {
 /// call channel.join, subscribe to PubSub (forwarding to GenServer mailbox).
 async fn handle_join(
     phoenix_msg: &PhoenixMessage,
-    channel: &Arc<dyn Channel>,
-    tx: &mpsc::UnboundedSender<WsSendItem>,
+    channel: &Rc<dyn Channel>,
+    tx: &unbounded::Tx<WsSendItem>,
     pubsub: &PubSub,
-    joined_channels: &mut HashMap<String, (Arc<dyn Channel>, ChannelSocket)>,
+    joined_channels: &mut HashMap<String, (Rc<dyn Channel>, ChannelSocket)>,
     self_pid: ProcessId,
-    runtime: &Arc<Runtime>,
+    runtime: &Rc<Runtime>,
 ) {
     let mut socket = ChannelSocket::new_with_pid(
         phoenix_msg.topic.clone(),
         tx.clone(),
         pubsub.clone(),
         self_pid,
-        Arc::clone(runtime),
+        Rc::clone(runtime),
     );
     match channel
         .join(&phoenix_msg.topic, &phoenix_msg.payload, &mut socket)
@@ -287,16 +284,24 @@ async fn handle_join(
             channel.started(&mut socket).await;
 
             // Subscribe to PubSub and spawn forwarder that sends to GenServer mailbox
-            if let Some(mut pubsub_rx) = pubsub.subscribe(&phoenix_msg.topic).await {
-                let runtime = Arc::clone(runtime);
+            if let Some(pubsub_rx) = pubsub.subscribe(&phoenix_msg.topic) {
+                let runtime = Rc::clone(runtime);
                 let pid = self_pid;
-                tokio::spawn(async move {
-                    while let Ok(pubsub_msg) = pubsub_rx.recv().await {
-                        if let Ok(json) = serde_json::to_string(&pubsub_msg) {
-                            let msg = rmpv::Value::String(rmpv::Utf8String::from(json));
-                            if runtime.send(pid, msg).await.is_err() {
-                                break;
+                monoio::spawn(async move {
+                    loop {
+                        match pubsub_rx.try_recv() {
+                            Ok(pubsub_msg) => {
+                                if let Ok(json) = serde_json::to_string(&pubsub_msg) {
+                                    let msg = rmpv::Value::String(rmpv::Utf8String::from(json));
+                                    if runtime.send(pid, msg).is_err() {
+                                        break;
+                                    }
+                                }
                             }
+                            Err(crossbeam_channel::TryRecvError::Empty) => {
+                                monoio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                         }
                     }
                 });
@@ -307,7 +312,7 @@ async fn handle_join(
                 );
             }
 
-            joined_channels.insert(phoenix_msg.topic.clone(), (Arc::clone(channel), socket));
+            joined_channels.insert(phoenix_msg.topic.clone(), (Rc::clone(channel), socket));
         }
         Err(_) => {
             let reply = Reply::error(serde_json::json!({"reason": "join failed"}));
@@ -321,7 +326,7 @@ async fn handle_join(
 /// Handle a `phx_leave` event: terminate the channel and send a reply.
 async fn handle_leave(
     phoenix_msg: &PhoenixMessage,
-    joined_channels: &mut HashMap<String, (Arc<dyn Channel>, ChannelSocket)>,
+    joined_channels: &mut HashMap<String, (Rc<dyn Channel>, ChannelSocket)>,
 ) {
     if let Some((channel, mut socket)) = joined_channels.remove(&phoenix_msg.topic) {
         channel.terminate("leave", &mut socket).await;
@@ -333,7 +338,7 @@ async fn handle_leave(
 }
 
 /// Handle a heartbeat event: reply with an ok status.
-fn handle_heartbeat(phoenix_msg: &PhoenixMessage, tx: &mpsc::UnboundedSender<WsSendItem>) {
+fn handle_heartbeat(phoenix_msg: &PhoenixMessage, tx: &unbounded::Tx<WsSendItem>) {
     let reply_msg = PhoenixMessage {
         topic: "phoenix".to_string(),
         event: PHX_REPLY.to_string(),
@@ -350,7 +355,7 @@ fn handle_heartbeat(phoenix_msg: &PhoenixMessage, tx: &mpsc::UnboundedSender<WsS
 /// Dispatch a regular event to the appropriate joined channel.
 async fn dispatch_event(
     phoenix_msg: &PhoenixMessage,
-    joined_channels: &mut HashMap<String, (Arc<dyn Channel>, ChannelSocket)>,
+    joined_channels: &mut HashMap<String, (Rc<dyn Channel>, ChannelSocket)>,
 ) {
     if let Some((channel, socket)) = joined_channels.get_mut(&phoenix_msg.topic) {
         match channel
@@ -373,24 +378,6 @@ async fn dispatch_event(
     }
 }
 
-/// Spawn a task that forwards JSON strings from an unbounded channel to a WebSocket sink.
-/// Wraps each `String` as `WsMessage::Text` before sending.
-/// Returns a JoinHandle that can be aborted on disconnect.
-fn spawn_ws_forwarder(
-    ws_sender: futures::stream::SplitSink<WebSocket, WsMessage>,
-    rx: mpsc::UnboundedReceiver<WsSendItem>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ws_sender = ws_sender;
-        let mut rx = rx;
-        while let Some(json) = rx.recv().await {
-            if ws_sender.send(WsMessage::Text(json.into())).await.is_err() {
-                break;
-            }
-        }
-    })
-}
-
 // ---------------------------------------------------------------------------
 // GenServer-based WebSocket connection
 // ---------------------------------------------------------------------------
@@ -398,61 +385,41 @@ fn spawn_ws_forwarder(
 /// GenServer implementation for a single WebSocket channel connection.
 ///
 /// Public so that alternative transports (e.g. io_uring raw TCP) can start
-/// the same GenServer without going through the axum WebSocket path.
+/// the same GenServer without going through a specific WebSocket library.
 pub struct ChannelConnectionServer {
-    channel_router: Arc<ChannelRouter>,
+    channel_router: Rc<ChannelRouter>,
     pubsub: PubSub,
-    ws_tx: mpsc::UnboundedSender<WsSendItem>,
-    runtime: Arc<Runtime>,
-    /// Signaled after each `handle_cast` completes, so the io_uring event loop
-    /// can drain replies without arbitrary yield loops.
-    cast_notify: Arc<Notify>,
+    ws_tx: unbounded::Tx<WsSendItem>,
+    runtime: Rc<Runtime>,
 }
 
 impl ChannelConnectionServer {
     /// Create a new ChannelConnectionServer.
     pub fn new(
-        channel_router: Arc<ChannelRouter>,
+        channel_router: Rc<ChannelRouter>,
         pubsub: PubSub,
-        ws_tx: mpsc::UnboundedSender<WsSendItem>,
-        runtime: Arc<Runtime>,
-    ) -> Self {
-        Self::with_notify(channel_router, pubsub, ws_tx, runtime, Arc::new(Notify::new()))
-    }
-
-    /// Create a ChannelConnectionServer with a shared `Notify` for cast completion signaling.
-    ///
-    /// The io_uring event loop passes its own `Arc<Notify>` here so it can
-    /// wait for cast processing to finish instead of using arbitrary yield loops.
-    pub fn with_notify(
-        channel_router: Arc<ChannelRouter>,
-        pubsub: PubSub,
-        ws_tx: mpsc::UnboundedSender<WsSendItem>,
-        runtime: Arc<Runtime>,
-        cast_notify: Arc<Notify>,
+        ws_tx: unbounded::Tx<WsSendItem>,
+        runtime: Rc<Runtime>,
     ) -> Self {
         Self {
             channel_router,
             pubsub,
             ws_tx,
             runtime,
-            cast_notify,
         }
     }
 }
 
 /// Internal state for the ChannelConnectionServer GenServer.
-/// Internal state for the ChannelConnectionServer GenServer.
 ///
 /// This type is public because it must satisfy the `GenServer::State` associated type,
 /// but it is not re-exported from `lib.rs` and should be treated as an internal detail.
 pub struct ChannelConnectionState {
-    joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)>,
+    joined_channels: HashMap<String, (Rc<dyn Channel>, ChannelSocket)>,
     self_pid: rebar_core::process::ProcessId,
-    runtime: Arc<Runtime>,
+    runtime: Rc<Runtime>,
 }
 
-#[async_trait]
 impl GenServer for ChannelConnectionServer {
     type State = ChannelConnectionState;
 
@@ -464,7 +431,7 @@ impl GenServer for ChannelConnectionServer {
         Ok(ChannelConnectionState {
             joined_channels: HashMap::new(),
             self_pid: ctx.self_pid(),
-            runtime: Arc::clone(&self.runtime),
+            runtime: Rc::clone(&self.runtime),
         })
     }
 
@@ -513,7 +480,6 @@ impl GenServer for ChannelConnectionServer {
                 }
             }
         }
-        self.cast_notify.notify_one();
         CastReply::NoReply(state)
     }
 
@@ -563,46 +529,35 @@ impl GenServer for ChannelConnectionServer {
 
 /// Handle a WebSocket connection as a GenServer process.
 ///
-/// Each incoming WebSocket message is cast to a GenServer that manages the
-/// per-connection channel state. The send-forwarder task remains a plain
-/// tokio task since it is purely I/O.
+/// Takes a sender/receiver pair for the WebSocket transport. The caller is
+/// responsible for bridging their specific WebSocket implementation to these
+/// channels.
 pub async fn handle_websocket(
-    ws: WebSocket,
-    channel_router: Arc<ChannelRouter>,
+    mut ws_rx: unbounded::Rx<String>,
+    ws_tx_out: unbounded::Tx<WsSendItem>,
+    channel_router: Rc<ChannelRouter>,
     pubsub: PubSub,
-    runtime: Arc<Runtime>,
+    runtime: Rc<Runtime>,
 ) {
-    let (ws_sender, mut ws_receiver) = ws.split();
-    let (tx, rx) = mpsc::unbounded_channel::<WsSendItem>();
-
-    let send_task = spawn_ws_forwarder(ws_sender, rx);
-
     // Start GenServer for this connection
     let server = ChannelConnectionServer::new(
         channel_router,
         pubsub,
-        tx,
-        Arc::clone(&runtime),
+        ws_tx_out,
+        Rc::clone(&runtime),
     );
-    let pid = gen_server::start(&runtime, server, rmpv::Value::Nil).await;
+    let pid = gen_server::start(&runtime, server, rmpv::Value::Nil);
 
     // Read WebSocket messages and cast them to the GenServer
-    while let Some(Ok(msg)) = ws_receiver.next().await {
-        match msg {
-            WsMessage::Text(ref text) => {
-                let cast_val = rmpv::Value::String(rmpv::Utf8String::from(text.to_string()));
-                if gen_server::cast_from_runtime(&runtime, pid, cast_val).await.is_err() {
-                    break;
-                }
-            }
-            WsMessage::Close(_) => break,
-            _ => {}
+    while let Some(text) = ws_rx.recv().await {
+        let cast_val = rmpv::Value::String(rmpv::Utf8String::from(text));
+        if gen_server::cast_from_runtime(&runtime, pid, cast_val).is_err() {
+            break;
         }
     }
 
     // Kill the GenServer process on disconnect
     runtime.kill(pid);
-    send_task.abort();
 }
 
 /// Handle a WebSocket connection via a supervised `ChannelSupervisor`.
@@ -610,25 +565,21 @@ pub async fn handle_websocket(
 /// The connection GenServer is started as a `Temporary` child of the supervisor,
 /// so crashes are isolated and don't affect other connections.
 pub async fn handle_websocket_supervised(
-    ws: WebSocket,
-    channel_router: Arc<ChannelRouter>,
+    ws_rx: unbounded::Rx<String>,
+    ws_tx_out: unbounded::Tx<WsSendItem>,
+    channel_router: Rc<ChannelRouter>,
     pubsub: PubSub,
-    runtime: Arc<Runtime>,
+    runtime: Rc<Runtime>,
     supervisor: &crate::supervisor::ChannelSupervisor,
 ) {
     use crate::supervisor::connection_child_entry;
     use rebar_core::process::ExitReason;
 
-    let entry = connection_child_entry({
-        let channel_router = Arc::clone(&channel_router);
-        let pubsub = pubsub.clone();
-        let runtime = Arc::clone(&runtime);
-        move || {
-            Box::pin(async move {
-                handle_websocket(ws, channel_router, pubsub, runtime).await;
-                ExitReason::Normal
-            })
-        }
+    let entry = connection_child_entry(move || {
+        Box::pin(async move {
+            handle_websocket(ws_rx, ws_tx_out, channel_router, pubsub, runtime).await;
+            ExitReason::Normal
+        })
     });
 
     if let Err(e) = supervisor.add_connection(entry).await {
@@ -639,7 +590,7 @@ pub async fn handle_websocket_supervised(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
+    use mahalo_core::plug::BoxFuture;
 
     /// Parse a JSON string, panicking on invalid JSON.
     fn parse_ws_json(msg: WsSendItem) -> Value {
@@ -647,9 +598,9 @@ mod tests {
     }
 
     /// Create a ChannelSocket with a fresh PubSub and unbounded channel.
-    fn test_socket(topic: &str) -> (ChannelSocket, mpsc::UnboundedReceiver<WsSendItem>, PubSub) {
+    fn test_socket(topic: &str) -> (ChannelSocket, unbounded::Rx<WsSendItem>, PubSub) {
         let pubsub = PubSub::start();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = unbounded::channel();
         let socket = ChannelSocket::new(topic.into(), tx, pubsub.clone());
         (socket, rx, pubsub)
     }
@@ -659,12 +610,12 @@ mod tests {
         topic: &str,
     ) -> (
         ChannelSocket,
-        mpsc::UnboundedSender<WsSendItem>,
-        mpsc::UnboundedReceiver<WsSendItem>,
+        unbounded::Tx<WsSendItem>,
+        unbounded::Rx<WsSendItem>,
         PubSub,
     ) {
         let pubsub = PubSub::start();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = unbounded::channel();
         let socket = ChannelSocket::new(topic.into(), tx.clone(), pubsub.clone());
         (socket, tx, rx, pubsub)
     }
@@ -696,31 +647,30 @@ mod tests {
 
     struct DummyChannel;
 
-    #[async_trait]
     impl Channel for DummyChannel {
-        async fn join(
-            &self,
-            _topic: &str,
-            _payload: &Value,
-            _socket: &mut ChannelSocket,
-        ) -> Result<Value, crate::channel::ChannelError> {
-            Ok(serde_json::json!({}))
+        fn join<'a>(
+            &'a self,
+            _topic: &'a str,
+            _payload: &'a Value,
+            _socket: &'a mut ChannelSocket,
+        ) -> BoxFuture<'a, Result<Value, crate::channel::ChannelError>> {
+            Box::pin(async { Ok(serde_json::json!({})) })
         }
 
-        async fn handle_in(
-            &self,
-            _event: &str,
-            _payload: &Value,
-            _socket: &mut ChannelSocket,
-        ) -> Result<Option<Reply>, crate::channel::ChannelError> {
-            Ok(None)
+        fn handle_in<'a>(
+            &'a self,
+            _event: &'a str,
+            _payload: &'a Value,
+            _socket: &'a mut ChannelSocket,
+        ) -> BoxFuture<'a, Result<Option<Reply>, crate::channel::ChannelError>> {
+            Box::pin(async { Ok(None) })
         }
     }
 
     #[test]
     fn channel_router_find_exact() {
         let router = ChannelRouter::new()
-            .channel("room:lobby", Arc::new(DummyChannel));
+            .channel("room:lobby", Rc::new(DummyChannel));
         assert!(router.find("room:lobby").is_some());
         assert!(router.find("room:other").is_none());
     }
@@ -728,7 +678,7 @@ mod tests {
     #[test]
     fn channel_router_find_wildcard() {
         let router = ChannelRouter::new()
-            .channel("room:*", Arc::new(DummyChannel));
+            .channel("room:*", Rc::new(DummyChannel));
         assert!(router.find("room:lobby").is_some());
         assert!(router.find("room:123").is_some());
         assert!(router.find("chat:lobby").is_none());
@@ -757,7 +707,7 @@ mod tests {
         type Value = bool;
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn channel_socket_assigns() {
         let (mut socket, _rx, pubsub) = test_socket("test:topic");
 
@@ -822,7 +772,7 @@ mod tests {
 
     // -- ChannelSocket push/reply/broadcast ------------------------------------
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn channel_socket_push() {
         let (socket, mut rx, pubsub) = test_socket("test:topic");
 
@@ -836,7 +786,7 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn channel_socket_push_closed_sender() {
         let (socket, rx, pubsub) = test_socket("test:topic");
 
@@ -847,23 +797,23 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn channel_socket_broadcast() {
         let (socket, _rx, pubsub) = test_socket("test:topic");
 
         // Subscribe before broadcasting
-        let mut sub_rx = pubsub.subscribe("test:topic").await.expect("subscribe should succeed");
+        let sub_rx = pubsub.subscribe("test:topic").expect("subscribe should succeed");
 
         socket.broadcast("evt", serde_json::json!({"key": "val"}));
 
-        let msg = sub_rx.recv().await.expect("should receive broadcast");
+        let msg = sub_rx.recv().expect("should receive broadcast");
         assert_eq!(msg.event, "evt");
         assert_eq!(msg.payload, serde_json::json!({"key": "val"}));
 
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn channel_socket_reply() {
         let (socket, mut rx, pubsub) = test_socket("test:topic");
 
@@ -879,7 +829,7 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn channel_socket_reply_closed() {
         let (socket, rx, pubsub) = test_socket("test:topic");
 
@@ -902,7 +852,7 @@ mod tests {
 
     #[test]
     fn handle_heartbeat_sends_reply() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = unbounded::channel();
         let msg = PhoenixMessage {
             topic: "phoenix".into(),
             event: "heartbeat".into(),
@@ -923,36 +873,35 @@ mod tests {
 
     struct FailChannel;
 
-    #[async_trait]
     impl Channel for FailChannel {
-        async fn join(
-            &self,
-            _topic: &str,
-            _payload: &Value,
-            _socket: &mut ChannelSocket,
-        ) -> Result<Value, crate::channel::ChannelError> {
-            Err(crate::channel::ChannelError::NotAuthorized)
+        fn join<'a>(
+            &'a self,
+            _topic: &'a str,
+            _payload: &'a Value,
+            _socket: &'a mut ChannelSocket,
+        ) -> BoxFuture<'a, Result<Value, crate::channel::ChannelError>> {
+            Box::pin(async { Err(crate::channel::ChannelError::NotAuthorized) })
         }
 
-        async fn handle_in(
-            &self,
-            _event: &str,
-            _payload: &Value,
-            _socket: &mut ChannelSocket,
-        ) -> Result<Option<Reply>, crate::channel::ChannelError> {
-            Ok(None)
+        fn handle_in<'a>(
+            &'a self,
+            _event: &'a str,
+            _payload: &'a Value,
+            _socket: &'a mut ChannelSocket,
+        ) -> BoxFuture<'a, Result<Option<Reply>, crate::channel::ChannelError>> {
+            Box::pin(async { Ok(None) })
         }
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn handle_join_success() {
         let pubsub = PubSub::start();
-        let runtime = Arc::new(rebar_core::runtime::Runtime::new(1));
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let channel: Arc<dyn Channel> = Arc::new(DummyChannel);
+        let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
+        let (tx, mut rx) = unbounded::channel();
+        let channel: Rc<dyn Channel> = Rc::new(DummyChannel);
         let mut joined_channels = HashMap::new();
 
-        let pid = rebar_core::process::ProcessId::new(1, 1);
+        let pid = rebar_core::process::ProcessId::new(1, 0, 1);
         let msg = PhoenixMessage {
             topic: "room:lobby".into(),
             event: "phx_join".into(),
@@ -972,15 +921,15 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn handle_join_failure() {
         let pubsub = PubSub::start();
-        let runtime = Arc::new(rebar_core::runtime::Runtime::new(1));
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let channel: Arc<dyn Channel> = Arc::new(FailChannel);
+        let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
+        let (tx, mut rx) = unbounded::channel();
+        let channel: Rc<dyn Channel> = Rc::new(FailChannel);
         let mut joined_channels = HashMap::new();
 
-        let pid = rebar_core::process::ProcessId::new(1, 1);
+        let pid = rebar_core::process::ProcessId::new(1, 0, 1);
         let msg = PhoenixMessage {
             topic: "room:lobby".into(),
             event: "phx_join".into(),
@@ -1002,12 +951,12 @@ mod tests {
 
     // -- handle_leave ----------------------------------------------------------
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn handle_leave_known_topic() {
         let (socket, tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
-        let channel: Arc<dyn Channel> = Arc::new(DummyChannel);
+        let channel: Rc<dyn Channel> = Rc::new(DummyChannel);
 
-        let mut joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)> = HashMap::new();
+        let mut joined_channels: HashMap<String, (Rc<dyn Channel>, ChannelSocket)> = HashMap::new();
         joined_channels.insert("room:lobby".into(), (channel, socket));
 
         let msg = PhoenixMessage {
@@ -1029,9 +978,9 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn handle_leave_unknown_topic() {
-        let mut joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)> = HashMap::new();
+        let mut joined_channels: HashMap<String, (Rc<dyn Channel>, ChannelSocket)> = HashMap::new();
 
         let msg = PhoenixMessage {
             topic: "room:unknown".into(),
@@ -1048,56 +997,54 @@ mod tests {
 
     struct ReplyChannel;
 
-    #[async_trait]
     impl Channel for ReplyChannel {
-        async fn join(
-            &self,
-            _topic: &str,
-            _payload: &Value,
-            _socket: &mut ChannelSocket,
-        ) -> Result<Value, crate::channel::ChannelError> {
-            Ok(serde_json::json!({}))
+        fn join<'a>(
+            &'a self,
+            _topic: &'a str,
+            _payload: &'a Value,
+            _socket: &'a mut ChannelSocket,
+        ) -> BoxFuture<'a, Result<Value, crate::channel::ChannelError>> {
+            Box::pin(async { Ok(serde_json::json!({})) })
         }
 
-        async fn handle_in(
-            &self,
-            _event: &str,
-            _payload: &Value,
-            _socket: &mut ChannelSocket,
-        ) -> Result<Option<Reply>, crate::channel::ChannelError> {
-            Ok(Some(Reply::ok(serde_json::json!({"echo": true}))))
+        fn handle_in<'a>(
+            &'a self,
+            _event: &'a str,
+            _payload: &'a Value,
+            _socket: &'a mut ChannelSocket,
+        ) -> BoxFuture<'a, Result<Option<Reply>, crate::channel::ChannelError>> {
+            Box::pin(async { Ok(Some(Reply::ok(serde_json::json!({"echo": true})))) })
         }
     }
 
     struct ErrorChannel;
 
-    #[async_trait]
     impl Channel for ErrorChannel {
-        async fn join(
-            &self,
-            _topic: &str,
-            _payload: &Value,
-            _socket: &mut ChannelSocket,
-        ) -> Result<Value, crate::channel::ChannelError> {
-            Ok(serde_json::json!({}))
+        fn join<'a>(
+            &'a self,
+            _topic: &'a str,
+            _payload: &'a Value,
+            _socket: &'a mut ChannelSocket,
+        ) -> BoxFuture<'a, Result<Value, crate::channel::ChannelError>> {
+            Box::pin(async { Ok(serde_json::json!({})) })
         }
 
-        async fn handle_in(
-            &self,
-            _event: &str,
-            _payload: &Value,
-            _socket: &mut ChannelSocket,
-        ) -> Result<Option<Reply>, crate::channel::ChannelError> {
-            Err(crate::channel::ChannelError::Internal("test error".into()))
+        fn handle_in<'a>(
+            &'a self,
+            _event: &'a str,
+            _payload: &'a Value,
+            _socket: &'a mut ChannelSocket,
+        ) -> BoxFuture<'a, Result<Option<Reply>, crate::channel::ChannelError>> {
+            Box::pin(async { Err(crate::channel::ChannelError::Internal("test error".into())) })
         }
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn dispatch_event_with_reply() {
         let (socket, _tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
-        let channel: Arc<dyn Channel> = Arc::new(ReplyChannel);
+        let channel: Rc<dyn Channel> = Rc::new(ReplyChannel);
 
-        let mut joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)> = HashMap::new();
+        let mut joined_channels: HashMap<String, (Rc<dyn Channel>, ChannelSocket)> = HashMap::new();
         joined_channels.insert("room:lobby".into(), (channel, socket));
 
         let msg = PhoenixMessage {
@@ -1118,12 +1065,12 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn dispatch_event_no_reply() {
         let (socket, _tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
-        let channel: Arc<dyn Channel> = Arc::new(DummyChannel); // returns Ok(None)
+        let channel: Rc<dyn Channel> = Rc::new(DummyChannel); // returns Ok(None)
 
-        let mut joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)> = HashMap::new();
+        let mut joined_channels: HashMap<String, (Rc<dyn Channel>, ChannelSocket)> = HashMap::new();
         joined_channels.insert("room:lobby".into(), (channel, socket));
 
         let msg = PhoenixMessage {
@@ -1141,12 +1088,12 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn dispatch_event_error() {
         let (socket, _tx, mut rx, pubsub) = test_socket_with_tx("room:lobby");
-        let channel: Arc<dyn Channel> = Arc::new(ErrorChannel);
+        let channel: Rc<dyn Channel> = Rc::new(ErrorChannel);
 
-        let mut joined_channels: HashMap<String, (Arc<dyn Channel>, ChannelSocket)> = HashMap::new();
+        let mut joined_channels: HashMap<String, (Rc<dyn Channel>, ChannelSocket)> = HashMap::new();
         joined_channels.insert("room:lobby".into(), (channel, socket));
 
         let msg = PhoenixMessage {
@@ -1166,918 +1113,70 @@ mod tests {
         pubsub.shutdown();
     }
 
-    // -- handle_websocket integration test ------------------------------------
+    // -- EchoChannel for integration tests ------------------------------------
 
-    /// A channel that echoes back events for testing handle_websocket end-to-end.
     struct EchoChannel;
 
-    #[async_trait]
     impl Channel for EchoChannel {
-        async fn join(
-            &self,
-            _topic: &str,
-            _payload: &Value,
-            _socket: &mut ChannelSocket,
-        ) -> Result<Value, crate::channel::ChannelError> {
-            Ok(serde_json::json!({"status": "connected"}))
+        fn join<'a>(
+            &'a self,
+            _topic: &'a str,
+            _payload: &'a Value,
+            _socket: &'a mut ChannelSocket,
+        ) -> BoxFuture<'a, Result<Value, crate::channel::ChannelError>> {
+            Box::pin(async { Ok(serde_json::json!({"status": "connected"})) })
         }
 
-        async fn handle_in(
-            &self,
-            event: &str,
-            payload: &Value,
-            _socket: &mut ChannelSocket,
-        ) -> Result<Option<Reply>, crate::channel::ChannelError> {
-            Ok(Some(Reply::ok(serde_json::json!({
-                "echo_event": event,
-                "echo_payload": payload,
-            }))))
-        }
-    }
-
-    #[tokio::test]
-    async fn handle_websocket_full_lifecycle() {
-        use axum::extract::ws::WebSocketUpgrade;
-        use axum::routing::get;
-        use axum::Router;
-        use tokio_tungstenite::tungstenite::Message as TungsteniteMsg;
-
-        let pubsub = PubSub::start();
-        let channel_router = Arc::new(
-            ChannelRouter::new().channel("room:*", Arc::new(EchoChannel)),
-        );
-
-        let runtime = Arc::new(rebar_core::runtime::Runtime::new(1));
-        let pubsub_clone = pubsub.clone();
-        let router_clone = channel_router.clone();
-        let runtime_clone = Arc::clone(&runtime);
-
-        let app = Router::new().route(
-            "/ws",
-            get(move |ws: WebSocketUpgrade| {
-                let cr = router_clone.clone();
-                let ps = pubsub_clone.clone();
-                let rt = runtime_clone.clone();
-                async move { ws.on_upgrade(move |socket| handle_websocket(socket, cr, ps, rt)) }
-            }),
-        );
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        // Connect via tokio-tungstenite
-        let (mut ws_stream, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-                .await
-                .expect("WebSocket connect failed");
-
-        use futures::{SinkExt, StreamExt};
-
-        // 1. Send heartbeat
-        let heartbeat = serde_json::json!({
-            "topic": "phoenix",
-            "event": "heartbeat",
-            "payload": {},
-            "ref": "hb-1"
-        });
-        ws_stream
-            .send(TungsteniteMsg::Text(heartbeat.to_string().into()))
-            .await
-            .unwrap();
-
-        let reply = ws_stream.next().await.unwrap().unwrap();
-        let parsed: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
-        assert_eq!(parsed["event"], "phx_reply");
-        assert_eq!(parsed["payload"]["status"], "ok");
-        assert_eq!(parsed["ref"], "hb-1");
-
-        // 2. Join a channel
-        let join_msg = serde_json::json!({
-            "topic": "room:lobby",
-            "event": "phx_join",
-            "payload": {},
-            "ref": "join-1"
-        });
-        ws_stream
-            .send(TungsteniteMsg::Text(join_msg.to_string().into()))
-            .await
-            .unwrap();
-
-        let reply = ws_stream.next().await.unwrap().unwrap();
-        let parsed: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
-        assert_eq!(parsed["event"], "phx_reply");
-        assert_eq!(parsed["payload"]["status"], "ok");
-        assert_eq!(parsed["payload"]["response"]["status"], "connected");
-        assert_eq!(parsed["ref"], "join-1");
-
-        // 3. Send a custom event
-        let custom_msg = serde_json::json!({
-            "topic": "room:lobby",
-            "event": "new_msg",
-            "payload": {"text": "hello"},
-            "ref": "msg-1"
-        });
-        ws_stream
-            .send(TungsteniteMsg::Text(custom_msg.to_string().into()))
-            .await
-            .unwrap();
-
-        let reply = ws_stream.next().await.unwrap().unwrap();
-        let parsed: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
-        assert_eq!(parsed["event"], "phx_reply");
-        assert_eq!(parsed["payload"]["status"], "ok");
-        assert_eq!(parsed["payload"]["response"]["echo_event"], "new_msg");
-        assert_eq!(parsed["payload"]["response"]["echo_payload"]["text"], "hello");
-        assert_eq!(parsed["ref"], "msg-1");
-
-        // 4. Send invalid JSON (should be ignored, no crash)
-        ws_stream
-            .send(TungsteniteMsg::Text("not json".to_string().into()))
-            .await
-            .unwrap();
-
-        // 5. Leave the channel
-        let leave_msg = serde_json::json!({
-            "topic": "room:lobby",
-            "event": "phx_leave",
-            "payload": {},
-            "ref": "leave-1"
-        });
-        ws_stream
-            .send(TungsteniteMsg::Text(leave_msg.to_string().into()))
-            .await
-            .unwrap();
-
-        let reply = ws_stream.next().await.unwrap().unwrap();
-        let parsed: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
-        assert_eq!(parsed["event"], "phx_reply");
-        assert_eq!(parsed["payload"]["status"], "ok");
-        assert_eq!(parsed["ref"], "leave-1");
-
-        // 6. Send event to unmatched topic (no crash)
-        let unmatched = serde_json::json!({
-            "topic": "nonexistent:topic",
-            "event": "phx_join",
-            "payload": {},
-            "ref": "x"
-        });
-        ws_stream
-            .send(TungsteniteMsg::Text(unmatched.to_string().into()))
-            .await
-            .unwrap();
-
-        // 7. Close
-        ws_stream.close(None).await.unwrap();
-
-        server.abort();
-        pubsub.shutdown();
-    }
-
-    // -- GenServer WebSocket lifecycle tests -----------------------------------
-
-    #[tokio::test]
-    async fn handle_websocket_genserver_lifecycle() {
-        use axum::extract::ws::WebSocketUpgrade;
-        use axum::routing::get;
-        use axum::Router;
-        use tokio_tungstenite::tungstenite::Message as TungsteniteMsg;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct LifecycleChannel {
-            terminated: Arc<AtomicBool>,
-        }
-
-        #[async_trait]
-        impl Channel for LifecycleChannel {
-            async fn join(
-                &self,
-                _topic: &str,
-                _payload: &Value,
-                socket: &mut ChannelSocket,
-            ) -> Result<Value, crate::channel::ChannelError> {
-                socket.broadcast("joined_broadcast", serde_json::json!({"from": "join"}));
-                Ok(serde_json::json!({"status": "joined"}))
-            }
-
-            async fn handle_in(
-                &self,
-                event: &str,
-                payload: &Value,
-                _socket: &mut ChannelSocket,
-            ) -> Result<Option<Reply>, crate::channel::ChannelError> {
+        fn handle_in<'a>(
+            &'a self,
+            event: &'a str,
+            payload: &'a Value,
+            _socket: &'a mut ChannelSocket,
+        ) -> BoxFuture<'a, Result<Option<Reply>, crate::channel::ChannelError>> {
+            Box::pin(async move {
                 Ok(Some(Reply::ok(serde_json::json!({
                     "echo_event": event,
                     "echo_payload": payload,
                 }))))
-            }
-
-            async fn handle_info(
-                &self,
-                msg: &mahalo_pubsub::PubSubMessage,
-                socket: &mut ChannelSocket,
-            ) -> Result<(), crate::channel::ChannelError> {
-                socket.push(&msg.event, &msg.payload).await;
-                Ok(())
-            }
-
-            async fn terminate(&self, _reason: &str, _socket: &mut ChannelSocket) {
-                self.terminated.store(true, Ordering::SeqCst);
-            }
+            })
         }
-
-        let terminated = Arc::new(AtomicBool::new(false));
-        let pubsub = PubSub::start();
-        let channel_router = Arc::new(
-            ChannelRouter::new().channel("room:*", Arc::new(LifecycleChannel {
-                terminated: terminated.clone(),
-            })),
-        );
-
-        let runtime = Arc::new(rebar_core::runtime::Runtime::new(1));
-        let pubsub_clone = pubsub.clone();
-        let router_clone = channel_router.clone();
-        let runtime_clone = Arc::clone(&runtime);
-
-        let app = Router::new().route(
-            "/ws",
-            get(move |ws: WebSocketUpgrade| {
-                let cr = router_clone.clone();
-                let ps = pubsub_clone.clone();
-                let rt = runtime_clone.clone();
-                async move {
-                    ws.on_upgrade(move |socket| handle_websocket(socket, cr, ps, rt))
-                }
-            }),
-        );
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let (mut ws_stream, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-                .await
-                .expect("WebSocket connect failed");
-
-        use futures::{SinkExt, StreamExt};
-
-        // 1. Join a channel
-        let join_msg = serde_json::json!({
-            "topic": "room:lobby",
-            "event": "phx_join",
-            "payload": {},
-            "ref": "join-1"
-        });
-        ws_stream
-            .send(TungsteniteMsg::Text(join_msg.to_string().into()))
-            .await
-            .unwrap();
-
-        // Should get join reply
-        let reply = ws_stream.next().await.unwrap().unwrap();
-        let parsed: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
-        assert_eq!(parsed["event"], "phx_reply");
-        assert_eq!(parsed["payload"]["status"], "ok");
-        assert_eq!(parsed["payload"]["response"]["status"], "joined");
-
-        // 2. The channel broadcast on join should arrive via handle_info
-        let broadcast_reply = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            ws_stream.next(),
-        ).await;
-        if let Ok(Some(Ok(msg))) = broadcast_reply {
-            let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-            assert_eq!(parsed["event"], "joined_broadcast");
-            assert_eq!(parsed["payload"]["from"], "join");
-        }
-        // Note: broadcast may or may not arrive depending on timing
-
-        // 3. Send a custom event
-        let custom_msg = serde_json::json!({
-            "topic": "room:lobby",
-            "event": "new_msg",
-            "payload": {"text": "hello"},
-            "ref": "msg-1"
-        });
-        ws_stream
-            .send(TungsteniteMsg::Text(custom_msg.to_string().into()))
-            .await
-            .unwrap();
-
-        let reply = ws_stream.next().await.unwrap().unwrap();
-        let parsed: Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
-        assert_eq!(parsed["event"], "phx_reply");
-        assert_eq!(parsed["payload"]["response"]["echo_event"], "new_msg");
-
-        // 4. Broadcast from server side and verify it arrives via handle_info
-        pubsub.broadcast("room:lobby", "server_event", serde_json::json!({"data": "test"}));
-
-        let broadcast_reply = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            ws_stream.next(),
-        ).await;
-        if let Ok(Some(Ok(msg))) = broadcast_reply {
-            let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-            assert_eq!(parsed["event"], "server_event");
-            assert_eq!(parsed["payload"]["data"], "test");
-        } else {
-            panic!("Expected to receive broadcast via handle_info");
-        }
-
-        // 5. Close connection
-        ws_stream.close(None).await.unwrap();
-
-        // 6. Wait for terminate to be called
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        server.abort();
-        pubsub.shutdown();
     }
 
-    #[tokio::test]
-    async fn terminate_called_on_disconnect() {
-        use axum::extract::ws::WebSocketUpgrade;
-        use axum::routing::get;
-        use axum::Router;
-        use tokio_tungstenite::tungstenite::Message as TungsteniteMsg;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct TermTrackChannel {
-            terminated: Arc<AtomicBool>,
-        }
-
-        #[async_trait]
-        impl Channel for TermTrackChannel {
-            async fn join(
-                &self,
-                _topic: &str,
-                _payload: &Value,
-                _socket: &mut ChannelSocket,
-            ) -> Result<Value, crate::channel::ChannelError> {
-                Ok(serde_json::json!({}))
-            }
-
-            async fn handle_in(
-                &self,
-                _event: &str,
-                _payload: &Value,
-                _socket: &mut ChannelSocket,
-            ) -> Result<Option<Reply>, crate::channel::ChannelError> {
-                Ok(None)
-            }
-
-            async fn terminate(&self, _reason: &str, _socket: &mut ChannelSocket) {
-                self.terminated.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let terminated = Arc::new(AtomicBool::new(false));
-        let pubsub = PubSub::start();
-        let channel_router = Arc::new(
-            ChannelRouter::new().channel("room:*", Arc::new(TermTrackChannel {
-                terminated: terminated.clone(),
-            })),
-        );
-
-        let runtime = Arc::new(rebar_core::runtime::Runtime::new(1));
-        let pubsub_clone = pubsub.clone();
-        let router_clone = channel_router.clone();
-        let runtime_clone = Arc::clone(&runtime);
-
-        let app = Router::new().route(
-            "/ws",
-            get(move |ws: WebSocketUpgrade| {
-                let cr = router_clone.clone();
-                let ps = pubsub_clone.clone();
-                let rt = runtime_clone.clone();
-                async move {
-                    ws.on_upgrade(move |socket| handle_websocket(socket, cr, ps, rt))
-                }
-            }),
-        );
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let (mut ws_stream, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-                .await
-                .expect("WebSocket connect failed");
-
-        use futures::{SinkExt, StreamExt};
-
-        // Join a channel
-        let join_msg = serde_json::json!({
-            "topic": "room:test",
-            "event": "phx_join",
-            "payload": {},
-            "ref": "1"
-        });
-        ws_stream.send(TungsteniteMsg::Text(join_msg.to_string().into())).await.unwrap();
-
-        // Consume join reply
-        let _ = ws_stream.next().await;
-
-        // Disconnect
-        ws_stream.close(None).await.unwrap();
-
-        // Wait for terminate to propagate
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        assert!(terminated.load(Ordering::SeqCst), "terminate should have been called on disconnect");
-
-        server.abort();
-        pubsub.shutdown();
-    }
-
-    // -- Timer scheduling tests (#7) ------------------------------------------
-
-    #[tokio::test]
-    async fn run_later_fires_after_delay() {
-        use axum::extract::ws::WebSocketUpgrade;
-        use axum::routing::get;
-        use axum::Router;
-        use tokio_tungstenite::tungstenite::Message as TungsteniteMsg;
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        /// Channel that schedules a run_later on join, pushes on handle_info.
-        struct TimerChannel {
-            timer_count: Arc<AtomicU32>,
-        }
-
-        #[async_trait]
-        impl Channel for TimerChannel {
-            async fn join(
-                &self,
-                _topic: &str,
-                _payload: &Value,
-                _socket: &mut ChannelSocket,
-            ) -> Result<Value, crate::channel::ChannelError> {
-                Ok(serde_json::json!({}))
-            }
-
-            async fn handle_in(
-                &self,
-                _event: &str,
-                _payload: &Value,
-                _socket: &mut ChannelSocket,
-            ) -> Result<Option<Reply>, crate::channel::ChannelError> {
-                Ok(None)
-            }
-
-            async fn started(&self, socket: &mut ChannelSocket) {
-                socket.run_later(Duration::from_millis(50), "tick");
-            }
-
-            async fn handle_info(
-                &self,
-                msg: &mahalo_pubsub::PubSubMessage,
-                socket: &mut ChannelSocket,
-            ) -> Result<(), crate::channel::ChannelError> {
-                if msg.event == "tick" {
-                    self.timer_count.fetch_add(1, Ordering::SeqCst);
-                    socket.push("timer_fired", &serde_json::json!({"count": self.timer_count.load(Ordering::SeqCst)})).await;
-                }
-                Ok(())
-            }
-        }
-
-        let timer_count = Arc::new(AtomicU32::new(0));
-        let pubsub = PubSub::start();
-        let channel_router = Arc::new(
-            ChannelRouter::new().channel("timer:*", Arc::new(TimerChannel {
-                timer_count: timer_count.clone(),
-            })),
-        );
-
-        let runtime = Arc::new(rebar_core::runtime::Runtime::new(1));
-        let pubsub_clone = pubsub.clone();
-        let router_clone = channel_router.clone();
-        let runtime_clone = Arc::clone(&runtime);
-
-        let app = Router::new().route(
-            "/ws",
-            get(move |ws: WebSocketUpgrade| {
-                let cr = router_clone.clone();
-                let ps = pubsub_clone.clone();
-                let rt = runtime_clone.clone();
-                async move {
-                    ws.on_upgrade(move |socket| handle_websocket(socket, cr, ps, rt))
-                }
-            }),
-        );
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let (mut ws_stream, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-                .await
-                .expect("WebSocket connect failed");
-
-        use futures::{SinkExt, StreamExt};
-
-        // Join to trigger run_later
-        let join_msg = serde_json::json!({
-            "topic": "timer:test",
-            "event": "phx_join",
-            "payload": {},
-            "ref": "1"
-        });
-        ws_stream.send(TungsteniteMsg::Text(join_msg.to_string().into())).await.unwrap();
-        let _ = ws_stream.next().await; // consume join reply
-
-        // Wait for timer to fire (50ms delay + some margin)
-        let timer_msg = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            ws_stream.next(),
-        ).await;
-
-        match timer_msg {
-            Ok(Some(Ok(msg))) => {
-                let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-                assert_eq!(parsed["event"], "timer_fired");
-                assert_eq!(parsed["payload"]["count"], 1);
-            }
-            other => panic!("Expected timer message, got {:?}", other),
-        }
-
-        // Verify it only fired once (run_later is one-shot)
-        let second = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            ws_stream.next(),
-        ).await;
-        // Should timeout — no second fire
-        assert!(second.is_err(), "run_later should only fire once");
-
-        ws_stream.close(None).await.unwrap();
-        server.abort();
-        pubsub.shutdown();
-    }
-
-    #[tokio::test]
-    async fn run_interval_fires_repeatedly() {
-        use axum::extract::ws::WebSocketUpgrade;
-        use axum::routing::get;
-        use axum::Router;
-        use tokio_tungstenite::tungstenite::Message as TungsteniteMsg;
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        struct IntervalChannel {
-            tick_count: Arc<AtomicU32>,
-        }
-
-        #[async_trait]
-        impl Channel for IntervalChannel {
-            async fn join(
-                &self,
-                _topic: &str,
-                _payload: &Value,
-                _socket: &mut ChannelSocket,
-            ) -> Result<Value, crate::channel::ChannelError> {
-                Ok(serde_json::json!({}))
-            }
-
-            async fn handle_in(
-                &self,
-                _event: &str,
-                _payload: &Value,
-                _socket: &mut ChannelSocket,
-            ) -> Result<Option<Reply>, crate::channel::ChannelError> {
-                Ok(None)
-            }
-
-            async fn started(&self, socket: &mut ChannelSocket) {
-                socket.run_interval(Duration::from_millis(50), "tick");
-            }
-
-            async fn handle_info(
-                &self,
-                msg: &mahalo_pubsub::PubSubMessage,
-                socket: &mut ChannelSocket,
-            ) -> Result<(), crate::channel::ChannelError> {
-                if msg.event == "tick" {
-                    self.tick_count.fetch_add(1, Ordering::SeqCst);
-                    socket.push("interval_tick", &serde_json::json!({"n": self.tick_count.load(Ordering::SeqCst)})).await;
-                }
-                Ok(())
-            }
-        }
-
-        let tick_count = Arc::new(AtomicU32::new(0));
-        let pubsub = PubSub::start();
-        let channel_router = Arc::new(
-            ChannelRouter::new().channel("interval:*", Arc::new(IntervalChannel {
-                tick_count: tick_count.clone(),
-            })),
-        );
-
-        let runtime = Arc::new(rebar_core::runtime::Runtime::new(1));
-        let pubsub_clone = pubsub.clone();
-        let router_clone = channel_router.clone();
-        let runtime_clone = Arc::clone(&runtime);
-
-        let app = Router::new().route(
-            "/ws",
-            get(move |ws: WebSocketUpgrade| {
-                let cr = router_clone.clone();
-                let ps = pubsub_clone.clone();
-                let rt = runtime_clone.clone();
-                async move {
-                    ws.on_upgrade(move |socket| handle_websocket(socket, cr, ps, rt))
-                }
-            }),
-        );
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let (mut ws_stream, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-                .await
-                .expect("WebSocket connect failed");
-
-        use futures::{SinkExt, StreamExt};
-
-        let join_msg = serde_json::json!({
-            "topic": "interval:test",
-            "event": "phx_join",
-            "payload": {},
-            "ref": "1"
-        });
-        ws_stream.send(TungsteniteMsg::Text(join_msg.to_string().into())).await.unwrap();
-        let _ = ws_stream.next().await; // join reply
-
-        // Collect at least 2 interval ticks
-        let mut received = 0u32;
-        for _ in 0..2 {
-            let tick = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                ws_stream.next(),
-            ).await;
-            if let Ok(Some(Ok(msg))) = tick {
-                let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-                if parsed["event"] == "interval_tick" {
-                    received += 1;
-                }
-            }
-        }
-
-        assert!(received >= 2, "expected at least 2 interval ticks, got {received}");
-
-        ws_stream.close(None).await.unwrap();
-        server.abort();
-        pubsub.shutdown();
-    }
-
-    // -- Stopping veto tests (#8) ---------------------------------------------
-
-    #[tokio::test]
-    async fn stopping_veto_prevents_terminate() {
-        use axum::extract::ws::WebSocketUpgrade;
-        use axum::routing::get;
-        use axum::Router;
-        use tokio_tungstenite::tungstenite::Message as TungsteniteMsg;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use crate::channel::ShouldStop;
-
-        struct VetoChannel {
-            terminated: Arc<AtomicBool>,
-        }
-
-        #[async_trait]
-        impl Channel for VetoChannel {
-            async fn join(
-                &self,
-                _topic: &str,
-                _payload: &Value,
-                _socket: &mut ChannelSocket,
-            ) -> Result<Value, crate::channel::ChannelError> {
-                Ok(serde_json::json!({}))
-            }
-
-            async fn handle_in(
-                &self,
-                _event: &str,
-                _payload: &Value,
-                _socket: &mut ChannelSocket,
-            ) -> Result<Option<Reply>, crate::channel::ChannelError> {
-                Ok(None)
-            }
-
-            async fn stopping(&self, _socket: &mut ChannelSocket) -> ShouldStop {
-                ShouldStop::No
-            }
-
-            async fn terminate(&self, _reason: &str, _socket: &mut ChannelSocket) {
-                self.terminated.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let terminated = Arc::new(AtomicBool::new(false));
-        let pubsub = PubSub::start();
-        let channel_router = Arc::new(
-            ChannelRouter::new().channel("veto:*", Arc::new(VetoChannel {
-                terminated: terminated.clone(),
-            })),
-        );
-
-        let runtime = Arc::new(rebar_core::runtime::Runtime::new(1));
-        let pubsub_clone = pubsub.clone();
-        let router_clone = channel_router.clone();
-        let runtime_clone = Arc::clone(&runtime);
-
-        let app = Router::new().route(
-            "/ws",
-            get(move |ws: WebSocketUpgrade| {
-                let cr = router_clone.clone();
-                let ps = pubsub_clone.clone();
-                let rt = runtime_clone.clone();
-                async move {
-                    ws.on_upgrade(move |socket| handle_websocket(socket, cr, ps, rt))
-                }
-            }),
-        );
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let (mut ws_stream, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-                .await
-                .expect("WebSocket connect failed");
-
-        use futures::{SinkExt, StreamExt};
-
-        let join_msg = serde_json::json!({
-            "topic": "veto:test",
-            "event": "phx_join",
-            "payload": {},
-            "ref": "1"
-        });
-        ws_stream.send(TungsteniteMsg::Text(join_msg.to_string().into())).await.unwrap();
-        let _ = ws_stream.next().await; // join reply
-
-        // Disconnect — triggers GenServer terminate
-        ws_stream.close(None).await.unwrap();
-
-        // Wait for terminate path to execute
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // stopping() returned ShouldStop::No, so terminate() should NOT have been called
-        assert!(!terminated.load(Ordering::SeqCst), "terminate should NOT be called when stopping() returns ShouldStop::No");
-
-        server.abort();
-        pubsub.shutdown();
-    }
-
-    #[tokio::test]
-    async fn stopping_yes_allows_terminate() {
-        use axum::extract::ws::WebSocketUpgrade;
-        use axum::routing::get;
-        use axum::Router;
-        use tokio_tungstenite::tungstenite::Message as TungsteniteMsg;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use crate::channel::ShouldStop;
-
-        struct AllowStopChannel {
-            terminated: Arc<AtomicBool>,
-        }
-
-        #[async_trait]
-        impl Channel for AllowStopChannel {
-            async fn join(
-                &self,
-                _topic: &str,
-                _payload: &Value,
-                _socket: &mut ChannelSocket,
-            ) -> Result<Value, crate::channel::ChannelError> {
-                Ok(serde_json::json!({}))
-            }
-
-            async fn handle_in(
-                &self,
-                _event: &str,
-                _payload: &Value,
-                _socket: &mut ChannelSocket,
-            ) -> Result<Option<Reply>, crate::channel::ChannelError> {
-                Ok(None)
-            }
-
-            async fn stopping(&self, _socket: &mut ChannelSocket) -> ShouldStop {
-                ShouldStop::Yes
-            }
-
-            async fn terminate(&self, _reason: &str, _socket: &mut ChannelSocket) {
-                self.terminated.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let terminated = Arc::new(AtomicBool::new(false));
-        let pubsub = PubSub::start();
-        let channel_router = Arc::new(
-            ChannelRouter::new().channel("allow:*", Arc::new(AllowStopChannel {
-                terminated: terminated.clone(),
-            })),
-        );
-
-        let runtime = Arc::new(rebar_core::runtime::Runtime::new(1));
-        let pubsub_clone = pubsub.clone();
-        let router_clone = channel_router.clone();
-        let runtime_clone = Arc::clone(&runtime);
-
-        let app = Router::new().route(
-            "/ws",
-            get(move |ws: WebSocketUpgrade| {
-                let cr = router_clone.clone();
-                let ps = pubsub_clone.clone();
-                let rt = runtime_clone.clone();
-                async move {
-                    ws.on_upgrade(move |socket| handle_websocket(socket, cr, ps, rt))
-                }
-            }),
-        );
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let (mut ws_stream, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-                .await
-                .expect("WebSocket connect failed");
-
-        use futures::{SinkExt, StreamExt};
-
-        let join_msg = serde_json::json!({
-            "topic": "allow:test",
-            "event": "phx_join",
-            "payload": {},
-            "ref": "1"
-        });
-        ws_stream.send(TungsteniteMsg::Text(join_msg.to_string().into())).await.unwrap();
-        let _ = ws_stream.next().await; // join reply
-
-        ws_stream.close(None).await.unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // stopping() returned ShouldStop::Yes, so terminate() SHOULD have been called
-        assert!(terminated.load(Ordering::SeqCst), "terminate should be called when stopping() returns ShouldStop::Yes");
-
-        server.abort();
-        pubsub.shutdown();
-    }
-
-    // -- ChannelConnectionServer GenServer unit tests --------------------------
+    // -- GenServer unit tests (no WebSocket needed) ----------------------------
 
     /// Helper: start a ChannelConnectionServer GenServer and return (pid, rx, runtime, pubsub).
     async fn start_genserver_with_channel(
-        channel: Arc<dyn Channel>,
+        channel: Rc<dyn Channel>,
         topic_pattern: &str,
     ) -> (
         rebar_core::process::ProcessId,
-        mpsc::UnboundedReceiver<WsSendItem>,
-        Arc<Runtime>,
+        unbounded::Rx<WsSendItem>,
+        Rc<Runtime>,
         PubSub,
     ) {
         let pubsub = PubSub::start();
-        let runtime = Arc::new(Runtime::new(1));
-        let channel_router = Arc::new(ChannelRouter::new().channel(topic_pattern, channel));
-        let (tx, rx) = mpsc::unbounded_channel();
+        let runtime = Rc::new(Runtime::new(1));
+        let channel_router = Rc::new(ChannelRouter::new().channel(topic_pattern, channel));
+        let (tx, rx) = unbounded::channel();
         let server = ChannelConnectionServer::new(
             channel_router,
             pubsub.clone(),
             tx,
-            Arc::clone(&runtime),
+            Rc::clone(&runtime),
         );
-        let pid = gen_server::start(&runtime, server, rmpv::Value::Nil).await;
+        let pid = gen_server::start(&runtime, server, rmpv::Value::Nil);
         (pid, rx, runtime, pubsub)
     }
 
     /// Cast a Phoenix JSON message to the GenServer.
-    async fn cast_phoenix_msg(runtime: &Arc<Runtime>, pid: rebar_core::process::ProcessId, msg: &Value) {
+    async fn cast_phoenix_msg(runtime: &Rc<Runtime>, pid: rebar_core::process::ProcessId, msg: &Value) {
         let json = serde_json::to_string(msg).unwrap();
         let cast_val = rmpv::Value::String(rmpv::Utf8String::from(json));
-        gen_server::cast_from_runtime(runtime, pid, cast_val).await.unwrap();
+        gen_server::cast_from_runtime(runtime, pid, cast_val).unwrap();
     }
 
     /// Read all available messages from the receiver (non-blocking).
-    fn drain_rx(rx: &mut mpsc::UnboundedReceiver<WsSendItem>) -> Vec<Value> {
+    fn drain_rx(rx: &mut unbounded::Rx<WsSendItem>) -> Vec<Value> {
         let mut msgs = Vec::new();
         while let Ok(msg) = rx.try_recv() {
             msgs.push(serde_json::from_str(&msg).unwrap());
@@ -2085,16 +1184,16 @@ mod tests {
         msgs
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn genserver_handle_cast_join_and_event() {
         let (pid, mut rx, runtime, pubsub) =
-            start_genserver_with_channel(Arc::new(EchoChannel), "room:*").await;
+            start_genserver_with_channel(Rc::new(EchoChannel), "room:*").await;
 
         // Join
         cast_phoenix_msg(&runtime, pid, &serde_json::json!({
             "topic": "room:lobby", "event": "phx_join", "payload": {}, "ref": "j1"
         })).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let msgs = drain_rx(&mut rx);
         assert!(!msgs.is_empty(), "should receive join reply");
@@ -2106,7 +1205,7 @@ mod tests {
         cast_phoenix_msg(&runtime, pid, &serde_json::json!({
             "topic": "room:lobby", "event": "new_msg", "payload": {"text": "hi"}, "ref": "m1"
         })).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let msgs = drain_rx(&mut rx);
         assert!(!msgs.is_empty(), "should receive event reply");
@@ -2117,15 +1216,15 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn genserver_handle_cast_heartbeat() {
         let (pid, mut rx, runtime, pubsub) =
-            start_genserver_with_channel(Arc::new(DummyChannel), "room:*").await;
+            start_genserver_with_channel(Rc::new(DummyChannel), "room:*").await;
 
         cast_phoenix_msg(&runtime, pid, &serde_json::json!({
             "topic": "phoenix", "event": "heartbeat", "payload": {}, "ref": "hb-1"
         })).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let msgs = drain_rx(&mut rx);
         assert!(!msgs.is_empty());
@@ -2137,23 +1236,23 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn genserver_handle_cast_leave() {
         let (pid, mut rx, runtime, pubsub) =
-            start_genserver_with_channel(Arc::new(DummyChannel), "room:*").await;
+            start_genserver_with_channel(Rc::new(DummyChannel), "room:*").await;
 
         // Join first
         cast_phoenix_msg(&runtime, pid, &serde_json::json!({
             "topic": "room:test", "event": "phx_join", "payload": {}, "ref": "j1"
         })).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
         drain_rx(&mut rx); // consume join reply
 
         // Leave
         cast_phoenix_msg(&runtime, pid, &serde_json::json!({
             "topic": "room:test", "event": "phx_leave", "payload": {}, "ref": "l1"
         })).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let msgs = drain_rx(&mut rx);
         assert!(!msgs.is_empty());
@@ -2165,15 +1264,15 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn genserver_handle_cast_invalid_json_ignored() {
         let (pid, mut rx, runtime, pubsub) =
-            start_genserver_with_channel(Arc::new(DummyChannel), "room:*").await;
+            start_genserver_with_channel(Rc::new(DummyChannel), "room:*").await;
 
         // Send non-JSON text — should be silently ignored.
         let cast_val = rmpv::Value::String(rmpv::Utf8String::from("not valid json"));
-        gen_server::cast_from_runtime(&runtime, pid, cast_val).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        gen_server::cast_from_runtime(&runtime, pid, cast_val).unwrap();
+        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert!(drain_rx(&mut rx).is_empty(), "invalid JSON should produce no output");
 
@@ -2181,44 +1280,45 @@ mod tests {
         pubsub.shutdown();
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn genserver_handle_info_pubsub_broadcast() {
         // Use a channel that pushes on handle_info
         struct InfoPushChannel;
 
-        #[async_trait]
         impl Channel for InfoPushChannel {
-            async fn join(
-                &self, _topic: &str, _payload: &Value, _socket: &mut ChannelSocket,
-            ) -> Result<Value, crate::channel::ChannelError> {
-                Ok(serde_json::json!({}))
+            fn join<'a>(
+                &'a self, _topic: &'a str, _payload: &'a Value, _socket: &'a mut ChannelSocket,
+            ) -> BoxFuture<'a, Result<Value, crate::channel::ChannelError>> {
+                Box::pin(async { Ok(serde_json::json!({})) })
             }
-            async fn handle_in(
-                &self, _event: &str, _payload: &Value, _socket: &mut ChannelSocket,
-            ) -> Result<Option<Reply>, crate::channel::ChannelError> {
-                Ok(None)
+            fn handle_in<'a>(
+                &'a self, _event: &'a str, _payload: &'a Value, _socket: &'a mut ChannelSocket,
+            ) -> BoxFuture<'a, Result<Option<Reply>, crate::channel::ChannelError>> {
+                Box::pin(async { Ok(None) })
             }
-            async fn handle_info(
-                &self, msg: &mahalo_pubsub::PubSubMessage, socket: &mut ChannelSocket,
-            ) -> Result<(), crate::channel::ChannelError> {
-                socket.push(&msg.event, &msg.payload).await;
-                Ok(())
+            fn handle_info<'a>(
+                &'a self, msg: &'a mahalo_pubsub::PubSubMessage, socket: &'a mut ChannelSocket,
+            ) -> BoxFuture<'a, Result<(), crate::channel::ChannelError>> {
+                Box::pin(async move {
+                    socket.push(&msg.event, &msg.payload).await;
+                    Ok(())
+                })
             }
         }
 
         let (pid, mut rx, runtime, pubsub) =
-            start_genserver_with_channel(Arc::new(InfoPushChannel), "room:*").await;
+            start_genserver_with_channel(Rc::new(InfoPushChannel), "room:*").await;
 
         // Join to establish PubSub subscription
         cast_phoenix_msg(&runtime, pid, &serde_json::json!({
             "topic": "room:lobby", "event": "phx_join", "payload": {}, "ref": "j1"
         })).await;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        monoio::time::sleep(std::time::Duration::from_millis(100)).await;
         drain_rx(&mut rx); // consume join reply
 
         // Broadcast via PubSub — should arrive via handle_info
         pubsub.broadcast("room:lobby", "server_push", serde_json::json!({"data": 42}));
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        monoio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let msgs = drain_rx(&mut rx);
         assert!(!msgs.is_empty(), "should receive handle_info push from PubSub broadcast");

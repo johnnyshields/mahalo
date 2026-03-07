@@ -59,7 +59,7 @@ mod tests {
             .put_resp_body(bytes::Bytes::from(body.to_owned()))
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn etag_computed_for_200_with_body() {
         let conn = make_conn("hello world");
         let conn = ETag::new().call(conn).await;
@@ -70,7 +70,7 @@ mod tests {
         assert_eq!(etag.len(), 36);
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn returns_304_when_if_none_match_matches() {
         // First call to get the ETag
         let conn = make_conn("hello world");
@@ -86,7 +86,7 @@ mod tests {
         assert!(conn.halted);
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn normal_response_when_no_if_none_match() {
         let conn = make_conn("hello world");
         let conn = ETag::new().call(conn).await;
@@ -96,7 +96,7 @@ mod tests {
         assert!(conn.resp_headers.get("etag").is_some());
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn normal_response_when_if_none_match_differs() {
         let mut conn = make_conn("hello world");
         conn.headers.insert("if-none-match", "W/\"deadbeef\"".parse().unwrap());
@@ -106,7 +106,7 @@ mod tests {
         assert!(conn.resp_headers.get("etag").is_some());
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn skips_non_200_responses() {
         let conn = Conn::new(Method::GET, Uri::from_static("/"))
             .put_status(StatusCode::CREATED)
@@ -121,7 +121,7 @@ mod tests {
         assert!(conn.resp_headers.get("etag").is_none());
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn overwrites_pre_existing_etag_header() {
         let conn = make_conn("hello world")
             .put_resp_header("etag", "W/\"old-etag-value\"");
@@ -133,7 +133,7 @@ mod tests {
         assert_eq!(etag.len(), 36);
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn skips_empty_body() {
         let conn = Conn::new(Method::GET, Uri::from_static("/"))
             .put_status(StatusCode::OK);

@@ -29,7 +29,7 @@ mod tests {
     use super::*;
     use http::{Method, Uri};
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn preserves_existing_request_id_header() {
         let mut conn = Conn::new(Method::GET, Uri::from_static("/"));
         conn.headers
@@ -47,7 +47,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn generates_uuid_when_header_missing() {
         let conn = Conn::new(Method::GET, Uri::from_static("/"));
         let conn = RequestId.call(conn).await;
@@ -57,7 +57,7 @@ mod tests {
         assert_eq!(conn.get_assign::<RequestIdKey>(), Some(&id.to_string()));
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn generated_id_is_valid_uuid() {
         let conn = Conn::new(Method::GET, Uri::from_static("/"));
         let conn = RequestId.call(conn).await;

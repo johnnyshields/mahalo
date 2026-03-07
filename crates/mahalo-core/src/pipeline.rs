@@ -49,7 +49,7 @@ mod tests {
         type Value = Vec<&'static str>;
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn executes_plugs_in_order() {
         let pipeline = Pipeline::new("test")
             .plug(plug_fn(|conn: Conn| async {
@@ -70,7 +70,7 @@ mod tests {
         assert_eq!(order, &vec!["first", "second"]);
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn halted_conn_stops_pipeline() {
         let pipeline = Pipeline::new("test")
             .plug(plug_fn(|conn: Conn| async {
@@ -87,7 +87,7 @@ mod tests {
         assert_eq!(conn.status, StatusCode::UNAUTHORIZED);
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn empty_pipeline_passes_through() {
         let pipeline = Pipeline::new("empty");
         let conn = Conn::new(Method::GET, Uri::from_static("/"));

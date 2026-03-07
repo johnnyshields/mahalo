@@ -10,7 +10,7 @@ use crate::endpoint::ErrorHandler;
 
 /// Create and bind a TCP socket with optional `SO_REUSEPORT`.
 ///
-/// Shared by both the io_uring worker (Linux) and the tokio TCP server (other platforms).
+/// Shared by all worker threads for per-thread listener binding.
 pub(crate) fn bind_socket(
     addr: SocketAddr,
     reuse_port: bool,
@@ -35,7 +35,7 @@ pub(crate) fn bind_socket(
 
 /// Execute a request through the router and after-plugs.
 ///
-/// Shared by both the io_uring event loop (Linux) and the tokio TCP server (other platforms).
+/// Runtime-agnostic — works on both monoio and tokio.
 #[inline]
 pub async fn execute_request(
     conn: Conn,
@@ -76,7 +76,7 @@ mod tests {
     use bytes::Bytes;
     use http::Method;
     use mahalo_core::plug::plug_fn;
-    use std::sync::Arc;
+    use std::rc::Rc;
 
     fn ok_router() -> MahaloRouter {
         MahaloRouter::new().get(
@@ -110,7 +110,7 @@ mod tests {
     #[tokio::test]
     async fn execute_request_custom_error_handler() {
         let router = ok_router();
-        let handler: ErrorHandler = Arc::new(|status, conn| {
+        let handler: ErrorHandler = Rc::new(|status, conn| {
             conn.put_resp_body(format!("Custom {}", status.as_u16()))
         });
         let conn = Conn::new(Method::GET, http::Uri::from_static("/missing"));

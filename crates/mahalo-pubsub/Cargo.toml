@@ -7,7 +7,8 @@ description = "Distributed PubSub backed by rebar processes"
 
 [dependencies]
 rebar-core = { workspace = true }
-tokio = { workspace = true }
+monoio = { workspace = true }
+crossbeam-channel = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

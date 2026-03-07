@@ -9,15 +9,13 @@ description = "Phoenix-style WebSocket Channels with rebar process per connectio
 mahalo-core = { path = "../mahalo-core" }
 mahalo-pubsub = { path = "../mahalo-pubsub" }
 rebar-core = { workspace = true }
-tokio = { workspace = true }
-axum = { workspace = true }
+monoio = { workspace = true }
+crossbeam-channel = { workspace = true }
+local-sync = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-async-trait = { workspace = true }
-futures = { workspace = true }
 rmpv = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-tokio-tungstenite = "0.26"

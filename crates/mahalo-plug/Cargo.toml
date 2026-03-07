@@ -7,10 +7,10 @@ description = "Built-in plugs for the Mahalo web framework"
 
 [dependencies]
 mahalo-core = { path = "../mahalo-core" }
+monoio = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true }
 blake3 = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }

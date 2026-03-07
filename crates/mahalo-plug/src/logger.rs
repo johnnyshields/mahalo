@@ -52,7 +52,7 @@ mod tests {
     use http::{Method, StatusCode, Uri};
     use mahalo_core::plug::Plug;
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn start_plug_stores_instant() {
         let (start, _finish) = request_logger();
         let conn = Conn::new(Method::GET, Uri::from_static("/test"));
@@ -60,7 +60,7 @@ mod tests {
         assert!(conn.get_assign::<RequestStartTime>().is_some());
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn finish_plug_does_not_panic_without_start() {
         let (_start, finish) = request_logger();
         let conn = Conn::new(Method::GET, Uri::from_static("/test"))
@@ -69,7 +69,7 @@ mod tests {
         assert_eq!(conn.status, StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn full_round_trip() {
         let (start, finish) = request_logger();
         let conn = Conn::new(Method::POST, Uri::from_static("/api/users"))

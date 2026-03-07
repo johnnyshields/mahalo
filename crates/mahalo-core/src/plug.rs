@@ -2,10 +2,10 @@ use crate::conn::Conn;
 use std::future::Future;
 use std::pin::Pin;
 
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 /// The core Plug trait -- every middleware is a Plug.
-pub trait Plug: Send + Sync + 'static {
+pub trait Plug: 'static {
     fn call(&self, conn: Conn) -> BoxFuture<'_, Conn>;
 
     /// Optional synchronous fast-path. If a plug can execute without async,
@@ -27,8 +27,8 @@ pub struct PlugFn<F>(pub F);
 
 impl<F, Fut> Plug for PlugFn<F>
 where
-    F: Fn(Conn) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Conn> + Send + 'static,
+    F: Fn(Conn) -> Fut + 'static,
+    Fut: Future<Output = Conn> + 'static,
 {
     fn call(&self, conn: Conn) -> BoxFuture<'_, Conn> {
         Box::pin(self.0(conn))
@@ -38,8 +38,8 @@ where
 /// Helper to create a `PlugFn` from an async function.
 pub fn plug_fn<F, Fut>(f: F) -> PlugFn<F>
 where
-    F: Fn(Conn) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Conn> + Send + 'static,
+    F: Fn(Conn) -> Fut + 'static,
+    Fut: Future<Output = Conn> + 'static,
 {
     PlugFn(f)
 }
@@ -49,7 +49,7 @@ pub struct SyncPlugFn<F>(pub F);
 
 impl<F> Plug for SyncPlugFn<F>
 where
-    F: Fn(Conn) -> Conn + Send + Sync + 'static,
+    F: Fn(Conn) -> Conn + 'static,
 {
     fn call(&self, conn: Conn) -> BoxFuture<'_, Conn> {
         Box::pin(std::future::ready(self.0(conn)))
@@ -65,7 +65,7 @@ where
 /// avoids BoxFuture heap allocation when used with the optimized pipeline.
 pub fn sync_plug_fn<F>(f: F) -> SyncPlugFn<F>
 where
-    F: Fn(Conn) -> Conn + Send + Sync + 'static,
+    F: Fn(Conn) -> Conn + 'static,
 {
     SyncPlugFn(f)
 }
@@ -75,7 +75,7 @@ mod tests {
     use super::*;
     use http::{Method, StatusCode, Uri};
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn plug_fn_creates_callable_plug() {
         let plug = plug_fn(|conn: Conn| async {
             conn.put_status(StatusCode::IM_A_TEAPOT)
@@ -85,7 +85,7 @@ mod tests {
         assert_eq!(conn.status, StatusCode::IM_A_TEAPOT);
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn plug_fn_can_modify_body() {
         let plug = plug_fn(|conn: Conn| async {
             conn.put_resp_body("hello from plug")
@@ -93,12 +93,6 @@ mod tests {
         let conn = Conn::new(Method::GET, Uri::from_static("/"));
         let conn = plug.call(conn).await;
         assert_eq!(conn.resp_body, "hello from plug");
-    }
-
-    #[test]
-    fn plug_fn_is_send_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<PlugFn<fn(Conn) -> std::pin::Pin<Box<dyn Future<Output = Conn> + Send>>>>();
     }
 
     #[test]
@@ -111,7 +105,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[monoio::test(enable_timer = true)]
     async fn sync_plug_fn_call_async_fallback() {
         let plug = sync_plug_fn(|conn: Conn| conn.put_resp_body("sync body"));
         let conn = Conn::new(Method::GET, Uri::from_static("/"));
@@ -127,9 +121,4 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn sync_plug_fn_is_send_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<SyncPlugFn<fn(Conn) -> Conn>>();
-    }
 }
