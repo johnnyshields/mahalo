@@ -190,7 +190,7 @@ mod tests {
         let msg = PubSubMessage {
             topic: "test:topic".into(),
             event: "greeting".into(),
-            payload: serde_json::json!({"hello": "world"}),
+            payload: std::sync::Arc::new(serde_json::json!({"hello": "world"})),
         };
 
         let ch = MinimalChannel;

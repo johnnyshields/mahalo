@@ -51,10 +51,10 @@ impl DistributedPubSub {
         let msg = PubSubMessage {
             topic: topic.to_string(),
             event: event.to_string(),
-            payload,
+            payload: Arc::new(payload),
         };
         // Deliver locally
-        self.local.broadcast(topic, &msg.event, msg.payload.clone());
+        self.local.broadcast(topic, &msg.event, (*msg.payload).clone());
         // Fan out to peers (stale senders are pruned)
         let mut peers = self.peers.write().unwrap();
         peers.retain(|tx| tx.send(msg.clone()).is_ok());
@@ -97,7 +97,7 @@ impl DistributedPubSub {
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             while let Ok(msg) = peer_rx.recv() {
-                local.broadcast(&msg.topic, msg.event, msg.payload);
+                local.broadcast(&msg.topic, msg.event, (*msg.payload).clone());
             }
         })
     }

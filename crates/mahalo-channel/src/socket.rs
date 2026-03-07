@@ -499,7 +499,7 @@ impl GenServer for ChannelConnectionServer {
                         let synthetic = mahalo_pubsub::PubSubMessage {
                             topic: topic.to_string(),
                             event: event.to_string(),
-                            payload: Value::Null,
+                            payload: std::sync::Arc::new(Value::Null),
                         };
                         let _ = channel.handle_info(&synthetic, socket).await;
                     }
@@ -808,7 +808,7 @@ mod tests {
 
         let msg = sub_rx.recv().expect("should receive broadcast");
         assert_eq!(msg.event, "evt");
-        assert_eq!(msg.payload, serde_json::json!({"key": "val"}));
+        assert_eq!(*msg.payload, serde_json::json!({"key": "val"}));
 
         pubsub.shutdown();
     }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use mahalo_core::plug::Plug;
 use mahalo_router::MahaloRouter;
 use rebar_core::executor::{ExecutorConfig, RebarExecutor};
+use turbine_core::config::PoolConfig;
 use rebar_core::io::TcpListener;
 use rebar_core::runtime::Runtime;
 
@@ -110,8 +111,11 @@ fn run_worker_arc(
 ) {
     setup_cpu_affinity(worker_id);
 
-    let ex = RebarExecutor::new(ExecutorConfig::default())
-        .expect("failed to build RebarExecutor");
+    let ex = RebarExecutor::new(ExecutorConfig {
+        pool_config: Some(PoolConfig::default()),
+        ..Default::default()
+    })
+    .expect("failed to build RebarExecutor");
 
     ex.block_on(async {
         let listener = match TcpListener::bind(addr) {

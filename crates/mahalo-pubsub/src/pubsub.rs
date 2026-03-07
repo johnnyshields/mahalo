@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crossbeam_channel as crossbeam;
 use tracing::{debug, trace};
@@ -14,7 +15,7 @@ use rebar_core::supervisor::{ChildEntry, ChildSpec};
 pub struct PubSubMessage {
     pub topic: String,
     pub event: String,
-    pub payload: serde_json::Value,
+    pub payload: Arc<serde_json::Value>,
 }
 
 /// Internal commands sent to the PubSub server task.
@@ -173,7 +174,7 @@ impl PubSub {
         let msg = PubSubMessage {
             topic: topic.to_string(),
             event: event.into(),
-            payload,
+            payload: Arc::new(payload),
         };
         let _ = self.cmd_tx.send(PubSubCommand::Broadcast {
             topic: topic.to_string(),
@@ -247,7 +248,7 @@ mod tests {
 
         assert_eq!(msg.topic, "room:lobby");
         assert_eq!(msg.event, "new_msg");
-        assert_eq!(msg.payload, serde_json::json!({"text": "hello"}));
+        assert_eq!(*msg.payload, serde_json::json!({"text": "hello"}));
 
         pubsub.shutdown();
     }
@@ -316,7 +317,7 @@ mod tests {
         let msg = PubSubMessage {
             topic: "room:lobby".to_string(),
             event: "new_msg".to_string(),
-            payload: serde_json::json!({"text": "hello"}),
+            payload: Arc::new(serde_json::json!({"text": "hello"})),
         };
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -324,7 +325,32 @@ mod tests {
 
         assert_eq!(deserialized.topic, "room:lobby");
         assert_eq!(deserialized.event, "new_msg");
-        assert_eq!(deserialized.payload, serde_json::json!({"text": "hello"}));
+        assert_eq!(*deserialized.payload, serde_json::json!({"text": "hello"}));
+    }
+
+    #[test]
+    fn pubsub_message_arc_serde_roundtrip() {
+        let msg = PubSubMessage {
+            topic: "room:lobby".to_string(),
+            event: "new_msg".to_string(),
+            payload: Arc::new(serde_json::json!({"text": "hello", "count": 42})),
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&msg).unwrap();
+
+        // The Arc should be transparent — payload serializes as a plain Value
+        let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(raw["payload"]["text"], "hello");
+        assert_eq!(raw["payload"]["count"], 42);
+
+        // Deserialize back into PubSubMessage (creates a fresh Arc)
+        let deserialized: PubSubMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(*deserialized.payload, serde_json::json!({"text": "hello", "count": 42}));
+
+        // Verify the Arc wrapper is present (clone is O(1))
+        let cloned = deserialized.clone();
+        assert!(Arc::ptr_eq(&deserialized.payload, &cloned.payload));
     }
 
     #[test]
@@ -352,7 +378,7 @@ mod tests {
 
             assert_eq!(msg.topic, "test:topic");
             assert_eq!(msg.event, "hello");
-            assert_eq!(msg.payload, serde_json::json!({"msg": "hi"}));
+            assert_eq!(*msg.payload, serde_json::json!({"msg": "hi"}));
 
             pubsub.shutdown();
         });
