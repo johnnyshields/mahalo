@@ -20,7 +20,7 @@
 #   all           - Everything (default)
 #
 # Frameworks:
-#   Rust:    mahalo, axum, actix, xitca, may-minihttp
+#   Rust:    mahalo, axum, actix, hyper, xitca, may-minihttp
 #   Node:    express
 #   Ruby:    puma, falcon
 #   Elixir:  elixir
@@ -61,6 +61,7 @@ PORT_GRANIAN=3008
 PORT_FALCON=3009
 PORT_MAY_MINIHTTP=3010
 PORT_XITCA=3011
+PORT_HYPER=3012
 
 # Colors
 RED='\033[0;31m'
@@ -360,6 +361,14 @@ start_may_minihttp() {
     wait_for_server $PORT_MAY_MINIHTTP "may-minihttp"
 }
 
+start_hyper() {
+    should_run "hyper" || return 0
+    log "Starting Hyper (raw)..."
+    run_pinned env PORT=$PORT_HYPER "$BENCH_DIR/../target/release/bench-hyper"
+    register_pid "hyper"
+    wait_for_server $PORT_HYPER "Hyper (raw)"
+}
+
 start_express() {
     should_run "express" || return 0
     if ! command -v node &>/dev/null; then
@@ -619,6 +628,9 @@ main() {
     start_axum
     start_actix
 
+    # Full-framework Rust servers (cont.)
+    start_hyper
+
     # Low-level Rust servers
     start_xitca
     start_may_minihttp
@@ -642,6 +654,7 @@ main() {
     should_run "mahalo"  && run_scenarios_full "Mahalo"     $PORT_MAHALO  || true
     should_run "axum"    && run_scenarios_full "Axum"       $PORT_AXUM    || true
     should_run "actix"   && run_scenarios_full "Actix-web"  $PORT_ACTIX   || true
+    should_run "hyper"   && run_scenarios_full "Hyper"      $PORT_HYPER   || true
 
     # Low-level Rust servers (TechEmpower only)
     should_run "xitca"         && run_scenarios_limited "xitca-web"     $PORT_XITCA         || true

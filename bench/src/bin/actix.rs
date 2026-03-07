@@ -4,7 +4,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use actix_web::web::{self, Data, Path, Query};
 use actix_web::{App, HttpResponse, HttpServer, get, post};
 use mahalo_bench::shared::{
-    Fortune, User, World, fortune_rows, parse_count, render_fortunes_html, users_db, world_rows,
+    Fortune, User, World, fortune_rows, parse_count, parse_port, render_fortunes_html, users_db,
+    world_rows,
 };
 use rand::Rng;
 use serde::Deserialize;
@@ -21,7 +22,6 @@ struct AppState {
 async fn plaintext() -> HttpResponse {
     HttpResponse::Ok()
         .content_type("text/plain")
-        .insert_header(("server", "actix"))
         .body("Hello, World!")
 }
 
@@ -29,7 +29,6 @@ async fn plaintext() -> HttpResponse {
 async fn json() -> HttpResponse {
     HttpResponse::Ok()
         .content_type("application/json")
-        .insert_header(("server", "actix"))
         .body(r#"{"message":"Hello, World!"}"#)
 }
 
@@ -160,10 +159,7 @@ async fn redirect_handler() -> HttpResponse {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(3002);
+    let port = parse_port(3002);
 
     let state = Data::new(AppState {
         worlds: world_rows(),

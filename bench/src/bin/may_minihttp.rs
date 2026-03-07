@@ -4,7 +4,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::io;
 
 use mahalo_bench::shared::{
-    World, fortune_rows, parse_count, parse_query_param, render_fortunes_html, world_rows,
+    World, fortune_rows, parse_count, parse_port, parse_query_param, render_fortunes_html,
+    world_rows,
 };
 use may_minihttp::{HttpService, HttpServiceFactory, Request, Response};
 use rand::Rng;
@@ -95,10 +96,7 @@ impl HttpServiceFactory for TechempowerFactory {
 }
 
 fn main() {
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(3010);
+    let port = parse_port(3010);
 
     let worlds = world_rows();
     let fortunes = fortune_rows();

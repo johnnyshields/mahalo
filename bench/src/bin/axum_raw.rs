@@ -10,7 +10,8 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use mahalo_bench::shared::{
-    Fortune, User, World, fortune_rows, parse_count, render_fortunes_html, users_db, world_rows,
+    Fortune, User, World, fortune_rows, parse_count, parse_port, render_fortunes_html, users_db,
+    world_rows,
 };
 use rand::Rng;
 use serde::Deserialize;
@@ -24,13 +25,13 @@ struct AppState {
 
 // ─── TechEmpower: Plaintext ─────────────────────────────────────────
 async fn plaintext() -> impl IntoResponse {
-    ([("content-type", "text/plain"), ("server", "axum")], "Hello, World!")
+    ([("content-type", "text/plain")], "Hello, World!")
 }
 
 // ─── TechEmpower: JSON ──────────────────────────────────────────────
 async fn json() -> impl IntoResponse {
     (
-        [("content-type", "application/json"), ("server", "axum")],
+        [("content-type", "application/json")],
         r#"{"message":"Hello, World!"}"#,
     )
 }
@@ -156,10 +157,7 @@ async fn redirect_handler() -> Redirect {
 
 #[tokio::main]
 async fn main() {
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(3001);
+    let port = parse_port(3001);
 
     let state = AppState {
         worlds: Arc::new(world_rows()),
