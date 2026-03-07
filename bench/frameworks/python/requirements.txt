@@ -1,0 +1,2 @@
+granian>=1.6
+uvicorn>=0.30

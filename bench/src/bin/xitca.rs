@@ -1,0 +1,99 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use std::sync::Arc;
+
+use mahalo_bench::shared::{
+    World, fortune_rows, parse_count, parse_port, parse_query_param, render_fortunes_html,
+    world_rows,
+};
+use rand::Rng;
+use xitca_web::handler::handler_service;
+use xitca_web::handler::uri::UriOwn;
+use xitca_web::route::get;
+use xitca_web::App;
+
+fn main() -> std::io::Result<()> {
+    let port = parse_port(3011);
+
+    let worlds: Arc<Vec<World>> = Arc::new(world_rows());
+    let fortunes = fortune_rows();
+    let fortunes_html: Arc<String> = Arc::new(render_fortunes_html(&fortunes));
+
+    eprintln!("xitca-web listening on 0.0.0.0:{port}");
+
+    let w = worlds.clone();
+    let db_handler = handler_service(move || {
+        let worlds = w.clone();
+        async move {
+            let mut rng = rand::rng();
+            let idx = rng.random_range(0..worlds.len());
+            serde_json::to_string(&worlds[idx]).unwrap()
+        }
+    });
+
+    let w = worlds.clone();
+    let queries_handler = handler_service(move |UriOwn(uri): UriOwn| {
+        let worlds = w.clone();
+        async move {
+            let query = uri.query().unwrap_or("");
+            let count = parse_count(parse_query_param(query, "queries"));
+            let mut rng = rand::rng();
+            let results: Vec<World> = (0..count)
+                .map(|_| worlds[rng.random_range(0..worlds.len())].clone())
+                .collect();
+            serde_json::to_string(&results).unwrap()
+        }
+    });
+
+    let fh = fortunes_html.clone();
+    let fortunes_handler = handler_service(move || {
+        let html = fh.clone();
+        async move { html.as_ref().clone() }
+    });
+
+    let w = worlds.clone();
+    let updates_handler = handler_service(move |UriOwn(uri): UriOwn| {
+        let worlds = w.clone();
+        async move {
+            let query = uri.query().unwrap_or("");
+            let count = parse_count(parse_query_param(query, "queries"));
+            let mut rng = rand::rng();
+            let results: Vec<World> = (0..count)
+                .map(|_| {
+                    let mut w = worlds[rng.random_range(0..worlds.len())].clone();
+                    w.random_number = rng.random_range(1..=10_000);
+                    w
+                })
+                .collect();
+            serde_json::to_string(&results).unwrap()
+        }
+    });
+
+    let w = worlds.clone();
+    let cached_handler = handler_service(move |UriOwn(uri): UriOwn| {
+        let worlds = w.clone();
+        async move {
+            let query = uri.query().unwrap_or("");
+            let count = parse_count(parse_query_param(query, "count"));
+            let mut rng = rand::rng();
+            let results: Vec<World> = (0..count)
+                .map(|_| worlds[rng.random_range(0..worlds.len())].clone())
+                .collect();
+            serde_json::to_string(&results).unwrap()
+        }
+    });
+
+    App::new()
+        .at("/plaintext", get(handler_service(|| async { "Hello, World!" })))
+        .at("/json", get(handler_service(|| async { r#"{"message":"Hello, World!"}"# })))
+        .at("/db", get(db_handler))
+        .at("/queries", get(queries_handler))
+        .at("/fortunes", get(fortunes_handler))
+        .at("/updates", get(updates_handler))
+        .at("/cached-queries", get(cached_handler))
+        .serve()
+        .bind(format!("0.0.0.0:{port}"))?
+        .run()
+        .wait()
+}
