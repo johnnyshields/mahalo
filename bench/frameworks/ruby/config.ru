@@ -70,6 +70,13 @@ app = lambda do |env|
     user = USERS.find { |u| u[:id] == id }
     user ? [200, { "content-type" => "application/json" }, [user.to_json]] :
            [404, { "content-type" => "application/json" }, ['{"error":"not found"}']]
+  when "/api/echo"
+    if env["REQUEST_METHOD"] == "POST"
+      body = env["rack.input"].read
+      [200, { "content-type" => "application/json" }, [body]]
+    else
+      [405, { "content-type" => "text/plain" }, ["Method Not Allowed"]]
+    end
   when "/api/search"
     q = qs["q"] || ""
     page = (qs["page"] || "1").to_i

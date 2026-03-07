@@ -108,7 +108,7 @@ async fn user_by_id(
     if let Some(user) = state.users.iter().find(|u| u.id == id) {
         Json(user.clone()).into_response()
     } else {
-        (StatusCode::NOT_FOUND, r#"{"error":"not found"}"#).into_response()
+        (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "application/json")], r#"{"error":"not found"}"#).into_response()
     }
 }
 

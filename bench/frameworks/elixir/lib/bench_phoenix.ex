@@ -116,10 +116,18 @@ defmodule BenchPhoenix.Router do
     end
   end
 
+  post "/api/echo" do
+    {:ok, body, conn} = Plug.Conn.read_body(conn)
+    conn |> put_resp_content_type("application/json") |> send_resp(200, body)
+  end
+
   get "/api/search" do
     conn = Plug.Conn.fetch_query_params(conn)
     q = conn.query_params["q"] || ""
-    page = BenchPhoenix.Data.parse_count(conn.query_params["page"])
+    page = case Integer.parse(conn.query_params["page"] || "") do
+      {n, _} when n >= 1 -> n
+      _ -> 1
+    end
     limit = min(BenchPhoenix.Data.parse_count(conn.query_params["limit"]) |> max(1), 100)
     offset = (page - 1) * limit
     results = BenchPhoenix.Data.users()

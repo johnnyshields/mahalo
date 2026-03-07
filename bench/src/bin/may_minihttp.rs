@@ -4,7 +4,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::io;
 
 use mahalo_bench::shared::{
-    World, fortune_rows, parse_count, render_fortunes_html, world_rows,
+    World, fortune_rows, parse_count, parse_query_param, render_fortunes_html, world_rows,
 };
 use may_minihttp::{HttpService, HttpServiceFactory, Request, Response};
 use rand::Rng;
@@ -37,7 +37,7 @@ impl HttpService for Techempower {
             }
             "/queries" => {
                 rsp.header("Content-Type: application/json");
-                let count = parse_query_count(query, "queries");
+                let count = parse_count(parse_query_param(query, "queries"));
                 let mut rng = rand::rng();
                 let results: Vec<&World> = (0..count)
                     .map(|_| &self.worlds[rng.random_range(0..self.worlds.len())])
@@ -50,7 +50,7 @@ impl HttpService for Techempower {
             }
             "/updates" => {
                 rsp.header("Content-Type: application/json");
-                let count = parse_query_count(query, "queries");
+                let count = parse_count(parse_query_param(query, "queries"));
                 let mut rng = rand::rng();
                 let results: Vec<World> = (0..count)
                     .map(|_| {
@@ -63,7 +63,7 @@ impl HttpService for Techempower {
             }
             "/cached-queries" => {
                 rsp.header("Content-Type: application/json");
-                let count = parse_query_count(query, "count");
+                let count = parse_count(parse_query_param(query, "count"));
                 let mut rng = rand::rng();
                 let results: Vec<&World> = (0..count)
                     .map(|_| &self.worlds[rng.random_range(0..self.worlds.len())])
@@ -77,17 +77,6 @@ impl HttpService for Techempower {
         }
         Ok(())
     }
-}
-
-fn parse_query_count(query: &str, key: &str) -> usize {
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == key {
-                return parse_count(Some(v));
-            }
-        }
-    }
-    1
 }
 
 struct TechempowerFactory {

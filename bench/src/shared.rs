@@ -57,6 +57,16 @@ pub fn parse_count(raw: Option<&str>) -> usize {
         .clamp(1, 500)
 }
 
+/// Extract a query-string parameter by key from a raw `&str` query string.
+///
+/// Example: `parse_query_param("queries=20&page=1", "queries")` → `Some("20")`
+pub fn parse_query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then_some(v)
+    })
+}
+
 /// Render fortunes as HTML (TechEmpower spec: add extra row, sort, escape).
 pub fn render_fortunes_html(db_rows: &[Fortune]) -> String {
     let mut rows: Vec<(i32, &str)> = db_rows.iter().map(|f| (f.id, f.message.as_str())).collect();

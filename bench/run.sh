@@ -124,7 +124,8 @@ run_pinned() {
     if [ -n "$CORES" ] && command -v taskset &>/dev/null; then
         local end_core=$(( NEXT_CORE + CORES - 1 ))
         if [ $end_core -ge "$TOTAL_CORES" ]; then
-            # Wrap around — not enough cores, just don't pin
+            # Wrap around — reset and don't pin this one
+            NEXT_CORE=0
             "$@" &
         else
             taskset -c "${NEXT_CORE}-${end_core}" "$@" &

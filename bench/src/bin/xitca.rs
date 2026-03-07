@@ -4,10 +4,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::sync::Arc;
 
 use mahalo_bench::shared::{
-    World, fortune_rows, render_fortunes_html, world_rows,
+    World, fortune_rows, parse_count, parse_query_param, render_fortunes_html, world_rows,
 };
 use rand::Rng;
 use xitca_web::handler::handler_service;
+use xitca_web::handler::uri::UriOwn;
 use xitca_web::route::get;
 use xitca_web::App;
 
@@ -34,12 +35,11 @@ fn main() -> std::io::Result<()> {
     });
 
     let w = worlds.clone();
-    let queries_handler = handler_service(move || {
+    let queries_handler = handler_service(move |UriOwn(uri): UriOwn| {
         let worlds = w.clone();
         async move {
-            // xitca doesn't give easy access to query params at this level
-            // Use fixed count=5 for benchmark comparison
-            let count = 5;
+            let query = uri.query().unwrap_or("");
+            let count = parse_count(parse_query_param(query, "queries"));
             let mut rng = rand::rng();
             let results: Vec<World> = (0..count)
                 .map(|_| worlds[rng.random_range(0..worlds.len())].clone())
@@ -55,10 +55,11 @@ fn main() -> std::io::Result<()> {
     });
 
     let w = worlds.clone();
-    let updates_handler = handler_service(move || {
+    let updates_handler = handler_service(move |UriOwn(uri): UriOwn| {
         let worlds = w.clone();
         async move {
-            let count = 5;
+            let query = uri.query().unwrap_or("");
+            let count = parse_count(parse_query_param(query, "queries"));
             let mut rng = rand::rng();
             let results: Vec<World> = (0..count)
                 .map(|_| {
@@ -72,10 +73,11 @@ fn main() -> std::io::Result<()> {
     });
 
     let w = worlds.clone();
-    let cached_handler = handler_service(move || {
+    let cached_handler = handler_service(move |UriOwn(uri): UriOwn| {
         let worlds = w.clone();
         async move {
-            let count = 10;
+            let query = uri.query().unwrap_or("");
+            let count = parse_count(parse_query_param(query, "count"));
             let mut rng = rand::rng();
             let results: Vec<World> = (0..count)
                 .map(|_| worlds[rng.random_range(0..worlds.len())].clone())
