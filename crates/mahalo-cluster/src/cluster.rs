@@ -128,7 +128,7 @@ mod tests {
     #[tokio::test]
     async fn initial_peers_broadcast_node_up() {
         let pubsub = PubSub::start();
-        let mut rx = pubsub.subscribe("mahalo:cluster").await.unwrap();
+        let rx = pubsub.subscribe("mahalo:cluster").unwrap();
 
         let peer1: SocketAddr = "127.0.0.1:4001".parse().unwrap();
         let peer2: SocketAddr = "127.0.0.1:4002".parse().unwrap();
@@ -145,10 +145,8 @@ mod tests {
         // Collect the two node_up messages from initial peers
         let mut seen_addrs: HashSet<String> = HashSet::new();
         for _ in 0..2 {
-            let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-                .await
-                .expect("timed out waiting for node_up")
-                .expect("recv failed");
+            let msg = rx.recv_timeout(Duration::from_secs(2))
+                .expect("timed out waiting for node_up");
             assert_eq!(msg.event, "node_up");
             let addr = msg.payload["addr"].as_str().unwrap().to_string();
             seen_addrs.insert(addr);
@@ -163,7 +161,7 @@ mod tests {
     #[tokio::test]
     async fn poll_detects_new_peer() {
         let pubsub = PubSub::start();
-        let mut rx = pubsub.subscribe("mahalo:cluster").await.unwrap();
+        let rx = pubsub.subscribe("mahalo:cluster").unwrap();
 
         let poll_peers: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(vec![]));
 
@@ -179,10 +177,11 @@ mod tests {
         let new_peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         *poll_peers.lock().unwrap() = vec![new_peer];
 
-        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("timed out waiting for node_up from poll")
-            .expect("recv failed");
+        // Poll with tokio yield to let the interval task run
+        let msg = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("timed out waiting for node_up from poll")
+        }).await.unwrap();
 
         assert_eq!(msg.event, "node_up");
         assert_eq!(msg.payload["addr"].as_str().unwrap(), new_peer.to_string());
@@ -193,7 +192,7 @@ mod tests {
     #[tokio::test]
     async fn poll_detects_removed_peer() {
         let pubsub = PubSub::start();
-        let mut rx = pubsub.subscribe("mahalo:cluster").await.unwrap();
+        let rx = pubsub.subscribe("mahalo:cluster").unwrap();
 
         let peer: SocketAddr = "127.0.0.1:6000".parse().unwrap();
         let poll_peers: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(vec![peer]));
@@ -206,20 +205,24 @@ mod tests {
 
         let _cluster = MahaloCluster::start(20, topo, pubsub.clone()).await;
 
-        // Drain the initial node_up message
-        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("timed out waiting for initial node_up")
-            .expect("recv failed");
-        assert_eq!(msg.event, "node_up");
+        // Drain the initial node_up message via spawn_blocking to not block tokio
+        let rx2 = {
+            let msg = tokio::task::spawn_blocking({
+                let rx = rx.clone();
+                move || rx.recv_timeout(Duration::from_secs(2))
+                    .expect("timed out waiting for initial node_up")
+            }).await.unwrap();
+            assert_eq!(msg.event, "node_up");
+            rx
+        };
 
         // Remove the peer so next poll detects it as gone
         *poll_peers.lock().unwrap() = vec![];
 
-        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("timed out waiting for node_down from poll")
-            .expect("recv failed");
+        let msg = tokio::task::spawn_blocking(move || {
+            rx2.recv_timeout(Duration::from_secs(2))
+                .expect("timed out waiting for node_down from poll")
+        }).await.unwrap();
 
         assert_eq!(msg.event, "node_down");
         assert_eq!(msg.payload["addr"].as_str().unwrap(), peer.to_string());
