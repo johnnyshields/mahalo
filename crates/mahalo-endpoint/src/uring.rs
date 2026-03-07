@@ -1322,4 +1322,16 @@ mod tests {
         assert_eq!(pool.chunk_size(), 256);
         assert!(!pool.as_ptr().is_null());
     }
+
+    #[test]
+    fn buffer_pool_iovecs_count_and_layout() {
+        let pool = BufferPool::new(4, 128);
+        let iovecs = pool.iovecs();
+        assert_eq!(iovecs.len(), 4);
+        let base = pool.as_ptr();
+        for (i, iov) in iovecs.iter().enumerate() {
+            assert_eq!(iov.iov_len, 128);
+            assert_eq!(iov.iov_base as *const u8, unsafe { base.add(i * 128) });
+        }
+    }
 }

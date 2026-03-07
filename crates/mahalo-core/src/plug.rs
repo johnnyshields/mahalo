@@ -10,7 +10,12 @@ pub trait Plug: Send + Sync + 'static {
 
     /// Optional synchronous fast-path. If a plug can execute without async,
     /// override this to return `Ok(conn)` and avoid the BoxFuture allocation.
-    /// The default returns `Err(conn)` (giving it back), meaning `call()` will be used.
+    ///
+    /// Returns `Ok(conn)` when the plug handled the request synchronously, or
+    /// `Err(conn)` (giving it back unchanged) to signal that the caller should
+    /// fall back to the async `call()` method instead.
+    ///
+    /// The default returns `Err(conn)`, meaning `call()` will be used.
     #[inline]
     fn call_sync(&self, conn: Conn) -> Result<Conn, Conn> {
         Err(conn)
@@ -94,5 +99,37 @@ mod tests {
     fn plug_fn_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<PlugFn<fn(Conn) -> std::pin::Pin<Box<dyn Future<Output = Conn> + Send>>>>();
+    }
+
+    #[test]
+    fn sync_plug_fn_call_sync_returns_ok() {
+        let plug = sync_plug_fn(|conn: Conn| conn.put_status(StatusCode::NOT_FOUND));
+        let conn = Conn::new(Method::GET, Uri::from_static("/"));
+        match plug.call_sync(conn) {
+            Ok(conn) => assert_eq!(conn.status, StatusCode::NOT_FOUND),
+            Err(_) => panic!("call_sync should return Ok for SyncPlugFn"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_plug_fn_call_async_fallback() {
+        let plug = sync_plug_fn(|conn: Conn| conn.put_resp_body("sync body"));
+        let conn = Conn::new(Method::GET, Uri::from_static("/"));
+        let conn = plug.call(conn).await;
+        assert_eq!(conn.resp_body, "sync body");
+    }
+
+    #[test]
+    fn async_plug_fn_call_sync_returns_err() {
+        let plug = plug_fn(|conn: Conn| async { conn });
+        let conn = Conn::new(Method::GET, Uri::from_static("/"));
+        let result = plug.call_sync(conn);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sync_plug_fn_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SyncPlugFn<fn(Conn) -> Conn>>();
     }
 }

@@ -343,6 +343,16 @@ mod tests {
     }
 
     #[test]
+    fn put_resp_body_static_zero_copy() {
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .put_resp_body_static(b"hello static");
+        assert_eq!(conn.resp_body, &b"hello static"[..]);
+        // Bytes::from_static does not allocate — the ptr points into the binary's
+        // read-only data segment, not the heap.
+        assert_eq!(conn.resp_body.len(), 12);
+    }
+
+    #[test]
     fn reset_preserves_capacity() {
         let mut conn = Conn::new(Method::GET, Uri::from_static("/"));
         // Add enough headers to force capacity growth.

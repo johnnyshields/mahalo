@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use io_uring::IoUring;
 use mahalo_core::plug::Plug;
@@ -10,12 +11,11 @@ use rebar_core::runtime::Runtime;
 use crate::endpoint::{ErrorHandler, WsConfig};
 use crate::uring::{BufferPool, ConnectionPool, run_event_loop};
 
-/// Spawn io_uring worker threads without joining them. Returns immediately.
+/// Spawn io_uring worker threads, returning their join handles.
 ///
-/// Used by `child_entry` (supervision) where the supervisor manages the lifetime.
 /// Each worker gets its own listening socket (SO_REUSEPORT), io_uring instance,
 /// connection pool, buffer pool, and single-threaded tokio runtime.
-pub fn spawn_uring_workers(
+fn spawn_workers(
     addr: SocketAddr,
     router: Arc<MahaloRouter>,
     error_handler: Option<ErrorHandler>,
@@ -23,48 +23,12 @@ pub fn spawn_uring_workers(
     runtime: Arc<Runtime>,
     body_limit: usize,
     ws_config: Option<WsConfig>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<JoinHandle<()>>, Box<dyn std::error::Error + Send + Sync>> {
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
 
     let error_handler = Arc::new(error_handler);
-
-    for i in 0..num_workers {
-        let router = Arc::clone(&router);
-        let error_handler = Arc::clone(&error_handler);
-        let after_plugs = Arc::clone(&after_plugs);
-        let runtime = Arc::clone(&runtime);
-        let ws_config = ws_config.clone();
-
-        std::thread::Builder::new()
-            .name(format!("uring-worker-{i}"))
-            .spawn(move || {
-                run_worker(i, addr, router, error_handler, after_plugs, runtime, body_limit, ws_config);
-            })?;
-    }
-
-    Ok(())
-}
-
-/// Start a multi-threaded io_uring HTTP server (blocking).
-///
-/// Spawns workers and joins them. Blocks forever. Used by `MahaloEndpoint::start()`.
-pub fn start_uring_server(
-    addr: SocketAddr,
-    router: Arc<MahaloRouter>,
-    error_handler: Option<ErrorHandler>,
-    after_plugs: Arc<Vec<Box<dyn Plug>>>,
-    runtime: Arc<Runtime>,
-    body_limit: usize,
-    ws_config: Option<WsConfig>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let num_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-
-    let error_handler = Arc::new(error_handler);
-
     let mut handles = Vec::with_capacity(num_workers);
 
     for i in 0..num_workers {
@@ -82,6 +46,40 @@ pub fn start_uring_server(
 
         handles.push(handle);
     }
+
+    Ok(handles)
+}
+
+/// Spawn io_uring worker threads without joining them. Returns immediately.
+///
+/// Used by `child_entry` (supervision) where the supervisor manages the lifetime.
+pub fn spawn_uring_workers(
+    addr: SocketAddr,
+    router: Arc<MahaloRouter>,
+    error_handler: Option<ErrorHandler>,
+    after_plugs: Arc<Vec<Box<dyn Plug>>>,
+    runtime: Arc<Runtime>,
+    body_limit: usize,
+    ws_config: Option<WsConfig>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Detach handles — supervisor manages lifetime.
+    let _handles = spawn_workers(addr, router, error_handler, after_plugs, runtime, body_limit, ws_config)?;
+    Ok(())
+}
+
+/// Start a multi-threaded io_uring HTTP server (blocking).
+///
+/// Spawns workers and joins them. Blocks forever. Used by `MahaloEndpoint::start()`.
+pub fn start_uring_server(
+    addr: SocketAddr,
+    router: Arc<MahaloRouter>,
+    error_handler: Option<ErrorHandler>,
+    after_plugs: Arc<Vec<Box<dyn Plug>>>,
+    runtime: Arc<Runtime>,
+    body_limit: usize,
+    ws_config: Option<WsConfig>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let handles = spawn_workers(addr, router, error_handler, after_plugs, runtime, body_limit, ws_config)?;
 
     // Wait for all workers (they run forever unless something goes wrong).
     for handle in handles {
