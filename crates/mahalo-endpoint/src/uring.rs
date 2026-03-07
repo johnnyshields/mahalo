@@ -11,7 +11,7 @@ use nix::libc;
 use rebar_core::gen_server;
 use rebar_core::process::ProcessId;
 use rebar_core::runtime::Runtime;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 
 use mahalo_channel::socket::WsSendItem;
 
@@ -477,8 +477,6 @@ pub(crate) fn run_event_loop(
     let mut ws_dispatches: Vec<WsPendingDispatch> = Vec::with_capacity(64);
     // Track slots that have active WS connections for outbox polling.
     let mut ws_active_slots: Vec<(u32, u32)> = Vec::with_capacity(256); // (slot_idx, generation)
-    // Shared notify for GenServer cast completion signaling.
-    let cast_notify: Arc<Notify> = Arc::new(Notify::new());
 
     // Conn object pool — recycle Conn structs to reuse HeaderMap/HashMap capacity.
     let mut conn_recycle: Vec<Conn> = Vec::with_capacity(CONN_POOL_CAP);
@@ -792,12 +790,11 @@ pub(crate) fn run_event_loop(
 
                     // Start GenServer for this connection
                     let gen_pid = tokio_rt.block_on(async {
-                        let server = mahalo_channel::socket::ChannelConnectionServer::with_notify(
+                        let server = mahalo_channel::socket::ChannelConnectionServer::new(
                             Arc::clone(&wsc.channel_router),
                             wsc.pubsub.clone(),
                             tx.clone(),
                             Arc::clone(runtime),
-                            Arc::clone(&cast_notify),
                         );
                         gen_server::start(runtime, server, rmpv::Value::Nil).await
                     });
@@ -1102,9 +1099,9 @@ pub(crate) fn run_event_loop(
         }
 
         // ---- Batched WebSocket dispatch ----
-        let mut casts_dispatched: usize = 0;
         if !ws_dispatches.is_empty() {
             tokio_rt.block_on(async {
+                let mut ack_rxs = Vec::new();
                 for dispatch in ws_dispatches.drain(..) {
                     let slot = match conn_pool.get(dispatch.slot_idx) {
                         Some(s) if s.generation == (dispatch.generation & 0x00FF_FFFF) => s,
@@ -1112,24 +1109,16 @@ pub(crate) fn run_event_loop(
                     };
                     if let Some(ws) = &slot.ws {
                         let cast_val = rmpv::Value::String(rmpv::Utf8String::from(dispatch.text));
-                        let _ = gen_server::cast_from_runtime(runtime, ws.gen_pid, cast_val).await;
-                        casts_dispatched += 1;
+                        if let Ok(rx) = gen_server::cast_from_runtime_ack(runtime, ws.gen_pid, cast_val).await {
+                            ack_rxs.push(rx);
+                        }
                     }
                 }
-            });
-        }
-
-        // Wait for GenServer cast processing to complete so replies are
-        // ready to drain. Each handle_cast signals cast_notify on completion.
-        if casts_dispatched > 0 {
-            tokio_rt.block_on(async {
-                for _ in 0..casts_dispatched {
-                    if tokio::time::timeout(
+                if !ack_rxs.is_empty() {
+                    let _ = tokio::time::timeout(
                         std::time::Duration::from_millis(50),
-                        cast_notify.notified(),
-                    ).await.is_err() {
-                        break; // Timed out waiting — proceed with whatever is ready.
-                    }
+                        futures::future::join_all(ack_rxs),
+                    ).await;
                 }
             });
         }
