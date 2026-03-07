@@ -4,11 +4,11 @@
 
 ```
 mahalo (umbrella re-export)
-  ├── mahalo-endpoint   → mahalo-router, mahalo-core, rebar-core, axum
+  ├── mahalo-endpoint   → mahalo-router, mahalo-core, rebar-core, monoio
   ├── mahalo-router     → mahalo-core
-  ├── mahalo-channel    → mahalo-core, mahalo-pubsub, axum (ws), futures
-  ├── mahalo-pubsub     → rebar-core, tokio
-  ├── mahalo-telemetry  → rebar-core, tokio
+  ├── mahalo-channel    → mahalo-core, mahalo-pubsub, local-sync
+  ├── mahalo-pubsub     → rebar-core, crossbeam-channel
+  ├── mahalo-telemetry  → rebar-core
   └── mahalo-core       → rebar-core, http, bytes, percent-encoding
 ```
 
@@ -22,12 +22,12 @@ Mahalo follows the same layered architecture as [Phoenix Framework](https://www.
 2. **Plugs** are composable middleware - every transformation is a plug, from authentication to response encoding.
 3. **Pipelines** chain plugs and short-circuit on `halt()`.
 4. **Routers** match HTTP method + path to handlers, with scoping and pipeline assignment.
-5. **Endpoints** bridge the framework to the HTTP server (Axum).
+5. **Endpoints** bridge the framework to the HTTP server (monoio thread-per-core).
 6. **Channels** provide real-time communication over WebSockets using the Phoenix wire protocol.
 7. **PubSub** enables inter-process messaging across channels and other components.
 8. **Telemetry** provides structured observability events.
 
-Unlike Phoenix (which runs on the BEAM), Mahalo runs on **rebar**, a Rust OTP-inspired runtime built on tokio. This gives it supervision trees, named processes, and lifecycle management.
+Unlike Phoenix (which runs on the BEAM), Mahalo runs on **rebar**, a Rust OTP-inspired runtime using a thread-per-core architecture with monoio. This gives it supervision trees, named processes, and lifecycle management — all with `!Send` thread-local state (no `Arc` on the hot path).
 
 ## Request Lifecycle
 
@@ -35,9 +35,9 @@ Unlike Phoenix (which runs on the BEAM), Mahalo runs on **rebar**, a Rust OTP-in
 HTTP Request
     │
     ▼
-MahaloEndpoint (Axum fallback handler)
+MahaloEndpoint (monoio accept loop, per-thread)
     │
-    ├── request_to_conn()      ← Convert Axum Request → Conn
+    ├── parse_request()        ← Parse raw HTTP/1.1 → Conn
     │                              (body limited to 2MB, query params URL-decoded)
     │
     ├── MahaloRouter::resolve() ← Match method + path → ResolvedRoute
@@ -47,7 +47,7 @@ MahaloEndpoint (Axum fallback handler)
     │       │
     │       └── Run Handler      ← Plug or Controller action
     │
-    └── conn_to_response()      ← Convert Conn → Axum Response
+    └── serialize_response()    ← Serialize Conn → raw HTTP/1.1 response
 ```
 
 ## WebSocket Channel Lifecycle
@@ -58,7 +58,7 @@ WebSocket Upgrade
     ▼
 handle_websocket()
     │
-    ├── Spawn send task (forwards mpsc → WebSocket)
+    ├── Spawn send task (forwards local channel → WebSocket)
     │
     └── Receive loop:
         │
@@ -99,7 +99,7 @@ The central request/response struct. Public fields:
 | `resp_headers` | `HeaderMap` | Response headers |
 | `resp_body` | `Bytes` | Response body |
 | `halted` | `bool` | If true, pipeline stops |
-| `runtime` | `Option<Arc<Runtime>>` | rebar runtime reference |
+| `runtime` | `Option<Rc<Runtime>>` | rebar runtime reference |
 
 Private `assigns` map stores typed state via `AssignKey`.
 
@@ -108,8 +108,8 @@ Private `assigns` map stores typed state via `AssignKey`.
 Both `Conn` and `ChannelSocket` use the same `AssignKey` trait for typed state:
 
 ```rust
-pub trait AssignKey: Send + Sync + 'static {
-    type Value: Send + Sync + 'static;
+pub trait AssignKey: 'static {
+    type Value: 'static;
 }
 ```
 
@@ -127,13 +127,13 @@ Routes are matched in registration order. Each route stores:
 
 ### PubSub
 
-Runs as a background tokio task with an `mpsc::UnboundedReceiver` for commands. Topics are lazily created on first subscribe. Each topic maps to a `broadcast::Sender` with capacity 256.
+Runs on a dedicated `std::thread` with a blocking `crossbeam_channel::recv()` loop for commands. Topics are lazily created on first subscribe. Each topic maps to a set of crossbeam senders.
 
-`subscribe()` returns `Option<Receiver>` (returns `None` if the server task has dropped). `broadcast()` is fire-and-forget. `unsubscribe()` triggers cleanup of empty topics.
+`subscribe()` is synchronous and returns `Option<crossbeam::Receiver<PubSubMessage>>` (returns `None` if the PubSub thread has stopped). `broadcast()` is fire-and-forget. `unsubscribe()` triggers cleanup of empty topics.
 
 ### Channel
 
-The `Channel` trait uses `async_trait` and has four lifecycle callbacks:
+The `Channel` trait has four lifecycle callbacks (using RPITIT, no `async_trait`):
 
 | Method | When Called | Return |
 |--------|-----------|--------|

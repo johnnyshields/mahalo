@@ -11,10 +11,10 @@ crates/
   mahalo/           # Umbrella crate - re-exports everything
   mahalo-core/      # Conn, Plug, Pipeline, Controller, AssignKey
   mahalo-router/    # MahaloRouter, scopes, resources, named routes, path matching
-  mahalo-endpoint/  # Platform-adaptive HTTP server, error handlers, after-plugs, rebar supervision
-                    #   handler.rs    - shared request execution + bind_socket helper
-                    #   worker.rs     - io_uring event loop (Linux only)
-                    #   tcp_server.rs - tokio TCP server (all platforms)
+  mahalo-endpoint/  # Thread-per-core HTTP server (monoio), error handlers, after-plugs, rebar supervision
+                    #   handler.rs    - shared request execution helper
+                    #   worker.rs     - thread-per-core worker spawning with SO_REUSEPORT + CPU affinity
+                    #   server.rs     - monoio accept loop + connection handler
                     #   http_parse.rs - zero-alloc HTTP/1.1 parser + serializer
   mahalo-pubsub/    # Topic-based PubSub with broadcast channels
   mahalo-channel/   # Phoenix-compatible WebSocket channels
@@ -29,9 +29,9 @@ crates/
 - **Pipeline** (`mahalo-core`): Ordered sequence of Plugs, halts early if `conn.halted`.
 - **Controller** (`mahalo-core`): RESTful trait with index/show/create/update/delete.
 - **MahaloRouter** (`mahalo-router`): Routes with scopes, named pipelines, named routes, `resources()` for CRUD, and `path_for()` reverse routing.
-- **MahaloEndpoint** (`mahalo-endpoint`): Platform-adaptive HTTP server. Uses io_uring on Linux, tokio TCP on other platforms. Body limit: 2MB default. Supports custom error handlers and after-plugs (post-handler pipeline). Shared logic in `handler.rs` (`execute_request`, `bind_socket`).
-- **ErrorHandler** (`mahalo-endpoint`): `Arc<dyn Fn(StatusCode, Conn) -> Conn + Send + Sync>`. Built-in: `json_error_handler()`, `text_error_handler()`.
-- **PubSub** (`mahalo-pubsub`): Background tokio task managing topic -> broadcast channel map.
+- **MahaloEndpoint** (`mahalo-endpoint`): Thread-per-core HTTP server using monoio (FusionDriver: io_uring on Linux, epoll/kqueue elsewhere). Factory pattern for per-thread state. Body limit: 2MB default. Supports custom error handlers and after-plugs (post-handler pipeline).
+- **ErrorHandler** (`mahalo-endpoint`): `Rc<dyn Fn(StatusCode, Conn) -> Conn>`. Built-in: `json_error_handler()`, `text_error_handler()`.
+- **PubSub** (`mahalo-pubsub`): Dedicated `std::thread` managing topic -> crossbeam channel map. `Clone + Send + Sync`.
 - **Channel** (`mahalo-channel`): Phoenix-compatible WebSocket channels with join/handle_in/handle_info/terminate.
 - **ChannelSocket** (`mahalo-channel`): Per-connection state with typed assigns (uses `AssignKey`, same as Conn).
 - **ChannelRouter** (`mahalo-channel`): Maps topic patterns (e.g. `"room:*"`) to Channel impls.
@@ -57,16 +57,15 @@ There are no features flags. Edition is 2024. All crates use `workspace = true` 
 
 ## Dependencies
 
-- **rebar-core**: OTP-style runtime, supervision, processes (path dep at `../rebar`)
-- **io-uring 0.7**: Linux io_uring HTTP server
-- **tokio**: Async runtime (full features)
+- **rebar-core**: OTP-style runtime, supervision, processes (git dep, branch `rebar-v4`)
+- **monoio**: Thread-per-core async runtime (FusionDriver: io_uring on Linux, epoll/kqueue elsewhere)
+- **local-sync**: `!Send` channel primitives for GenServer and socket communication
+- **crossbeam-channel**: Lock-free cross-thread channels (PubSub)
 - **serde/serde_json**: Serialization
 - **http**: HTTP types (Method, StatusCode, Uri, HeaderMap)
 - **bytes**: Efficient byte buffers
 - **tracing**: Structured logging
-- **async-trait**: Async trait methods (Channel, Controller)
 - **percent-encoding**: URL decoding for query params
-- **futures**: Stream/Sink for WebSocket handling
 - **sha2**: SHA-256 hashing (ETag, CSRF)
 - **hmac**: HMAC computation (CSRF)
 - **uuid**: UUID v4 generation (Request ID)
@@ -79,7 +78,7 @@ There are no features flags. Edition is 2024. All crates use `workspace = true` 
 - **Typed assigns**: Both Conn and ChannelSocket use the `AssignKey` trait for type-safe state storage. Define a zero-sized struct, impl `AssignKey` with an associated `Value` type.
 - **Phoenix wire format**: WebSocket messages use `PhoenixMessage` with `topic`, `event`, `payload`, `ref` fields. Events: `phx_join`, `phx_leave`, `heartbeat`, custom events.
 - **Topic patterns**: ChannelRouter supports exact match (`"room:lobby"`) and wildcard (`"room:*"`).
-- **PubSub subscribe returns Option**: `subscribe()` returns `Option<Receiver>` (not panic). Always handle the `None` case.
+- **PubSub subscribe returns Option**: `subscribe()` is synchronous, returns `Option<crossbeam::Receiver<PubSubMessage>>`. Always handle the `None` case.
 - **Error handling**: `ChannelError` implements `Display` + `Error`. Prefer `Result` over panics.
 - **Send failures are logged**: `tracing::warn` on WebSocket send failures in push/reply/heartbeat.
 - **No unwrap in production paths**: Only use `.unwrap()` in tests.
@@ -90,7 +89,7 @@ There are no features flags. Edition is 2024. All crates use `workspace = true` 
 
 - Each crate has `#[cfg(test)] mod tests` in source files (not separate test files).
 - Integration tests live alongside unit tests (see `endpoint.rs` integration test).
-- Use `tokio::test` for async tests, plain `#[test]` for sync.
+- Use plain `#[test]` for sync tests. Async tests use monoio runtime where needed.
 - PubSub tests should call `pubsub.shutdown()` at the end.
 - Use `"127.0.0.1:0"` for random port binding in integration tests.
 - Use `Conn::test()` for quick test Conn construction (GET /).

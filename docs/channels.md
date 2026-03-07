@@ -25,70 +25,80 @@ handle_websocket()
 Implement the `Channel` trait:
 
 ```rust
-use async_trait::async_trait;
-use mahalo::{Channel, ChannelError, ChannelSocket, Reply};
+use mahalo::{Channel, ChannelError, ChannelSocket, BoxFuture, Reply};
 use serde_json::Value;
 
 struct ChatChannel;
 
-#[async_trait]
 impl Channel for ChatChannel {
     /// Called when a client joins this channel's topic.
     /// Return Ok(payload) to accept, Err to reject.
-    async fn join(
-        &self,
-        topic: &str,
-        payload: &Value,
-        socket: &mut ChannelSocket,
-    ) -> Result<Value, ChannelError> {
-        // Validate authorization
-        let token = payload.get("token").and_then(|t| t.as_str());
-        if token != Some("valid") {
-            return Err(ChannelError::NotAuthorized);
-        }
+    fn join<'a>(
+        &'a self,
+        topic: &'a str,
+        payload: &'a Value,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, Result<Value, ChannelError>> {
+        Box::pin(async move {
+            // Validate authorization
+            let token = payload.get("token").and_then(|t| t.as_str());
+            if token != Some("valid") {
+                return Err(ChannelError::NotAuthorized);
+            }
 
-        // Store state on the socket
-        socket.assign::<UserName>("anonymous".to_string());
+            // Store state on the socket
+            socket.assign::<UserName>("anonymous".to_string());
 
-        Ok(serde_json::json!({"status": "joined", "topic": topic}))
+            Ok(serde_json::json!({"status": "joined", "topic": topic}))
+        })
     }
 
     /// Called when the client sends a custom event.
     /// Return Ok(Some(reply)) to reply, Ok(None) for no reply.
-    async fn handle_in(
-        &self,
-        event: &str,
-        payload: &Value,
-        socket: &mut ChannelSocket,
-    ) -> Result<Option<Reply>, ChannelError> {
-        match event {
-            "new_msg" => {
-                // Broadcast to all subscribers on this topic
-                socket.broadcast("new_msg", payload.clone());
-                Ok(Some(Reply::ok(serde_json::json!({"sent": true}))))
+    fn handle_in<'a>(
+        &'a self,
+        event: &'a str,
+        payload: &'a Value,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, Result<Option<Reply>, ChannelError>> {
+        Box::pin(async move {
+            match event {
+                "new_msg" => {
+                    // Broadcast to all subscribers on this topic
+                    socket.broadcast("new_msg", payload.clone());
+                    Ok(Some(Reply::ok(serde_json::json!({"sent": true}))))
+                }
+                "ping" => {
+                    Ok(Some(Reply::ok(serde_json::json!({"pong": true}))))
+                }
+                _ => Ok(None)
             }
-            "ping" => {
-                Ok(Some(Reply::ok(serde_json::json!({"pong": true}))))
-            }
-            _ => Ok(None)
-        }
+        })
     }
 
     /// Called when a PubSub message arrives for this topic.
     /// Default implementation pushes the message to the client.
-    async fn handle_info(
-        &self,
-        msg: &mahalo_pubsub::PubSubMessage,
-        socket: &mut ChannelSocket,
-    ) -> Result<(), ChannelError> {
-        // Custom filtering or transformation
-        socket.push(&msg.event, &msg.payload).await;
-        Ok(())
+    fn handle_info<'a>(
+        &'a self,
+        msg: &'a mahalo_pubsub::PubSubMessage,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, Result<(), ChannelError>> {
+        Box::pin(async move {
+            // Custom filtering or transformation
+            socket.push(&msg.event, &msg.payload).await;
+            Ok(())
+        })
     }
 
     /// Called on leave or disconnect. Cleanup resources here.
-    async fn terminate(&self, reason: &str, _socket: &mut ChannelSocket) {
-        println!("Channel terminated: {reason}");
+    fn terminate<'a>(
+        &'a self,
+        reason: &'a str,
+        _socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            println!("Channel terminated: {reason}");
+        })
     }
 }
 ```
@@ -120,12 +130,11 @@ let name = socket.get_assign::<UserName>(); // Some(&"alice")
 Map topic patterns to channel implementations:
 
 ```rust
-use std::sync::Arc;
 use mahalo::ChannelRouter;
 
 let channel_router = ChannelRouter::new()
-    .channel("room:*", Arc::new(ChatChannel))      // wildcard: room:lobby, room:123, etc.
-    .channel("notifications", Arc::new(NotifyChannel)); // exact match
+    .channel("room:*", ChatChannel)        // wildcard: room:lobby, room:123, etc.
+    .channel("notifications", NotifyChannel); // exact match
 ```
 
 **Topic patterns:**
@@ -136,28 +145,22 @@ Routes are matched in registration order; first match wins.
 
 ## Wiring It Up
 
+Channels are registered via the endpoint's factory pattern using `WsConfig`:
+
 ```rust
-use std::sync::Arc;
-use axum::extract::ws::WebSocketUpgrade;
-use axum::response::IntoResponse;
-use mahalo::{ChannelRouter, PubSub, handle_websocket};
+use mahalo::{MahaloEndpoint, ChannelRouter, PubSub, WsConfig};
 
-let pubsub = PubSub::start();
-let channel_router = Arc::new(
-    ChannelRouter::new()
-        .channel("room:*", Arc::new(ChatChannel))
-);
+let endpoint = MahaloEndpoint::new(|| build_router(), addr)
+    .channels(|| WsConfig {
+        channel_router: ChannelRouter::new()
+            .channel("room:*", ChatChannel),
+        pubsub: PubSub::start(),
+    });
 
-// Axum handler
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    // Extract channel_router and pubsub from Axum state
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| {
-        handle_websocket(socket, channel_router, pubsub)
-    })
-}
+endpoint.start().unwrap();
 ```
+
+Each worker thread creates its own `WsConfig` via the factory closure, keeping channel state thread-local.
 
 ## Phoenix Wire Protocol
 

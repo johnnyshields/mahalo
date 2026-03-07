@@ -5,7 +5,7 @@ Plugs are Mahalo's composable middleware abstraction. Every request transformati
 ## The Plug Trait
 
 ```rust
-pub trait Plug: Send + Sync + 'static {
+pub trait Plug: 'static {
     fn call(&self, conn: Conn) -> BoxFuture<'_, Conn>;
 }
 ```

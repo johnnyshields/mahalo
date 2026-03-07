@@ -31,7 +31,7 @@ crates/
   mahalo/             Umbrella crate — re-exports everything
   mahalo-core/        Conn, Plug, Pipeline, Controller, AssignKey
   mahalo-router/      Router with scopes, resources, named routes
-  mahalo-endpoint/    Axum bridge, HTTP server, error handlers
+  mahalo-endpoint/    Thread-per-core HTTP server (monoio), error handlers
   mahalo-pubsub/      Topic-based PubSub
   mahalo-channel/     Phoenix-compatible WebSocket channels
   mahalo-telemetry/   Telemetry events, handlers, spans
@@ -47,27 +47,28 @@ bench/                Cross-framework benchmark suite
 use mahalo::*;
 use http::StatusCode;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let api_pipeline = Pipeline::new("api")
         .plug(plug_fn(|conn: Conn| async {
             conn.put_resp_header("content-type", "application/json")
         }));
 
-    let router = MahaloRouter::new()
-        .pipeline(api_pipeline)
-        .scope("/api", &["api"], |s| {
-            s.get("/hello", plug_fn(|conn: Conn| async {
-                conn.put_status(StatusCode::OK)
-                    .put_resp_body(r#"{"message": "Aloha!"}"#)
-            }));
-        });
-
     let addr = "127.0.0.1:4000".parse().unwrap();
-    let runtime = std::sync::Arc::new(rebar_core::runtime::Runtime::new(4));
-    let endpoint = MahaloEndpoint::new(router, addr, runtime);
+    let endpoint = MahaloEndpoint::new(
+        move || {
+            MahaloRouter::new()
+                .pipeline(api_pipeline.clone())
+                .scope("/api", &["api"], |s| {
+                    s.get("/hello", plug_fn(|conn: Conn| async {
+                        conn.put_status(StatusCode::OK)
+                            .put_resp_body(r#"{"message": "Aloha!"}"#)
+                    }));
+                })
+        },
+        addr,
+    );
 
-    endpoint.start().await.unwrap();
+    endpoint.start().unwrap();
 }
 ```
 
@@ -80,7 +81,7 @@ cargo test --workspace
 
 ## Dependencies
 
-Built on [Axum](https://github.com/tokio-rs/axum), [Tokio](https://tokio.rs/), and the [rebar](https://github.com/johnnyshields/rebar) OTP-style runtime. No feature flags required — edition 2024.
+Built on [monoio](https://github.com/bytedance/monoio) (thread-per-core async runtime) and the [rebar](https://github.com/johnnyshields/rebar) OTP-style runtime. No feature flags required — edition 2024.
 
 ## License
 

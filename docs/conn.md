@@ -11,7 +11,7 @@ use http::{Method, Uri};
 let conn = Conn::new(Method::GET, Uri::from_static("/api/rooms"));
 ```
 
-In production, `Conn` is created by `MahaloEndpoint` from the incoming Axum request. You'll typically create `Conn` directly only in tests.
+In production, `Conn` is created by the monoio server from the parsed HTTP/1.1 request. You'll typically create `Conn` directly only in tests.
 
 ## Builder Methods
 
@@ -45,7 +45,7 @@ Mark the connection as halted. Pipelines will stop executing further plugs when 
 
 Store a typed value in the assigns map. See [Typed Assigns](#typed-assigns) below.
 
-### `with_runtime(runtime: Arc<Runtime>) -> Self`
+### `with_runtime(runtime: Rc<Runtime>) -> Self`
 
 Attach a rebar runtime reference to the connection.
 
@@ -78,7 +78,7 @@ conn.resp_body      // bytes::Bytes
 
 // Control flow
 conn.halted         // bool - if true, pipeline stops
-conn.runtime        // Option<Arc<Runtime>> - rebar runtime
+conn.runtime        // Option<Rc<Runtime>> - rebar runtime
 ```
 
 ## Typed Assigns

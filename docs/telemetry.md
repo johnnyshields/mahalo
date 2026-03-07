@@ -1,6 +1,6 @@
 # Telemetry Guide
 
-Mahalo Telemetry provides structured observability events for monitoring, metrics, and debugging. It uses its own broadcast channel system independent of rebar's lifecycle events.
+Mahalo Telemetry provides structured observability events for monitoring, metrics, and debugging. Handlers are synchronous and thread-local (`Rc<RefCell>`), with no broadcast channels or atomics.
 
 ## Overview
 
@@ -15,14 +15,13 @@ The telemetry system has three operations:
 ```rust
 use mahalo::Telemetry;
 
-// With custom broadcast channel capacity
 let telemetry = Telemetry::new(512);
 
 // Or use the default (capacity 512)
 let telemetry = Telemetry::default();
 ```
 
-`Telemetry` is `Clone + Send + Sync` and can be shared freely.
+`Telemetry` is `Clone` and thread-local (not `Send`). Each worker thread creates its own instance.
 
 ## Emitting Events
 
@@ -40,12 +39,10 @@ telemetry.execute(
     &["mahalo", "endpoint", "stop"],
     measurements,
     metadata,
-).await;
+);
 ```
 
-Events are:
-- Dispatched to matching attached handlers (inline, synchronous)
-- Broadcast on the internal channel to subscribers
+Events are dispatched synchronously to all matching attached handlers inline.
 
 ## Attaching Handlers
 
@@ -58,7 +55,7 @@ telemetry.attach(&["mahalo", "endpoint"], |event| {
         event.name,
         event.measurements.get("duration_ms")
     );
-}).await;
+});
 ```
 
 Handlers run inline during `execute()`. Keep them fast to avoid blocking the request path.
@@ -81,21 +78,6 @@ let result = telemetry.span(
 This emits:
 1. `["mahalo", "db", "query", "start"]` with the metadata (before the work)
 2. `["mahalo", "db", "query", "stop"]` with `duration_ms` measurement + metadata (after the work)
-
-## Subscribing to Raw Events
-
-For async consumers (e.g. metrics exporters), subscribe to the broadcast channel:
-
-```rust
-let mut rx = telemetry.subscribe();
-
-tokio::spawn(async move {
-    while let Ok(event) = rx.recv().await {
-        // Process event asynchronously
-        metrics::emit(event);
-    }
-});
-```
 
 ## Built-in Event Names
 
@@ -141,7 +123,7 @@ telemetry.attach(&["mahalo", "endpoint", "stop"], |event| {
     let path = event.metadata.get("path").and_then(|v| v.as_str()).unwrap_or("?");
     let duration = event.measurements.get("duration_ms").unwrap_or(&0.0);
     tracing::info!("{method} {path} completed in {duration:.2}ms");
-}).await;
+});
 ```
 
 ## Example: Prometheus Metrics
@@ -152,5 +134,5 @@ telemetry.attach(&["mahalo"], |event| {
     for (key, value) in &event.measurements {
         prometheus::histogram!(format!("{name}.{key}"), *value);
     }
-}).await;
+});
 ```

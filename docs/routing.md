@@ -99,9 +99,7 @@ let router = MahaloRouter::new()
 Generate standard CRUD routes for a `Controller`:
 
 ```rust
-use std::sync::Arc;
-
-s.resources("/rooms", Arc::new(RoomController));
+s.resources("/rooms", RoomController);
 ```
 
 This generates:
