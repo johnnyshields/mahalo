@@ -10,7 +10,7 @@ pub use mahalo_router::MahaloRouter;
 // Endpoint (io_uring HTTP server)
 pub use mahalo_endpoint::{
     json_error_handler, text_error_handler, ErrorHandler, MahaloApplication,
-    MahaloApplicationBuilder, MahaloEndpoint,
+    MahaloApplicationBuilder, MahaloEndpoint, WsConfig,
 };
 
 // PubSub

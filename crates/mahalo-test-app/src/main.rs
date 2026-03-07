@@ -17,7 +17,6 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use http::StatusCode;
 use serde::Serialize;
 
@@ -62,15 +61,22 @@ struct OrderItem {
 // In-Memory Store
 // ---------------------------------------------------------------------------
 
+/// Shared store data (Send + Sync, shared across worker threads).
 #[derive(Clone)]
-struct Store {
+struct StoreData {
     flavors: Arc<Mutex<Vec<Flavor>>>,
     orders: Arc<Mutex<Vec<Order>>>,
+}
+
+/// Thread-local store with telemetry (created per-worker).
+#[derive(Clone)]
+struct Store {
+    data: StoreData,
     telemetry: Telemetry,
 }
 
-impl Store {
-    fn new(telemetry: Telemetry) -> Self {
+impl StoreData {
+    fn new() -> Self {
         let flavors = vec![
             Flavor { id: 1, name: "Coconut Dream".into(), description: "Creamy coconut with toasted flakes".into(), price_cents: 450, in_stock: true },
             Flavor { id: 2, name: "Pineapple Paradise".into(), description: "Tangy pineapple sorbet".into(), price_cents: 400, in_stock: true },
@@ -81,11 +87,16 @@ impl Store {
             Flavor { id: 7, name: "Papaya Cream".into(), description: "Smooth papaya with coconut cream".into(), price_cents: 450, in_stock: false },
         ];
 
-        Store {
+        StoreData {
             flavors: Arc::new(Mutex::new(flavors)),
             orders: Arc::new(Mutex::new(Vec::new())),
-            telemetry,
         }
+    }
+}
+
+impl Store {
+    fn new(data: StoreData, telemetry: Telemetry) -> Self {
+        Store { data, telemetry }
     }
 }
 
@@ -120,7 +131,7 @@ struct FlavorController {
 impl Controller for FlavorController {
     fn index(&self, conn: Conn) -> BoxFuture<'_, Conn> {
         Box::pin(async {
-            let flavors = self.store.flavors.lock().unwrap();
+            let flavors = self.store.data.flavors.lock().unwrap();
             let json = serde_json::to_string(&*flavors).unwrap();
             conn.put_status(StatusCode::OK).put_resp_body(json)
         })
@@ -130,7 +141,7 @@ impl Controller for FlavorController {
         Box::pin(async {
             let id = parse_id_param(&conn);
 
-            let flavors = self.store.flavors.lock().unwrap();
+            let flavors = self.store.data.flavors.lock().unwrap();
             match flavors.iter().find(|f| f.id == id) {
                 Some(flavor) => {
                     let json = serde_json::to_string(flavor).unwrap();
@@ -156,7 +167,7 @@ impl Controller for FlavorController {
             };
 
             let json = {
-                let mut flavors = self.store.flavors.lock().unwrap();
+                let mut flavors = self.store.data.flavors.lock().unwrap();
                 let next_id = flavors.iter().map(|f| f.id).max().unwrap_or(0) + 1;
 
                 let flavor = Flavor {
@@ -172,13 +183,11 @@ impl Controller for FlavorController {
                 json
             };
 
-            telemetry
-                .execute(
+            telemetry.execute(
                     &["ice_cream", "flavor", "created"],
                     HashMap::new(),
                     HashMap::new(),
-                )
-                .await;
+                );
 
             conn.put_status(StatusCode::CREATED).put_resp_body(json)
         })
@@ -197,7 +206,7 @@ impl Controller for FlavorController {
                 }
             };
 
-            let mut flavors = self.store.flavors.lock().unwrap();
+            let mut flavors = self.store.data.flavors.lock().unwrap();
             match flavors.iter_mut().find(|f| f.id == id) {
                 Some(flavor) => {
                     if let Some(name) = body["name"].as_str() {
@@ -226,7 +235,7 @@ impl Controller for FlavorController {
         Box::pin(async {
             let id = parse_id_param(&conn);
 
-            let mut flavors = self.store.flavors.lock().unwrap();
+            let mut flavors = self.store.data.flavors.lock().unwrap();
             let len_before = flavors.len();
             flavors.retain(|f| f.id != id);
 
@@ -253,7 +262,7 @@ struct OrderController {
 impl Controller for OrderController {
     fn index(&self, conn: Conn) -> BoxFuture<'_, Conn> {
         Box::pin(async {
-            let orders = self.store.orders.lock().unwrap();
+            let orders = self.store.data.orders.lock().unwrap();
             let json = serde_json::to_string(&*orders).unwrap();
             conn.put_status(StatusCode::OK).put_resp_body(json)
         })
@@ -263,7 +272,7 @@ impl Controller for OrderController {
         Box::pin(async {
             let id = parse_id_param(&conn);
 
-            let orders = self.store.orders.lock().unwrap();
+            let orders = self.store.data.orders.lock().unwrap();
             match orders.iter().find(|o| o.id == id) {
                 Some(order) => {
                     let json = serde_json::to_string(order).unwrap();
@@ -290,7 +299,7 @@ impl Controller for OrderController {
             };
 
             let (json, order_id) = {
-                let mut orders = self.store.orders.lock().unwrap();
+                let mut orders = self.store.data.orders.lock().unwrap();
                 let next_id = orders.iter().map(|o| o.id).max().unwrap_or(0) + 1;
 
                 let items: Vec<OrderItem> = body["items"]
@@ -329,13 +338,11 @@ impl Controller for OrderController {
                 "order_id".to_string(),
                 serde_json::json!(order_id),
             );
-            telemetry
-                .execute(
+            telemetry.execute(
                     &["ice_cream", "order", "placed"],
                     HashMap::new(),
                     meta,
-                )
-                .await;
+                );
 
             // Broadcast via PubSub
             pubsub.broadcast(
@@ -361,7 +368,7 @@ impl Controller for OrderController {
                 }
             };
 
-            let mut orders = self.store.orders.lock().unwrap();
+            let mut orders = self.store.data.orders.lock().unwrap();
             match orders.iter_mut().find(|o| o.id == id) {
                 Some(order) => {
                     if let Some(status) = body["status"].as_str() {
@@ -381,7 +388,7 @@ impl Controller for OrderController {
         Box::pin(async {
             let id = parse_id_param(&conn);
 
-            let mut orders = self.store.orders.lock().unwrap();
+            let mut orders = self.store.data.orders.lock().unwrap();
             let len_before = orders.len();
             orders.retain(|o| o.id != id);
 
@@ -405,142 +412,151 @@ struct OrderChannel {
     pubsub: PubSub,
 }
 
-#[async_trait]
 impl Channel for OrderChannel {
-    async fn join(
-        &self,
-        topic: &str,
-        payload: &serde_json::Value,
-        socket: &mut ChannelSocket,
-    ) -> Result<serde_json::Value, ChannelError> {
-        let customer = payload["customer_name"]
-            .as_str()
-            .unwrap_or("Guest")
-            .to_string();
+    fn join<'a>(
+        &'a self,
+        topic: &'a str,
+        payload: &'a serde_json::Value,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, Result<serde_json::Value, ChannelError>> {
+        Box::pin(async move {
+            let customer = payload["customer_name"]
+                .as_str()
+                .unwrap_or("Guest")
+                .to_string();
 
-        tracing::info!(topic = %topic, customer = %customer, "Customer joined order channel");
-        socket.assign::<CustomerName>(customer.clone());
+            tracing::info!(topic = %topic, customer = %customer, "Customer joined order channel");
+            socket.assign::<CustomerName>(customer.clone());
 
-        // Extract order ID from topic (e.g., "order:42")
-        let order_id = parse_order_id(topic);
+            // Extract order ID from topic (e.g., "order:42")
+            let order_id = parse_order_id(topic);
 
-        let status = {
-            let orders = self.store.orders.lock().unwrap();
-            orders
-                .iter()
-                .find(|o| o.id == order_id)
-                .map(|o| o.status.clone())
-                .unwrap_or_else(|| "not_found".to_string())
-        };
+            let status = {
+                let orders = self.store.data.orders.lock().unwrap();
+                orders
+                    .iter()
+                    .find(|o| o.id == order_id)
+                    .map(|o| o.status.clone())
+                    .unwrap_or_else(|| "not_found".to_string())
+            };
 
-        // Spawn a local task to simulate order status progression
-        if status == "pending" {
-            let sim_store = self.store.clone();
-            let sim_pubsub = self.pubsub.clone();
-            let topic = topic.to_string();
-            let sim_order_id = order_id;
-            monoio::spawn(async move {
-                let statuses = ["preparing", "ready", "delivered"];
-                for next_status in statuses {
-                    monoio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    {
-                        let mut orders = sim_store.orders.lock().unwrap();
-                        if let Some(order) = orders.iter_mut().find(|o| o.id == sim_order_id) {
-                            order.status = next_status.to_string();
+            // Spawn a local task to simulate order status progression
+            if status == "pending" {
+                let sim_store = self.store.clone();
+                let sim_pubsub = self.pubsub.clone();
+                let topic = topic.to_string();
+                let sim_order_id = order_id;
+                monoio::spawn(async move {
+                    let statuses = ["preparing", "ready", "delivered"];
+                    for next_status in statuses {
+                        monoio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        {
+                            let mut orders = sim_store.data.orders.lock().unwrap();
+                            if let Some(order) = orders.iter_mut().find(|o| o.id == sim_order_id) {
+                                order.status = next_status.to_string();
+                            }
                         }
+                        tracing::info!(order_id = sim_order_id, status = next_status, "📦 Order status updated");
+                        sim_pubsub.broadcast(
+                            &topic,
+                            "status_changed",
+                            serde_json::json!({
+                                "order_id": sim_order_id,
+                                "status": next_status,
+                            }),
+                        );
                     }
-                    tracing::info!(order_id = sim_order_id, status = next_status, "📦 Order status updated");
-                    sim_pubsub.broadcast(
-                        &topic,
+                });
+            }
+
+            Ok(serde_json::json!({
+                "status": status,
+                "customer": customer,
+            }))
+        })
+    }
+
+    fn handle_in<'a>(
+        &'a self,
+        event: &'a str,
+        payload: &'a serde_json::Value,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, Result<Option<Reply>, ChannelError>> {
+        Box::pin(async move {
+            match event {
+                "update_status" => {
+                    let order_id = parse_order_id(&socket.topic);
+
+                    let new_status = payload["status"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_string();
+
+                    let mut orders = self.store.data.orders.lock().unwrap();
+                    if let Some(order) = orders.iter_mut().find(|o| o.id == order_id) {
+                        order.status = new_status.clone();
+                    }
+
+                    // Broadcast status change to all subscribers
+                    socket.broadcast(
                         "status_changed",
                         serde_json::json!({
-                            "order_id": sim_order_id,
-                            "status": next_status,
-                        }),
-                    );
-                }
-            });
-        }
-
-        Ok(serde_json::json!({
-            "status": status,
-            "customer": customer,
-        }))
-    }
-
-    async fn handle_in(
-        &self,
-        event: &str,
-        payload: &serde_json::Value,
-        socket: &mut ChannelSocket,
-    ) -> Result<Option<Reply>, ChannelError> {
-        match event {
-            "update_status" => {
-                let order_id = parse_order_id(&socket.topic);
-
-                let new_status = payload["status"]
-                    .as_str()
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                let mut orders = self.store.orders.lock().unwrap();
-                if let Some(order) = orders.iter_mut().find(|o| o.id == order_id) {
-                    order.status = new_status.clone();
-                }
-
-                // Broadcast status change to all subscribers
-                socket.broadcast(
-                    "status_changed",
-                    serde_json::json!({
-                        "order_id": order_id,
-                        "status": new_status,
-                    }),
-                );
-
-                Ok(Some(Reply::ok(serde_json::json!({"updated": true}))))
-            }
-            "add_item" => {
-                let order_id = parse_order_id(&socket.topic);
-
-                let item = OrderItem {
-                    flavor_id: payload["flavor_id"].as_u64().unwrap_or(0),
-                    scoops: payload["scoops"].as_u64().unwrap_or(1) as u32,
-                    topping: payload["topping"].as_str().map(|s| s.to_string()),
-                };
-
-                let mut orders = self.store.orders.lock().unwrap();
-                if let Some(order) = orders.iter_mut().find(|o| o.id == order_id) {
-                    order.items.push(item.clone());
-
-                    socket.broadcast(
-                        "item_added",
-                        serde_json::json!({
                             "order_id": order_id,
-                            "item": item,
+                            "status": new_status,
                         }),
                     );
 
-                    Ok(Some(Reply::ok(serde_json::json!({"added": true}))))
-                } else {
-                    Ok(Some(Reply::error(
-                        serde_json::json!({"error": "order not found"}),
-                    )))
+                    Ok(Some(Reply::ok(serde_json::json!({"updated": true}))))
                 }
+                "add_item" => {
+                    let order_id = parse_order_id(&socket.topic);
+
+                    let item = OrderItem {
+                        flavor_id: payload["flavor_id"].as_u64().unwrap_or(0),
+                        scoops: payload["scoops"].as_u64().unwrap_or(1) as u32,
+                        topping: payload["topping"].as_str().map(|s| s.to_string()),
+                    };
+
+                    let mut orders = self.store.data.orders.lock().unwrap();
+                    if let Some(order) = orders.iter_mut().find(|o| o.id == order_id) {
+                        order.items.push(item.clone());
+
+                        socket.broadcast(
+                            "item_added",
+                            serde_json::json!({
+                                "order_id": order_id,
+                                "item": item,
+                            }),
+                        );
+
+                        Ok(Some(Reply::ok(serde_json::json!({"added": true}))))
+                    } else {
+                        Ok(Some(Reply::error(
+                            serde_json::json!({"error": "order not found"}),
+                        )))
+                    }
+                }
+                _ => Ok(None),
             }
-            _ => Ok(None),
-        }
+        })
     }
 
-    async fn terminate(&self, reason: &str, socket: &mut ChannelSocket) {
-        let customer = socket
-            .get_assign::<CustomerName>()
-            .cloned()
-            .unwrap_or_else(|| "Unknown".to_string());
-        tracing::info!(
-            customer = %customer,
-            reason = %reason,
-            "Customer left order channel"
-        );
+    fn terminate<'a>(
+        &'a self,
+        reason: &'a str,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let customer = socket
+                .get_assign::<CustomerName>()
+                .cloned()
+                .unwrap_or_else(|| "Unknown".to_string());
+            tracing::info!(
+                customer = %customer,
+                reason = %reason,
+                "Customer left order channel"
+            );
+        })
     }
 }
 
@@ -548,110 +564,119 @@ struct StoreChannel {
     store: Store,
 }
 
-#[async_trait]
 impl Channel for StoreChannel {
-    async fn join(
-        &self,
-        _topic: &str,
-        payload: &serde_json::Value,
-        socket: &mut ChannelSocket,
-    ) -> Result<serde_json::Value, ChannelError> {
-        let customer = payload["customer_name"]
-            .as_str()
-            .unwrap_or("Guest")
-            .to_string();
+    fn join<'a>(
+        &'a self,
+        _topic: &'a str,
+        payload: &'a serde_json::Value,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, Result<serde_json::Value, ChannelError>> {
+        Box::pin(async move {
+            let customer = payload["customer_name"]
+                .as_str()
+                .unwrap_or("Guest")
+                .to_string();
 
-        tracing::info!(customer = %customer, "Customer entered the store lobby");
-        socket.assign::<CustomerName>(customer.clone());
+            tracing::info!(customer = %customer, "Customer entered the store lobby");
+            socket.assign::<CustomerName>(customer.clone());
 
-        socket.broadcast(
-            "customer_arrived",
-            serde_json::json!({"customer": customer}),
-        );
+            socket.broadcast(
+                "customer_arrived",
+                serde_json::json!({"customer": customer}),
+            );
 
-        Ok(serde_json::json!({
-            "message": format!("Welcome to the Mahalo Ice Cream Store, {customer}!"),
-        }))
+            Ok(serde_json::json!({
+                "message": format!("Welcome to the Mahalo Ice Cream Store, {customer}!"),
+            }))
+        })
     }
 
-    async fn handle_in(
-        &self,
-        event: &str,
-        payload: &serde_json::Value,
-        socket: &mut ChannelSocket,
-    ) -> Result<Option<Reply>, ChannelError> {
-        match event {
-            "announcement" => {
-                let message = payload["message"]
-                    .as_str()
-                    .unwrap_or("No message")
-                    .to_string();
-
-                socket.broadcast(
-                    "store_announcement",
-                    serde_json::json!({"message": message}),
-                );
-
-                Ok(Some(Reply::ok(serde_json::json!({"announced": true}))))
-            }
-            "request_menu" => {
-                let menu_payload = {
-                    let flavors = self.store.flavors.lock().unwrap();
-                    let menu: Vec<serde_json::Value> = flavors
-                        .iter()
-                        .filter(|f| f.in_stock)
-                        .map(|f| {
-                            serde_json::json!({
-                                "name": f.name,
-                                "price": format!("${:.2}", f.price_cents as f64 / 100.0),
-                            })
-                        })
-                        .collect();
-                    serde_json::json!({"flavors": menu})
-                };
-
-                socket.push("menu", &menu_payload).await;
-
-                Ok(Some(Reply::ok(serde_json::json!({"sent": true}))))
-            }
-            "update_price" => {
-                let flavor_id = payload["flavor_id"].as_u64().unwrap_or(0);
-                let new_price_cents = payload["price_cents"].as_u64().unwrap_or(0);
-
-                let mut flavors = self.store.flavors.lock().unwrap();
-                if let Some(flavor) = flavors.iter_mut().find(|f| f.id == flavor_id) {
-                    flavor.price_cents = new_price_cents;
-                    let price_str = format_price(new_price_cents);
-                    let flavor_name = flavor.name.clone();
+    fn handle_in<'a>(
+        &'a self,
+        event: &'a str,
+        payload: &'a serde_json::Value,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, Result<Option<Reply>, ChannelError>> {
+        Box::pin(async move {
+            match event {
+                "announcement" => {
+                    let message = payload["message"]
+                        .as_str()
+                        .unwrap_or("No message")
+                        .to_string();
 
                     socket.broadcast(
-                        "price_updated",
-                        serde_json::json!({
-                            "flavor_id": flavor_id,
-                            "price": price_str,
-                            "flavor_name": flavor_name,
-                        }),
+                        "store_announcement",
+                        serde_json::json!({"message": message}),
                     );
 
-                    Ok(Some(Reply::ok(serde_json::json!({"updated": true}))))
-                } else {
-                    Ok(Some(Reply::error(serde_json::json!({"error": "flavor not found"}))))
+                    Ok(Some(Reply::ok(serde_json::json!({"announced": true}))))
                 }
+                "request_menu" => {
+                    let menu_payload = {
+                        let flavors = self.store.data.flavors.lock().unwrap();
+                        let menu: Vec<serde_json::Value> = flavors
+                            .iter()
+                            .filter(|f| f.in_stock)
+                            .map(|f| {
+                                serde_json::json!({
+                                    "name": f.name,
+                                    "price": format!("${:.2}", f.price_cents as f64 / 100.0),
+                                })
+                            })
+                            .collect();
+                        serde_json::json!({"flavors": menu})
+                    };
+
+                    socket.push("menu", &menu_payload).await;
+
+                    Ok(Some(Reply::ok(serde_json::json!({"sent": true}))))
+                }
+                "update_price" => {
+                    let flavor_id = payload["flavor_id"].as_u64().unwrap_or(0);
+                    let new_price_cents = payload["price_cents"].as_u64().unwrap_or(0);
+
+                    let mut flavors = self.store.data.flavors.lock().unwrap();
+                    if let Some(flavor) = flavors.iter_mut().find(|f| f.id == flavor_id) {
+                        flavor.price_cents = new_price_cents;
+                        let price_str = format_price(new_price_cents);
+                        let flavor_name = flavor.name.clone();
+
+                        socket.broadcast(
+                            "price_updated",
+                            serde_json::json!({
+                                "flavor_id": flavor_id,
+                                "price": price_str,
+                                "flavor_name": flavor_name,
+                            }),
+                        );
+
+                        Ok(Some(Reply::ok(serde_json::json!({"updated": true}))))
+                    } else {
+                        Ok(Some(Reply::error(serde_json::json!({"error": "flavor not found"}))))
+                    }
+                }
+                _ => Ok(None),
             }
-            _ => Ok(None),
-        }
+        })
     }
 
-    async fn terminate(&self, reason: &str, socket: &mut ChannelSocket) {
-        let customer = socket
-            .get_assign::<CustomerName>()
-            .cloned()
-            .unwrap_or_else(|| "Unknown".to_string());
-        tracing::info!(
-            customer = %customer,
-            reason = %reason,
-            "Customer left the store"
-        );
+    fn terminate<'a>(
+        &'a self,
+        reason: &'a str,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let customer = socket
+                .get_assign::<CustomerName>()
+                .cloned()
+                .unwrap_or_else(|| "Unknown".to_string());
+            tracing::info!(
+                customer = %customer,
+                reason = %reason,
+                "Customer left the store"
+            );
+        })
     }
 }
 
@@ -682,56 +707,65 @@ impl ChatResponder {
 
 struct SupportChannel;
 
-#[async_trait]
 impl Channel for SupportChannel {
-    async fn join(
-        &self,
-        _topic: &str,
-        payload: &serde_json::Value,
-        socket: &mut ChannelSocket,
-    ) -> Result<serde_json::Value, ChannelError> {
-        let customer = payload["customer_name"]
-            .as_str()
-            .unwrap_or("Guest")
-            .to_string();
-        tracing::info!(customer = %customer, "Customer joined support chat");
-        socket.assign::<CustomerName>(customer.clone());
+    fn join<'a>(
+        &'a self,
+        _topic: &'a str,
+        payload: &'a serde_json::Value,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, Result<serde_json::Value, ChannelError>> {
+        Box::pin(async move {
+            let customer = payload["customer_name"]
+                .as_str()
+                .unwrap_or("Guest")
+                .to_string();
+            tracing::info!(customer = %customer, "Customer joined support chat");
+            socket.assign::<CustomerName>(customer.clone());
 
-        Ok(serde_json::json!({
-            "message": format!("🌺 Aloha {customer}! How can we help you today?"),
-        }))
+            Ok(serde_json::json!({
+                "message": format!("🌺 Aloha {customer}! How can we help you today?"),
+            }))
+        })
     }
 
-    async fn handle_in(
-        &self,
-        event: &str,
-        payload: &serde_json::Value,
-        socket: &mut ChannelSocket,
-    ) -> Result<Option<Reply>, ChannelError> {
-        match event {
-            "chat_message" => {
-                let msg = payload["message"].as_str().unwrap_or("");
-                let responder = ChatResponder;
-                let response = responder.respond(msg);
+    fn handle_in<'a>(
+        &'a self,
+        event: &'a str,
+        payload: &'a serde_json::Value,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, Result<Option<Reply>, ChannelError>> {
+        Box::pin(async move {
+            match event {
+                "chat_message" => {
+                    let msg = payload["message"].as_str().unwrap_or("");
+                    let responder = ChatResponder;
+                    let response = responder.respond(msg);
 
-                // Broadcast the reply so all connected clients see it
-                socket.broadcast(
-                    "chat_reply",
-                    serde_json::json!({"message": response}),
-                );
+                    // Broadcast the reply so all connected clients see it
+                    socket.broadcast(
+                        "chat_reply",
+                        serde_json::json!({"message": response}),
+                    );
 
-                Ok(Some(Reply::ok(serde_json::json!({"response": response}))))
+                    Ok(Some(Reply::ok(serde_json::json!({"response": response}))))
+                }
+                _ => Ok(None),
             }
-            _ => Ok(None),
-        }
+        })
     }
 
-    async fn terminate(&self, reason: &str, socket: &mut ChannelSocket) {
-        let customer = socket
-            .get_assign::<CustomerName>()
-            .cloned()
-            .unwrap_or_else(|| "Unknown".to_string());
-        tracing::info!(customer = %customer, reason = %reason, "Customer left support chat");
+    fn terminate<'a>(
+        &'a self,
+        reason: &'a str,
+        socket: &'a mut ChannelSocket,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let customer = socket
+                .get_assign::<CustomerName>()
+                .cloned()
+                .unwrap_or_else(|| "Unknown".to_string());
+            tracing::info!(customer = %customer, reason = %reason, "Customer left support chat");
+        })
     }
 }
 
@@ -791,7 +825,7 @@ fn render_template(conn: Conn, tera: &Tera, name: &str, context: &Context) -> Co
 
 fn render_home(conn: Conn, tera: &Tera, store: &Store) -> Conn {
     let mut context = Context::new();
-    let flavors = store.flavors.lock().unwrap();
+    let flavors = store.data.flavors.lock().unwrap();
     let featured: Vec<serde_json::Value> = flavors.iter().take(3).map(|f| format_flavor(f)).collect();
     context.insert("flavors", &featured);
     render_template(conn, tera, "home.html", &context)
@@ -799,7 +833,7 @@ fn render_home(conn: Conn, tera: &Tera, store: &Store) -> Conn {
 
 fn render_menu(conn: Conn, tera: &Tera, store: &Store) -> Conn {
     let mut context = Context::new();
-    let flavors = store.flavors.lock().unwrap();
+    let flavors = store.data.flavors.lock().unwrap();
     let all_flavors: Vec<serde_json::Value> = flavors.iter().map(|f| format_flavor(f)).collect();
     context.insert("flavors", &all_flavors);
 
@@ -820,7 +854,7 @@ fn render_menu(conn: Conn, tera: &Tera, store: &Store) -> Conn {
 
 fn render_order(conn: Conn, tera: &Tera, store: &Store) -> Conn {
     let mut context = Context::new();
-    let flavors = store.flavors.lock().unwrap();
+    let flavors = store.data.flavors.lock().unwrap();
     let in_stock: Vec<serde_json::Value> = flavors.iter().filter(|f| f.in_stock).map(|f| format_flavor(f)).collect();
     context.insert("flavors", &in_stock);
     let toppings: Vec<serde_json::Value> = toppings_data()
@@ -863,7 +897,7 @@ fn render_about(conn: Conn, tera: &Tera) -> Conn {
 
 fn render_flavor(conn: Conn, tera: &Tera, store: &Store) -> Conn {
     let id = parse_id_param(&conn);
-    let flavors = store.flavors.lock().unwrap();
+    let flavors = store.data.flavors.lock().unwrap();
     match flavors.iter().find(|f| f.id == id) {
         Some(flavor) => {
             let mut context = Context::new();
@@ -940,75 +974,45 @@ fn main() {
         )
         .init();
 
-    // Start PubSub
+    // Start PubSub (Send + Sync — shared across workers)
     let pubsub = PubSub::start();
 
-    // Set up telemetry (thread-local, will be created per-worker via factory)
-    let telemetry = Telemetry::new(512);
+    // Shared store data (Send + Sync — shared across workers)
+    let store_data = StoreData::new();
 
-    telemetry.attach(&["mahalo"], |event| {
-        tracing::debug!(
-            name = ?event.name,
-            measurements = ?event.measurements,
-            "[telemetry] framework event"
-        );
-    });
-
-    telemetry.attach(&["ice_cream"], |event| {
-        tracing::info!(
-            name = ?event.name,
-            metadata = ?event.metadata,
-            "[telemetry] app event"
-        );
-    });
-
-    // Create the store
-    let store = Store::new(telemetry.clone());
-
-    // Initialize Tera templates
+    // Initialize Tera templates (Send + Sync via Arc)
     let template_dir = format!("{}/templates/**/*", env!("CARGO_MANIFEST_DIR"));
     let tera = Arc::new(Tera::new(&template_dir).expect("Failed to load templates"));
 
-    // Static files plug
+    // Static files directory
     let static_dir = format!("{}/static", env!("CARGO_MANIFEST_DIR"));
-
-    // Build controllers (Arc so they can be shared into factory closures)
-    let flavor_controller = Arc::new(FlavorController {
-        store: store.clone(),
-    });
-    let order_controller = Arc::new(OrderController {
-        store: store.clone(),
-        pubsub: pubsub.clone(),
-    });
 
     let addr: std::net::SocketAddr = "127.0.0.1:4000".parse().unwrap();
 
     // --- Build endpoint with factory pattern ---
+    // Each factory creates thread-local (!Send) instances per worker thread.
 
     let endpoint = MahaloEndpoint::new(
         {
-            let store = store.clone();
+            let store_data = store_data.clone();
             let tera = tera.clone();
-            let telemetry = telemetry.clone();
-            let flavor_controller = flavor_controller.clone();
-            let order_controller = order_controller.clone();
+            let pubsub = pubsub.clone();
             move || {
-                build_router(
-                    store.clone(),
-                    tera.clone(),
-                    telemetry.clone(),
-                    flavor_controller.clone(),
-                    order_controller.clone(),
-                )
+                // Create per-worker telemetry + store
+                let telemetry = make_telemetry();
+                let store = Store::new(store_data.clone(), telemetry);
+                build_router(store, tera.clone(), pubsub.clone())
             }
         },
         addr,
     )
     .channels({
-        let store = store.clone();
+        let store_data = store_data.clone();
         let pubsub = pubsub.clone();
         move || {
             use mahalo::WsConfig;
+            let telemetry = make_telemetry();
+            let store = Store::new(store_data.clone(), telemetry);
             let channel_router = ChannelRouter::new()
                 .channel(
                     "order:*",
@@ -1046,7 +1050,7 @@ fn main() {
     });
 
     // Background task: fluctuate prices every 15 seconds for real-time demo
-    let price_store = store.clone();
+    let price_store = store_data.clone();
     let price_pubsub = pubsub.clone();
     let startup_seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1102,13 +1106,40 @@ fn main() {
     }
 }
 
+/// Create per-worker telemetry with standard handlers attached.
+fn make_telemetry() -> Telemetry {
+    let telemetry = Telemetry::new(512);
+    telemetry.attach(&["mahalo"], |event| {
+        tracing::debug!(
+            name = ?event.name,
+            measurements = ?event.measurements,
+            "[telemetry] framework event"
+        );
+    });
+    telemetry.attach(&["ice_cream"], |event| {
+        tracing::info!(
+            name = ?event.name,
+            metadata = ?event.metadata,
+            "[telemetry] app event"
+        );
+    });
+    telemetry
+}
+
 fn build_router(
     store: Store,
     tera: Arc<Tera>,
-    telemetry: Telemetry,
-    flavor_controller: Arc<FlavorController>,
-    order_controller: Arc<OrderController>,
+    pubsub: PubSub,
 ) -> MahaloRouter {
+    // Build controllers (thread-local, created per worker)
+    let flavor_controller: Rc<dyn Controller> = Rc::new(FlavorController {
+        store: store.clone(),
+    });
+    let order_controller: Rc<dyn Controller> = Rc::new(OrderController {
+        store: store.clone(),
+        pubsub: pubsub.clone(),
+    });
+
     // --- Pipelines ---
 
     let browser_pipeline = Pipeline::new("browser").plug(plug_fn(|conn: Conn| async {
@@ -1137,7 +1168,7 @@ fn build_router(
     // --- Standalone plug closures that capture store/telemetry ---
 
     let store_for_menu = store.clone();
-    let telemetry_for_menu = telemetry.clone();
+    let telemetry_for_menu = store.telemetry.clone();
 
     // --- Router ---
 
@@ -1195,7 +1226,7 @@ fn build_router(
                                 &["ice_cream", "menu", "build"],
                                 HashMap::new(),
                                 || async {
-                                    let flavors = store.flavors.lock().unwrap();
+                                    let flavors = store.data.flavors.lock().unwrap();
                                     let menu: Vec<serde_json::Value> = flavors
                                         .iter()
                                         .filter(|f| f.in_stock)
