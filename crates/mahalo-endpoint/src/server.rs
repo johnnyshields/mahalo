@@ -10,6 +10,9 @@ use rebar_core::runtime::Runtime;
 use crate::endpoint::{ErrorHandler, WsConfig};
 use crate::http_parse::{self, ParseError};
 
+/// Default buffer size for read operations (lease and Vec fallback).
+const DEFAULT_BUF_SIZE: usize = 8192;
+
 /// Run the accept loop on the current executor using an existing listener.
 pub(crate) async fn run_accept_loop(
     listener: TcpListener,
@@ -99,7 +102,7 @@ async fn handle_connection(
         }
 
         // Fast path: lease a buffer, read, try to parse in one shot.
-        let lease = rebar_core::executor::with_buffer_pool(|pool| pool.lease(8192)).flatten();
+        let lease = rebar_core::executor::with_buffer_pool(|pool| pool.lease(DEFAULT_BUF_SIZE)).flatten();
 
         match lease {
             Some(lease) => {
@@ -135,17 +138,20 @@ async fn handle_connection(
                             return;
                         }
 
-                        if let Some(leftover_bytes) = leftover_data {
-                            // Pipelining: copy leftover to accum for next iteration.
-                            let mut buf = vec![0u8; 8192];
-                            buf[..leftover_bytes.len()].copy_from_slice(&leftover_bytes);
-                            accum = Some((buf, leftover_bytes.len()));
+                        if let Some(mut leftover_bytes) = leftover_data {
+                            // Pipelining: reuse the to_vec() allocation directly.
+                            let filled = leftover_bytes.len();
+                            if leftover_bytes.capacity() < DEFAULT_BUF_SIZE {
+                                leftover_bytes.reserve(DEFAULT_BUF_SIZE - leftover_bytes.len());
+                            }
+                            leftover_bytes.resize(leftover_bytes.capacity(), 0);
+                            accum = Some((leftover_bytes, filled));
                         }
                         // lease drops here — zero-alloc for the common case.
                     }
                     Ok(None) => {
                         // Incomplete — copy to accum, fall back to Vec path.
-                        let cap = 8192usize.max(n * 2);
+                        let cap = DEFAULT_BUF_SIZE.max(n * 2);
                         let mut buf = vec![0u8; cap];
                         buf[..n].copy_from_slice(&lease.as_slice()[..n]);
                         accum = Some((buf, n));
@@ -162,7 +168,7 @@ async fn handle_connection(
             }
             None => {
                 // No pool or arena full — use Vec path for this read cycle.
-                accum = Some((vec![0u8; 8192], 0));
+                accum = Some((vec![0u8; DEFAULT_BUF_SIZE], 0));
             }
         }
     }
@@ -234,7 +240,7 @@ async fn vec_read_loop(
 ) -> bool {
     // Read more data.
     if *filled == buf.len() {
-        if buf.len() >= body_limit + 8192 {
+        if buf.len() >= body_limit + DEFAULT_BUF_SIZE {
             let _ = stream.write_all(http_parse::RESPONSE_413.to_vec()).await;
             return false;
         }
@@ -277,7 +283,7 @@ async fn vec_read_loop(
             }
             Ok(None) => {
                 if *filled == buf.len() {
-                    if buf.len() >= body_limit + 8192 {
+                    if buf.len() >= body_limit + DEFAULT_BUF_SIZE {
                         let _ = stream.write_all(http_parse::RESPONSE_413.to_vec()).await;
                         return false;
                     }
@@ -294,5 +300,118 @@ async fn vec_read_loop(
                 return false;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::StatusCode;
+    use mahalo_core::conn::Conn;
+    use mahalo_core::plug::plug_fn;
+    use rebar_core::executor::{ExecutorConfig, RebarExecutor};
+    use std::io::{Read as _, Write as _};
+    use turbine_core::config::PoolConfig;
+
+    /// Helper: send an HTTP request to `addr` on a background std thread
+    /// and return the raw response bytes.
+    fn http_roundtrip(addr: std::net::SocketAddr, request: &[u8]) -> String {
+        let request = request.to_vec();
+        let handle = std::thread::spawn(move || {
+            // Small delay to let the accept loop start.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(&request).unwrap();
+            let mut response = Vec::new();
+            let _ = stream.read_to_end(&mut response);
+            String::from_utf8(response).unwrap()
+        });
+        handle.join().unwrap()
+    }
+
+    /// Run the accept loop with the given executor config and router,
+    /// send one request, and return the response.
+    fn serve_one_request(
+        exec_config: ExecutorConfig,
+        route: &str,
+        body: &str,
+        request: &[u8],
+    ) -> String {
+        let route = route.to_string();
+        let body = body.to_string();
+        let request = request.to_vec();
+
+        // We need the address before we can send the request, but the
+        // accept loop runs inside block_on. Use a channel to pass it out.
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let ex = RebarExecutor::new(exec_config).unwrap();
+            ex.block_on(async {
+                let listener =
+                    rebar_core::io::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let addr = listener.local_addr().unwrap();
+                addr_tx.send(addr).unwrap();
+
+                let router = MahaloRouter::new().get(
+                    &route,
+                    plug_fn(move |conn: Conn| {
+                        let body = body.clone();
+                        async move { conn.put_status(StatusCode::OK).put_resp_body(body) }
+                    }),
+                );
+                let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
+
+                run_accept_loop(listener, router, None, vec![], runtime, 2 * 1024 * 1024, None)
+                    .await;
+            });
+        });
+
+        let addr = addr_rx.recv().unwrap();
+        let response = http_roundtrip(addr, &request);
+        drop(handle); // Server thread runs forever; test just checks the response.
+        response
+    }
+
+    #[test]
+    fn lease_read_path_serves_http_request() {
+        let response = serve_one_request(
+            ExecutorConfig {
+                pool_config: Some(PoolConfig::default()),
+                ..Default::default()
+            },
+            "/hello",
+            "world",
+            b"GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            response.contains("world"),
+            "response body missing: {response}"
+        );
+    }
+
+    #[test]
+    fn fallback_vec_path_serves_http_request() {
+        let response = serve_one_request(
+            ExecutorConfig::default(),
+            "/ping",
+            "pong",
+            b"GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            response.contains("pong"),
+            "response body missing: {response}"
+        );
     }
 }

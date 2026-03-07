@@ -11,10 +11,10 @@ crates/
   mahalo/           # Umbrella crate - re-exports everything
   mahalo-core/      # Conn, Plug, Pipeline, Controller, AssignKey
   mahalo-router/    # MahaloRouter, scopes, resources, named routes, path matching
-  mahalo-endpoint/  # Thread-per-core HTTP server (monoio), error handlers, after-plugs, rebar supervision
+  mahalo-endpoint/  # Thread-per-core HTTP server (compio + turbine), error handlers, after-plugs, rebar supervision
                     #   handler.rs    - shared request execution helper
                     #   worker.rs     - thread-per-core worker spawning with SO_REUSEPORT + CPU affinity
-                    #   server.rs     - monoio accept loop + connection handler
+                    #   server.rs     - compio accept loop + hybrid lease/Vec connection handler
                     #   http_parse.rs - zero-alloc HTTP/1.1 parser + serializer
   mahalo-pubsub/    # Topic-based PubSub with broadcast channels
   mahalo-channel/   # Phoenix-compatible WebSocket channels
@@ -29,7 +29,7 @@ crates/
 - **Pipeline** (`mahalo-core`): Ordered sequence of Plugs, halts early if `conn.halted`.
 - **Controller** (`mahalo-core`): RESTful trait with index/show/create/update/delete.
 - **MahaloRouter** (`mahalo-router`): Routes with scopes, named pipelines, named routes, `resources()` for CRUD, and `path_for()` reverse routing.
-- **MahaloEndpoint** (`mahalo-endpoint`): Thread-per-core HTTP server using monoio (FusionDriver: io_uring on Linux, epoll/kqueue elsewhere). Factory pattern for per-thread state. Body limit: 2MB default. Supports custom error handlers and after-plugs (post-handler pipeline).
+- **MahaloEndpoint** (`mahalo-endpoint`): Thread-per-core HTTP server using compio (io_uring on Linux, IOCP on Windows, kqueue on macOS) with turbine zero-copy buffer pool. Factory pattern for per-thread state. Body limit: 2MB default. Supports custom error handlers and after-plugs (post-handler pipeline).
 - **ErrorHandler** (`mahalo-endpoint`): `Rc<dyn Fn(StatusCode, Conn) -> Conn>`. Built-in: `json_error_handler()`, `text_error_handler()`.
 - **PubSub** (`mahalo-pubsub`): Dedicated `std::thread` managing topic -> crossbeam channel map. `Clone + Send + Sync`.
 - **Channel** (`mahalo-channel`): Phoenix-compatible WebSocket channels with join/handle_in/handle_info/terminate.
@@ -57,8 +57,9 @@ There are no features flags. Edition is 2024. All crates use `workspace = true` 
 
 ## Dependencies
 
-- **rebar-core**: OTP-style runtime, supervision, processes (git dep, branch `rebar-v4`)
-- **monoio**: Thread-per-core async runtime (FusionDriver: io_uring on Linux, epoll/kqueue elsewhere)
+- **rebar-core**: OTP-style runtime, supervision, processes (git dep, branch `rebar-v5`)
+- **turbine-core**: Epoch-arena buffer pool, `LeasedBuffer`, zero-copy I/O primitives (git dep via rebar)
+- **compio-driver**: Completion-based I/O driver (io_uring on Linux, IOCP on Windows, kqueue on macOS)
 - **local-sync**: `!Send` channel primitives for GenServer and socket communication
 - **crossbeam-channel**: Lock-free cross-thread channels (PubSub)
 - **serde/serde_json**: Serialization
@@ -84,6 +85,29 @@ There are no features flags. Edition is 2024. All crates use `workspace = true` 
 - **No unwrap in production paths**: Only use `.unwrap()` in tests.
 - **Named routes**: Use `get_named()`, `post_named()`, etc. for reverse routing. `resources()` auto-generates names like `rooms_index`, `rooms_show`.
 - **After-plugs**: Use `endpoint.after(plug)` for plugs that run after the handler (e.g., ETag, logger finish).
+
+## Turbine Zero-Copy I/O
+
+### Buffer Pool Lifecycle
+- Each worker thread creates a `RebarExecutor` with `pool_config: Some(PoolConfig::default())`.
+- Access the thread-local pool via `rebar_core::executor::with_buffer_pool(|pool| pool.lease(size))`.
+- `LeasedBuffer` is a RAII handle — the buffer is returned to the arena on drop.
+
+### LeaseIoBuf (rebar-core/io.rs)
+- `LeaseIoBuf` wraps `LeasedBuffer` to implement compio's `IoBuf`/`IoBufMut`/`SetLen` traits.
+- Enables zero-copy reads: the kernel writes directly into epoch-arena memory.
+- Unsafe blocks must carry `// SAFETY:` comments documenting invariants.
+
+### Hybrid Read Strategy (mahalo-endpoint/server.rs)
+- **Fast path**: Lease a buffer, read, parse in one shot. If the full request fits in one read, no heap allocation occurs.
+- **Fallback**: If no pool, arena exhausted, or request is incomplete, fall back to a heap-allocated `Vec<u8>`.
+- `DEFAULT_BUF_SIZE` (8192) is the standard buffer size for both paths.
+- Leftover bytes from HTTP pipelining reuse the `to_vec()` allocation directly (no double-copy).
+
+### Arc<Value> in PubSub
+- `PubSubMessage.payload` is `Arc<serde_json::Value>` — cloning a message is O(1) for the payload.
+- Use `PubSub::broadcast_arc()` when the payload is already behind an `Arc` (e.g., relay from bridge) to avoid deep-cloning.
+- The distributed bridge (`DistributedPubSub`) uses `broadcast_arc()` and `Arc::clone()` internally.
 
 ## Testing Conventions
 

@@ -171,10 +171,24 @@ impl PubSub {
     /// This is a fire-and-forget operation: if the topic has no subscribers
     /// the message is silently dropped.
     pub fn broadcast(&self, topic: &str, event: impl Into<String>, payload: serde_json::Value) {
+        self.broadcast_arc(topic, event, Arc::new(payload));
+    }
+
+    /// Broadcast a pre-wrapped `Arc<Value>` without cloning the payload.
+    ///
+    /// Use this when the payload is already behind an `Arc` (e.g., from
+    /// a `PubSubMessage` received via the distributed bridge) to avoid a
+    /// deep-clone of the JSON tree.
+    pub fn broadcast_arc(
+        &self,
+        topic: &str,
+        event: impl Into<String>,
+        payload: Arc<serde_json::Value>,
+    ) {
         let msg = PubSubMessage {
             topic: topic.to_string(),
             event: event.into(),
-            payload: Arc::new(payload),
+            payload,
         };
         let _ = self.cmd_tx.send(PubSubCommand::Broadcast {
             topic: topic.to_string(),
