@@ -4,7 +4,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::sync::Arc;
 
 use mahalo_bench::shared::{
-    World, fortune_rows, parse_count, parse_query_param, render_fortunes_html, world_rows,
+    World, fortune_rows, parse_count, parse_port, parse_query_param, render_fortunes_html,
+    world_rows,
 };
 use rand::Rng;
 use xitca_web::handler::handler_service;
@@ -13,10 +14,7 @@ use xitca_web::route::get;
 use xitca_web::App;
 
 fn main() -> std::io::Result<()> {
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(3011);
+    let port = parse_port(3011);
 
     let worlds: Arc<Vec<World>> = Arc::new(world_rows());
     let fortunes = fortune_rows();

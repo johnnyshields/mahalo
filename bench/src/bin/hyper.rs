@@ -11,8 +11,8 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use mahalo_bench::shared::{
-    Fortune, User, World, fortune_rows, parse_count, parse_query_param, render_fortunes_html,
-    users_db, world_rows,
+    Fortune, User, World, fortune_rows, parse_count, parse_port, parse_query_param,
+    render_fortunes_html, users_db, world_rows,
 };
 use rand::Rng;
 use tokio::net::TcpListener;
@@ -29,7 +29,6 @@ fn ok_response(content_type: &str, body: impl Into<Bytes>) -> Response<Body> {
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", content_type)
-        .header("server", "hyper")
         .body(Full::new(body.into()))
         .unwrap()
 }
@@ -151,12 +150,17 @@ async fn handle(
         // ─── REST API: POST echo ────────────────────────────────────
         (&Method::POST, "/api/echo") => {
             use http_body_util::BodyExt;
-            let body = req.into_body().collect().await.unwrap().to_bytes();
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(Full::new(body))
-                .unwrap()
+            match req.into_body().collect().await {
+                Ok(collected) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(collected.to_bytes()))
+                    .unwrap(),
+                Err(_) => Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Full::new(Bytes::from("bad request")))
+                    .unwrap(),
+            }
         }
 
         // ─── Browser page ───────────────────────────────────────────
@@ -183,10 +187,7 @@ async fn handle(
 
 #[tokio::main]
 async fn main() {
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(3012);
+    let port = parse_port(3012);
 
     let state = Arc::new(AppState {
         worlds: world_rows(),

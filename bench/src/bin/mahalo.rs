@@ -4,14 +4,15 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use http::header::{HeaderValue, CONTENT_TYPE, SERVER};
+use http::header::{HeaderValue, CONTENT_TYPE};
 use http::StatusCode;
 use mahalo::{
     Conn, ETag, MahaloEndpoint, MahaloRouter, Pipeline, RequestId, SecureHeaders,
     plug_fn, request_logger, sync_plug_fn,
 };
 use mahalo_bench::shared::{
-    Fortune, User, World, fortune_rows, parse_count, render_fortunes_html, users_db, world_rows,
+    Fortune, User, World, fortune_rows, parse_count, parse_port, render_fortunes_html, users_db,
+    world_rows,
 };
 use rand::Rng;
 use rebar_core::runtime::Runtime;
@@ -20,14 +21,9 @@ use rebar_core::runtime::Runtime;
 static CT_TEXT: HeaderValue = HeaderValue::from_static("text/plain");
 static CT_JSON: HeaderValue = HeaderValue::from_static("application/json");
 static CT_HTML: HeaderValue = HeaderValue::from_static("text/html; charset=utf-8");
-static SRV: HeaderValue = HeaderValue::from_static("mahalo");
-
 #[tokio::main]
 async fn main() {
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(3000);
+    let port = parse_port(3000);
 
     let runtime = Arc::new(Runtime::new(1));
 
@@ -42,21 +38,15 @@ async fn main() {
     // "bare" pipeline — zero middleware, raw speed
     let bare = Pipeline::new("bare");
 
-    // "api" pipeline — request ID + server header
+    // "api" pipeline — request ID
     let api = Pipeline::new("api")
-        .plug(RequestId)
-        .plug(sync_plug_fn(|conn: Conn| {
-            conn.put_resp_header_static(SERVER, SRV.clone())
-        }));
+        .plug(RequestId);
 
     // "browser" pipeline — full middleware stack
     let browser = Pipeline::new("browser")
         .plug(log_start)
         .plug(RequestId)
-        .plug(SecureHeaders::new())
-        .plug(sync_plug_fn(|conn: Conn| {
-            conn.put_resp_header_static(SERVER, SRV.clone())
-        }));
+        .plug(SecureHeaders::new());
 
     let router = MahaloRouter::new()
         .pipeline(bare)
