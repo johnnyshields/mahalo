@@ -280,6 +280,26 @@ mod tests {
     }
 
     #[test]
+    fn json_data_serialization_error() {
+        use serde::ser::{Serializer, Error as _};
+
+        // A type that always fails serialization.
+        struct BadValue;
+        impl serde::Serialize for BadValue {
+            fn serialize<S: Serializer>(&self, _s: S) -> Result<S::Ok, S::Error> {
+                Err(S::Error::custom("intentional failure"))
+            }
+        }
+
+        // json_data() converts the error into a {"error":"..."} payload
+        // rather than panicking.
+        let s = Event::default().json_data(&BadValue).serialize();
+        assert!(s.starts_with("data: {\"error\":"), "should contain error payload: {s}");
+        assert!(s.contains("intentional failure"), "should include error message: {s}");
+        assert!(s.ends_with("\n\n"));
+    }
+
+    #[test]
     fn event_empty_data() {
         let s = Event::default().data("").serialize();
         assert_eq!(s, "data: \n\n");

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Mahalo is a Phoenix-like web framework for Rust, built on top of the [rebar](../rebar) OTP-inspired runtime. It provides Plug-based middleware, RESTful routing, Phoenix-compatible WebSocket channels, PubSub, telemetry, and built-in plugs for security, logging, static files, and more.
+Mahalo is a Phoenix-like web framework for Rust, built on top of the [rebar](../rebar) OTP-inspired runtime. It provides Plug-based middleware, RESTful routing, Phoenix-compatible WebSocket channels, Server-Sent Events (SSE), PubSub, telemetry, and built-in plugs for security, logging, static files, and more.
 
 ## Workspace Structure
 
@@ -16,6 +16,7 @@ crates/
                     #   worker.rs     - thread-per-core worker spawning with SO_REUSEPORT + CPU affinity
                     #   server.rs     - compio accept loop + hybrid lease/Vec connection handler
                     #   http_parse.rs - zero-alloc HTTP/1.1 parser + serializer
+  mahalo-sse/       # Server-Sent Events: Event builder, SseSender, sse_response() helper
   mahalo-pubsub/    # Topic-based PubSub with broadcast channels
   mahalo-channel/   # Phoenix-compatible WebSocket channels
   mahalo-telemetry/ # Telemetry events, handlers, spans
@@ -31,6 +32,7 @@ crates/
 - **MahaloRouter** (`mahalo-router`): Routes with scopes, named pipelines, named routes, `resources()` for CRUD, and `path_for()` reverse routing.
 - **MahaloEndpoint** (`mahalo-endpoint`): Thread-per-core HTTP server using compio (io_uring on Linux, IOCP on Windows, kqueue on macOS) with turbine zero-copy buffer pool. Factory pattern for per-thread state. Body limit: 2MB default. Supports custom error handlers and after-plugs (post-handler pipeline).
 - **ErrorHandler** (`mahalo-endpoint`): `Rc<dyn Fn(StatusCode, Conn) -> Conn>`. Built-in: `json_error_handler()`, `text_error_handler()`.
+- **SSE** (`mahalo-sse`): Server-Sent Events. `Event` builder serializes to SSE wire format. `sse_response(conn, options)` returns `(Conn, SseSender)`. Events are pre-serialized before entering the channel. `SseSender` and all SSE types are `!Send`.
 - **PubSub** (`mahalo-pubsub`): Dedicated `std::thread` managing topic -> crossbeam channel map. `Clone + Send + Sync`.
 - **Channel** (`mahalo-channel`): Phoenix-compatible WebSocket channels with join/handle_in/handle_info/terminate.
 - **ChannelSocket** (`mahalo-channel`): Per-connection state with typed assigns (uses `AssignKey`, same as Conn).
@@ -128,6 +130,7 @@ No nested module directories. Keep it flat.
 - **Add a new plug**: Write an async fn taking and returning `Conn`, wrap with `plug_fn()`. Or implement `Plug` trait directly for structs with state.
 - **Add a new route**: Use `router.get("/path", plug)` or `scope()` + `ScopeBuilder` methods.
 - **Add a named route**: Use `router.get_named("/path", "name", plug)` or `scope_builder.get_named()`. Retrieve URL with `router.path_for("name", &[("param", "value")])`.
+- **Add an SSE endpoint**: Use `sse_response(conn, SseOptions::default())` to get `(Conn, SseSender)`. Return the `Conn` from the handler; spawn a task that calls `sender.send(Event::default().data("..."))`. The connection closes when the sender is dropped. For keep-alive, use `SseOptions::default().keep_alive(KeepAlive::new(Duration::from_secs(15)))`.
 - **Add a new channel**: Implement the `Channel` trait, register with `ChannelRouter::channel("topic:*", handler)`.
 - **Add telemetry**: Use `telemetry.execute()` to emit, `telemetry.attach()` to listen, `telemetry.span()` for timing.
 - **Store per-request state**: Define `struct MyKey;` + `impl AssignKey for MyKey { type Value = T; }`, then `conn.assign::<MyKey>(value)`.

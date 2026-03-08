@@ -860,6 +860,86 @@ mod tests {
         assert_eq!(result.ws_key, None, "POST with websocket in body should not produce ws_key");
     }
 
+    // -- serialize_sse_headers_into tests --
+
+    #[test]
+    fn sse_headers_status_line() {
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .put_status(StatusCode::OK)
+            .put_resp_header("content-type", "text/event-stream");
+        let mut buf = Vec::new();
+        serialize_sse_headers_into(&conn, &mut buf);
+        let response = String::from_utf8(buf).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "bad status line: {response}");
+    }
+
+    #[test]
+    fn sse_headers_includes_response_headers() {
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .put_status(StatusCode::OK)
+            .put_resp_header("content-type", "text/event-stream")
+            .put_resp_header("cache-control", "no-cache")
+            .put_resp_header("x-custom", "value");
+        let mut buf = Vec::new();
+        serialize_sse_headers_into(&conn, &mut buf);
+        let response = String::from_utf8(buf).unwrap();
+        assert!(response.contains("content-type: text/event-stream\r\n"), "missing content-type");
+        assert!(response.contains("cache-control: no-cache\r\n"), "missing cache-control");
+        assert!(response.contains("x-custom: value\r\n"), "missing x-custom");
+    }
+
+    #[test]
+    fn sse_headers_connection_close() {
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .put_status(StatusCode::OK);
+        let mut buf = Vec::new();
+        serialize_sse_headers_into(&conn, &mut buf);
+        let response = String::from_utf8(buf).unwrap();
+        assert!(response.contains("connection: close\r\n"), "missing connection: close");
+    }
+
+    #[test]
+    fn sse_headers_no_content_length() {
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .put_status(StatusCode::OK)
+            .put_resp_body("should be ignored");
+        let mut buf = Vec::new();
+        serialize_sse_headers_into(&conn, &mut buf);
+        let response = String::from_utf8(buf).unwrap();
+        assert!(!response.contains("content-length"), "SSE headers must not have content-length");
+    }
+
+    #[test]
+    fn sse_headers_includes_date_and_server() {
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .put_status(StatusCode::OK);
+        let mut buf = Vec::new();
+        serialize_sse_headers_into(&conn, &mut buf);
+        let response = String::from_utf8(buf).unwrap();
+        assert!(response.contains("date: "), "missing date header");
+        assert!(response.contains("server: mahalo\r\n"), "missing server header");
+    }
+
+    #[test]
+    fn sse_headers_ends_with_blank_line() {
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .put_status(StatusCode::OK);
+        let mut buf = Vec::new();
+        serialize_sse_headers_into(&conn, &mut buf);
+        let response = String::from_utf8(buf).unwrap();
+        assert!(response.ends_with("\r\n\r\n"), "must end with blank line separator");
+    }
+
+    #[test]
+    fn sse_headers_uncommon_status_code() {
+        let conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .put_status(StatusCode::ACCEPTED); // 202 — not in status_line() fast path
+        let mut buf = Vec::new();
+        serialize_sse_headers_into(&conn, &mut buf);
+        let response = String::from_utf8(buf).unwrap();
+        assert!(response.starts_with("HTTP/1.1 202 Accepted\r\n"), "bad status: {response}");
+    }
+
     #[test]
     fn parse_into_conn_ws_rejected_without_version_13() {
         let raw = b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n";

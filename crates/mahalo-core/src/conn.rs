@@ -212,26 +212,42 @@ impl Conn {
 
 // --- SSE types (minimal, lives in core to avoid circular deps) ---
 
-/// Assign key for SSE stream receiver.
+/// Assign key for the [`SseStream`] receiver stored in `Conn` assigns.
+///
+/// The endpoint server checks for this key after handler execution to switch
+/// from normal HTTP response mode into SSE streaming mode.
 pub struct SseStreamKey;
 impl AssignKey for SseStreamKey {
     type Value = SseStream;
 }
 
-/// Assign key for SSE keep-alive config.
+/// Assign key for the [`KeepAlive`] configuration stored in `Conn` assigns.
+///
+/// When present alongside `SseStreamKey`, the server sends periodic comment
+/// lines to keep the connection alive during idle periods.
 pub struct SseKeepAliveKey;
 impl AssignKey for SseKeepAliveKey {
     type Value = KeepAlive;
 }
 
-/// Receiver half of SSE channel. Events are pre-serialized to SSE wire format strings.
+/// Receiver half of an SSE channel.
+///
+/// Events arriving on `rx` are **pre-serialized** SSE wire format strings
+/// (e.g. `"data: hello\n\n"`), ready to be written directly to the TCP stream.
+/// This struct is `!Send` — it must remain on the thread that created it.
 pub struct SseStream {
     pub rx: mpsc_unbounded::Rx<String>,
 }
 
 /// Keep-alive configuration for SSE connections.
+///
+/// When attached to a `Conn` via [`SseKeepAliveKey`], the server sends an SSE
+/// comment (`: <text>\n\n`) every `interval` if no events have been sent.
+/// The `text` field controls the comment content (default: `"keep-alive"`).
 pub struct KeepAlive {
+    /// How long to wait before sending a keep-alive comment.
     pub interval: Duration,
+    /// Text included in the keep-alive comment line (e.g. `": keep-alive\n\n"`).
     pub text: String,
 }
 

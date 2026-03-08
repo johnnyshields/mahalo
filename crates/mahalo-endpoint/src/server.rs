@@ -252,7 +252,7 @@ async fn sse_streaming_loop(
 ) {
     match keep_alive_cfg {
         Some(ka) => {
-            let comment = format!(": {}\n\n", ka.text);
+            let mut comment_bytes = format!(": {}\n\n", ka.text).into_bytes();
             loop {
                 match rebar_core::time::timeout(ka.interval, sse_stream.rx.recv()).await {
                     Ok(Some(data)) => {
@@ -263,8 +263,9 @@ async fn sse_streaming_loop(
                     }
                     Ok(None) => return, // sender dropped
                     Err(_elapsed) => {
-                        let BufResult(result, _) =
-                            stream.write_all(comment.as_bytes().to_vec()).await;
+                        let BufResult(result, returned) =
+                            stream.write_all(comment_bytes).await;
+                        comment_bytes = returned;
                         if result.is_err() {
                             return;
                         }
@@ -538,6 +539,78 @@ mod tests {
         assert!(
             response.contains("data: event 3"),
             "missing event 3: {response}"
+        );
+
+        drop(handle);
+    }
+
+    #[test]
+    fn sse_keep_alive_sends_comment_before_event() {
+        let request = b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let ex = RebarExecutor::new(ExecutorConfig::default()).unwrap();
+            ex.block_on(async {
+                let listener =
+                    rebar_core::io::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let addr = listener.local_addr().unwrap();
+                addr_tx.send(addr).unwrap();
+
+                let router = MahaloRouter::new().get(
+                    "/events",
+                    plug_fn(|conn: Conn| async move {
+                        let (tx, rx) = local_sync::mpsc::unbounded::channel::<String>();
+
+                        let conn = conn
+                            .put_status(StatusCode::OK)
+                            .put_resp_header("content-type", "text/event-stream")
+                            .put_resp_header("cache-control", "no-cache")
+                            .assign::<mahalo_core::conn::SseStreamKey>(
+                                mahalo_core::conn::SseStream { rx },
+                            )
+                            .assign::<mahalo_core::conn::SseKeepAliveKey>(
+                                mahalo_core::conn::KeepAlive::new(
+                                    std::time::Duration::from_millis(50),
+                                ),
+                            );
+
+                        // Wait long enough for keep-alive to fire, then send an event.
+                        rebar_core::executor::spawn(async move {
+                            rebar_core::time::sleep(std::time::Duration::from_millis(200)).await;
+                            let _ = tx.send("data: after-keepalive\n\n".to_string());
+                            // tx dropped — closes stream
+                        })
+                        .detach();
+
+                        conn
+                    }),
+                );
+                let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
+
+                run_accept_loop(listener, router, None, vec![], runtime, 2 * 1024 * 1024, None)
+                    .await;
+            });
+        });
+
+        let addr = addr_rx.recv().unwrap();
+        let response = http_roundtrip(addr, request);
+
+        // Keep-alive comment should appear before the event data.
+        let ka_pos = response.find(": keep-alive\n");
+        let event_pos = response.find("data: after-keepalive\n");
+        assert!(
+            ka_pos.is_some(),
+            "keep-alive comment not found: {response}"
+        );
+        assert!(
+            event_pos.is_some(),
+            "event data not found: {response}"
+        );
+        assert!(
+            ka_pos.unwrap() < event_pos.unwrap(),
+            "keep-alive should appear before the event: {response}"
         );
 
         drop(handle);
