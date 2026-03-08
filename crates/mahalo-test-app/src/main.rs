@@ -8,6 +8,7 @@
 //! - WebSocket Channels (OrderChannel, StoreChannel)
 //! - PubSub for broadcasting
 //! - Telemetry with custom events and spans
+//! - Server-Sent Events (SSE) for price streaming
 //! - Pipeline halting (auth plug)
 
 #[global_allocator]
@@ -16,6 +17,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use http::StatusCode;
 use serde::Serialize;
@@ -563,7 +565,6 @@ impl Channel for OrderChannel {
 
 struct StoreChannel {
     store: Store,
-    pubsub: PubSub,
 }
 
 impl Channel for StoreChannel {
@@ -641,27 +642,11 @@ impl Channel for StoreChannel {
                     let mut flavors = self.store.data.flavors.lock().unwrap();
                     if let Some(flavor) = flavors.iter_mut().find(|f| f.id == flavor_id) {
                         flavor.price_cents = new_price_cents;
-                        let price_str = format_price(new_price_cents);
                         let flavor_name = flavor.name.clone();
 
                         socket.broadcast(
                             "price_updated",
-                            serde_json::json!({
-                                "flavor_id": flavor_id,
-                                "price": price_str,
-                                "flavor_name": &flavor_name,
-                            }),
-                        );
-
-                        // Also broadcast to "prices" topic for SSE clients
-                        self.pubsub.broadcast(
-                            "prices",
-                            "price_updated",
-                            serde_json::json!({
-                                "flavor_id": flavor_id,
-                                "price": price_str,
-                                "flavor_name": flavor_name,
-                            }),
+                            price_update_payload(flavor_id, &flavor_name, new_price_cents),
                         );
 
                         Ok(Some(Reply::ok(serde_json::json!({"updated": true}))))
@@ -813,6 +798,14 @@ fn chrono_now() -> String {
 
 fn format_price(cents: u64) -> String {
     format!("${:.2}", cents as f64 / 100.0)
+}
+
+fn price_update_payload(flavor_id: u64, flavor_name: &str, price_cents: u64) -> serde_json::Value {
+    serde_json::json!({
+        "flavor_id": flavor_id,
+        "price": format_price(price_cents),
+        "flavor_name": flavor_name,
+    })
 }
 
 fn format_flavor(f: &Flavor) -> serde_json::Value {
@@ -1034,7 +1027,7 @@ fn main() {
                         pubsub: pubsub.clone(),
                     }),
                 )
-                .channel("store:lobby", Rc::new(StoreChannel { store: store.clone(), pubsub: pubsub.clone() }))
+                .channel("store:lobby", Rc::new(StoreChannel { store: store.clone() }))
                 .channel("support:*", Rc::new(SupportChannel));
             WsConfig {
                 channel_router: Rc::new(channel_router),
@@ -1072,7 +1065,7 @@ fn main() {
     std::thread::spawn(move || {
         let mut tick = 0u64;
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(3));
+            std::thread::sleep(Duration::from_secs(3));
             tick += 1;
 
             let update = {
@@ -1089,21 +1082,16 @@ fn main() {
                 (flavor.id, flavor.name.clone(), new_price)
             };
 
-            let price_str = format_price(update.2);
             tracing::info!(
                 flavor = %update.1,
-                new_price = %price_str,
+                new_price = %format_price(update.2),
                 "💰 Price updated!"
             );
 
             price_pubsub.broadcast(
                 "prices",
                 "price_updated",
-                serde_json::json!({
-                    "flavor_id": update.0,
-                    "price": price_str,
-                    "flavor_name": update.1,
-                }),
+                price_update_payload(update.0, &update.1, update.2),
             );
         }
     });
@@ -1331,7 +1319,7 @@ fn build_router(
                             let (conn, sender) = sse_response(
                                 conn,
                                 SseOptions::default()
-                                    .keep_alive(KeepAlive::new(std::time::Duration::from_secs(15))),
+                                    .keep_alive(KeepAlive::new(Duration::from_secs(15))),
                             );
                             if let Some(rx) = pubsub.subscribe("prices") {
                                 rebar_core::executor::spawn(async move {
@@ -1343,13 +1331,14 @@ fn build_router(
                                                         .event("price_updated")
                                                         .json_data(&*msg.payload);
                                                     if sender.send(event).is_err() {
+                                                        tracing::debug!("SSE price client disconnected");
                                                         break;
                                                     }
                                                 }
                                             }
                                             Err(std::sync::mpsc::TryRecvError::Empty) => {
                                                 rebar_core::time::sleep(
-                                                    std::time::Duration::from_millis(5),
+                                                    Duration::from_millis(5),
                                                 )
                                                 .await;
                                             }
@@ -1360,6 +1349,8 @@ fn build_router(
                                     }
                                 })
                                 .detach();
+                            } else {
+                                tracing::warn!("PubSub subscribe failed for prices SSE stream");
                             }
                             conn
                         }
@@ -1413,6 +1404,24 @@ mod tests {
         assert_eq!(v["name"], "Test");
         assert_eq!(v["price"], "$4.50");
         assert_eq!(v["in_stock"], true);
+    }
+
+    // -- price_update_payload --
+
+    #[test]
+    fn test_price_update_payload() {
+        let v = price_update_payload(3, "Vanilla", 525);
+        assert_eq!(v["flavor_id"], 3);
+        assert_eq!(v["price"], "$5.25");
+        assert_eq!(v["flavor_name"], "Vanilla");
+    }
+
+    #[test]
+    fn test_price_update_payload_zero() {
+        let v = price_update_payload(0, "Free Scoop", 0);
+        assert_eq!(v["flavor_id"], 0);
+        assert_eq!(v["price"], "$0.00");
+        assert_eq!(v["flavor_name"], "Free Scoop");
     }
 
     // -- parse_order_id --
