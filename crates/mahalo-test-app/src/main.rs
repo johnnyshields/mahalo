@@ -469,7 +469,7 @@ impl Channel for OrderChannel {
                             }),
                         );
                     }
-                });
+                }).detach();
             }
 
             Ok(serde_json::json!({

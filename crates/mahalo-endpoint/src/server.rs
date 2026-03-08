@@ -1600,4 +1600,257 @@ mod tests {
 
         assert_eq!(result, "ok");
     }
+
+    // -----------------------------------------------------------------------
+    // WebSocket PubSub broadcast integration test
+    // -----------------------------------------------------------------------
+
+    /// Channel that broadcasts on join and echoes handle_in events via PubSub.
+    /// The default handle_info pushes PubSub messages to the client, so broadcasts
+    /// from one client should arrive back as server-pushed events.
+    struct BroadcastChannel;
+
+    impl mahalo_channel::Channel for BroadcastChannel {
+        fn join<'a>(
+            &'a self,
+            _topic: &'a str,
+            _payload: &'a serde_json::Value,
+            _socket: &'a mut mahalo_channel::ChannelSocket,
+        ) -> mahalo_core::plug::BoxFuture<'a, Result<serde_json::Value, mahalo_channel::ChannelError>>
+        {
+            Box::pin(async { Ok(serde_json::json!({"joined": true})) })
+        }
+
+        fn handle_in<'a>(
+            &'a self,
+            event: &'a str,
+            payload: &'a serde_json::Value,
+            socket: &'a mut mahalo_channel::ChannelSocket,
+        ) -> mahalo_core::plug::BoxFuture<
+            'a,
+            Result<Option<mahalo_channel::Reply>, mahalo_channel::ChannelError>,
+        > {
+            let p = payload.clone();
+            let evt = event.to_string();
+            Box::pin(async move {
+                // Broadcast via PubSub — should come back through handle_info → push
+                socket.broadcast(&evt, p);
+                Ok(Some(mahalo_channel::Reply::ok(serde_json::json!({"sent": true}))))
+            })
+        }
+    }
+
+    #[test]
+    fn websocket_pubsub_broadcast_reaches_client() {
+        use std::time::Duration;
+
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+
+        let _server = std::thread::spawn(move || {
+            let ex = RebarExecutor::new(ExecutorConfig::default()).unwrap();
+            ex.block_on(async {
+                let listener =
+                    rebar_core::io::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let addr = listener.local_addr().unwrap();
+                addr_tx.send(addr).unwrap();
+
+                let router = MahaloRouter::new();
+                let channel_router = mahalo_channel::ChannelRouter::new()
+                    .channel("bc:*", Rc::new(BroadcastChannel));
+                let pubsub = mahalo_pubsub::PubSub::start();
+                let ws_config = Some(WsConfig {
+                    channel_router: Rc::new(channel_router),
+                    pubsub: pubsub.clone(),
+                });
+                let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
+
+                run_accept_loop(
+                    listener, router, None, vec![], runtime, 2 * 1024 * 1024, ws_config, None,
+                )
+                .await;
+            });
+        });
+
+        let addr = addr_rx.recv().unwrap();
+
+        let result = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_nodelay(true).unwrap();
+
+            // 1. Upgrade.
+            let upgrade_req = b"GET /ws HTTP/1.1\r\n\
+                Host: localhost\r\n\
+                Upgrade: websocket\r\n\
+                Connection: Upgrade\r\n\
+                Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                Sec-WebSocket-Version: 13\r\n\r\n";
+            stream.write_all(upgrade_req).unwrap();
+            let mut resp_buf = vec![0u8; 512];
+            let n = stream.read(&mut resp_buf).unwrap();
+            let resp = String::from_utf8_lossy(&resp_buf[..n]);
+            assert!(resp.starts_with("HTTP/1.1 101"), "expected 101, got: {resp}");
+
+            // 2. Join "bc:room".
+            let join_msg = serde_json::json!({
+                "topic": "bc:room", "event": "phx_join", "payload": {}, "ref": "1"
+            });
+            stream.write_all(&build_masked_frame(1, join_msg.to_string().as_bytes())).unwrap();
+            let mut frame_buf = vec![0u8; 4096];
+            let n = stream.read(&mut frame_buf).unwrap();
+            let payload_start = if frame_buf[1] <= 125 { 2 } else { 4 };
+            let reply: serde_json::Value = serde_json::from_slice(&frame_buf[payload_start..n]).unwrap();
+            assert_eq!(reply["event"], "phx_reply");
+
+            // 3. Send an event that triggers socket.broadcast().
+            let msg = serde_json::json!({
+                "topic": "bc:room", "event": "announce", "payload": {"text": "hello"}, "ref": "2"
+            });
+            stream.write_all(&build_masked_frame(1, msg.to_string().as_bytes())).unwrap();
+
+            // 4. Read the reply first.
+            let n = stream.read(&mut frame_buf).unwrap();
+            let payload_start = if frame_buf[1] <= 125 { 2 } else { 4 };
+            let reply: serde_json::Value = serde_json::from_slice(&frame_buf[payload_start..n]).unwrap();
+            assert_eq!(reply["event"], "phx_reply", "expected reply, got: {reply}");
+            assert_eq!(reply["payload"]["response"]["sent"], true);
+
+            // 5. Read the PubSub broadcast pushed via handle_info → push.
+            let n = stream.read(&mut frame_buf).unwrap();
+            let payload_start = if frame_buf[1] <= 125 { 2 } else { 4 };
+            let broadcast: serde_json::Value = serde_json::from_slice(&frame_buf[payload_start..n]).unwrap();
+            assert_eq!(broadcast["event"], "announce", "expected broadcast event, got: {broadcast}");
+            assert_eq!(broadcast["payload"]["text"], "hello", "broadcast payload mismatch: {broadcast}");
+            assert_eq!(broadcast["topic"], "bc:room", "broadcast topic mismatch: {broadcast}");
+
+            // 6. Close.
+            stream.write_all(&build_masked_frame(ws_parse::OPCODE_CLOSE, &1000u16.to_be_bytes())).unwrap();
+
+            "ok".to_string()
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(result, "ok");
+    }
+
+    // -----------------------------------------------------------------------
+    // SSE via PubSub integration test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sse_receives_pubsub_broadcasts() {
+        use std::time::Duration;
+
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let pubsub = mahalo_pubsub::PubSub::start();
+        let pubsub_for_server = pubsub.clone();
+        let pubsub_for_broadcaster = pubsub.clone();
+
+        let _server = std::thread::spawn(move || {
+            let ex = RebarExecutor::new(ExecutorConfig::default()).unwrap();
+            ex.block_on(async {
+                let listener =
+                    rebar_core::io::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let addr = listener.local_addr().unwrap();
+                addr_tx.send(addr).unwrap();
+
+                let ps = pubsub_for_server;
+                let router = MahaloRouter::new().get(
+                    "/events",
+                    plug_fn(move |conn: Conn| {
+                        let ps = ps.clone();
+                        async move {
+                            let (tx, rx) = local_sync::mpsc::unbounded::channel::<String>();
+
+                            let conn = conn
+                                .put_status(StatusCode::OK)
+                                .put_resp_header("content-type", "text/event-stream")
+                                .put_resp_header("cache-control", "no-cache")
+                                .assign::<mahalo_core::conn::SseStreamKey>(
+                                    mahalo_core::conn::SseStream { rx },
+                                );
+
+                            // Forward PubSub messages to SSE stream.
+                            if let Some(pubsub_rx) = ps.subscribe("test_events") {
+                                rebar_core::executor::spawn(async move {
+                                    loop {
+                                        match pubsub_rx.try_recv() {
+                                            Ok(msg) => {
+                                                let sse_data = format!(
+                                                    "event: {}\ndata: {}\n\n",
+                                                    msg.event,
+                                                    msg.payload,
+                                                );
+                                                if tx.send(sse_data).is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                                rebar_core::time::sleep(Duration::from_millis(5)).await;
+                                            }
+                                            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                                        }
+                                    }
+                                }).detach();
+                            }
+                            conn
+                        }
+                    }),
+                );
+                let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
+
+                run_accept_loop(
+                    listener, router, None, vec![], runtime, 2 * 1024 * 1024, None, None,
+                )
+                .await;
+            });
+        });
+
+        let addr = addr_rx.recv().unwrap();
+
+        let result = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_nodelay(true).unwrap();
+
+            // 1. Send GET request for SSE endpoint.
+            let request = b"GET /events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n";
+            stream.write_all(request).unwrap();
+
+            // 2. Read headers.
+            let mut all = Vec::new();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            all.extend_from_slice(&buf[..n]);
+            let headers = String::from_utf8_lossy(&all);
+            assert!(headers.contains("200 OK"), "expected 200: {headers}");
+            assert!(headers.contains("text/event-stream"), "missing SSE content-type: {headers}");
+
+            // 3. Broadcast events via PubSub from another thread.
+            std::thread::sleep(Duration::from_millis(50));
+            pubsub_for_broadcaster.broadcast("test_events", "update", serde_json::json!({"n": 1}));
+            std::thread::sleep(Duration::from_millis(50));
+            pubsub_for_broadcaster.broadcast("test_events", "update", serde_json::json!({"n": 2}));
+
+            // 4. Read SSE events.
+            std::thread::sleep(Duration::from_millis(200));
+            let n = stream.read(&mut buf).unwrap();
+            all.extend_from_slice(&buf[..n]);
+            let response = String::from_utf8_lossy(&all);
+
+            assert!(response.contains("event: update"), "missing event line: {response}");
+            assert!(response.contains(r#""n":1"#) || response.contains(r#""n": 1"#), "missing event 1: {response}");
+            assert!(response.contains(r#""n":2"#) || response.contains(r#""n": 2"#), "missing event 2: {response}");
+
+            "ok".to_string()
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(result, "ok");
+        pubsub.shutdown();
+    }
 }
