@@ -367,7 +367,7 @@ fn status_line(code: u16) -> &'static [u8] {
 /// pre-computed status lines and manual integer formatting.
 pub fn serialize_response(conn: &Conn, keep_alive: bool) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
-    serialize_response_into(conn, keep_alive, &mut buf);
+    serialize_response_into(conn, keep_alive, false, &mut buf);
     buf
 }
 
@@ -375,8 +375,11 @@ pub fn serialize_response(conn: &Conn, keep_alive: bool) -> Vec<u8> {
 ///
 /// Clears `buf` first, then writes the full HTTP/1.1 response. The existing
 /// capacity is preserved, so repeated calls on the same Vec avoid re-allocation.
+///
+/// When `head_request` is true, the Content-Length header reflects the body size
+/// but the body itself is omitted (per HTTP spec, HEAD MUST NOT include a body).
 #[inline]
-pub fn serialize_response_into(conn: &Conn, keep_alive: bool, buf: &mut Vec<u8>) {
+pub fn serialize_response_into(conn: &Conn, keep_alive: bool, head_request: bool, buf: &mut Vec<u8>) {
     let code = conn.status.as_u16();
     let body = &conn.resp_body;
     let body_len = body.len();
@@ -474,9 +477,11 @@ pub fn serialize_response_into(conn: &Conn, keep_alive: bool, buf: &mut Vec<u8>)
     // Server header (static bytes, zero cost).
     buf.extend_from_slice(SERVER_HEADER);
 
-    // Separator + body.
+    // Separator + body (omit body for HEAD requests per HTTP spec).
     buf.extend_from_slice(b"\r\n");
-    buf.extend_from_slice(body);
+    if !head_request {
+        buf.extend_from_slice(body);
+    }
 }
 
 
@@ -704,13 +709,13 @@ mod tests {
             .put_resp_body("Hello");
 
         let mut buf = Vec::with_capacity(512);
-        serialize_response_into(&conn, true, &mut buf);
+        serialize_response_into(&conn, true, false, &mut buf);
         let first_len = buf.len();
         let cap_after_first = buf.capacity();
 
         // Second call reuses the same buffer — capacity should not grow
         // for a same-size response.
-        serialize_response_into(&conn, true, &mut buf);
+        serialize_response_into(&conn, true, false, &mut buf);
         assert_eq!(buf.len(), first_len);
         assert_eq!(buf.capacity(), cap_after_first);
     }

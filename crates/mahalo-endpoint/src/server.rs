@@ -16,6 +16,10 @@ use crate::ws_parse;
 /// Default buffer size for read operations (lease and Vec fallback).
 const DEFAULT_BUF_SIZE: usize = 8192;
 
+/// Maximum WebSocket frame size (1 MB). Frames exceeding this trigger a 1009
+/// (message too big) close to prevent memory exhaustion from oversized frames.
+const WS_MAX_FRAME_SIZE: usize = 1 << 20;
+
 /// Outcome of processing a single HTTP request.
 enum RequestOutcome {
     /// Continue the keep-alive connection.
@@ -343,6 +347,7 @@ async fn execute_and_respond(
         if result.is_err() {
             return RequestOutcome::Close;
         }
+        tracing::debug!("WebSocket upgrade accepted");
 
         // Create channels bridging the TCP stream ↔ channel GenServer.
         let (ws_msg_tx, ws_msg_rx) = local_sync::mpsc::unbounded::channel::<String>();
@@ -385,7 +390,8 @@ async fn execute_and_respond(
     }
 
     resp_buf.clear();
-    http_parse::serialize_response_into(&conn, keep_alive, resp_buf);
+    let is_head = conn.method == http::Method::HEAD;
+    http_parse::serialize_response_into(&conn, keep_alive, is_head, resp_buf);
 
     let resp = std::mem::take(resp_buf);
     let BufResult(result, returned) = stream.write_all(resp).await;
@@ -554,8 +560,9 @@ async fn ws_streaming_loop(
         while let Some(msg) = ws_out_rx.recv().await {
             frame_buf.clear();
             ws_parse::serialize_frame(ws_parse::OPCODE_TEXT, msg.as_bytes(), &mut frame_buf);
-            let data = frame_buf.clone();
-            let BufResult(result, _) = writer_stream.write_all(data).await;
+            let data = std::mem::take(&mut frame_buf);
+            let BufResult(result, returned) = writer_stream.write_all(data).await;
+            frame_buf = returned;
             if result.is_err() {
                 return;
             }
@@ -568,8 +575,15 @@ async fn ws_streaming_loop(
     let mut filled = 0usize;
 
     loop {
-        // Ensure space for reading.
+        // Ensure space for reading; enforce max frame size.
         if filled == read_buf.len() {
+            if read_buf.len() >= WS_MAX_FRAME_SIZE {
+                tracing::warn!("WebSocket frame exceeds {} bytes, closing with 1009", WS_MAX_FRAME_SIZE);
+                let mut close_buf = Vec::with_capacity(16);
+                ws_parse::serialize_close_frame(1009, b"message too big", &mut close_buf);
+                let _ = stream.write_all(close_buf).await;
+                return;
+            }
             read_buf.resize(read_buf.len() * 2, 0);
         }
 
@@ -1321,15 +1335,16 @@ mod tests {
 
     #[test]
     fn http_head_matches_get_route() {
-        // HEAD uses GET route table (router.rs:61).
-        // Note: body stripping for HEAD is not yet implemented — the server
-        // currently returns the full body. This test documents existing behavior.
+        // HEAD uses GET route table — body is stripped per HTTP spec.
         let resp = serve_method_request(
             "/api",
             b"HEAD /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {resp}");
-        assert!(resp.contains("content-length: 6"), "headers: {resp}");
+        assert!(resp.contains("content-length: 6"), "headers should include body size: {resp}");
+        // Body must be empty for HEAD.
+        let body_start = resp.find("\r\n\r\n").unwrap() + 4;
+        assert_eq!(&resp[body_start..], "", "HEAD response must have empty body, got: {}", &resp[body_start..]);
     }
 
     #[test]
@@ -1346,28 +1361,9 @@ mod tests {
     // WebSocket integration test
     // -----------------------------------------------------------------------
 
-    /// Build a masked client WebSocket frame (test helper).
+    /// Build a masked client WebSocket frame (delegates to ws_parse test helper).
     fn build_masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
-        let mask_key: [u8; 4] = [0x37, 0xfa, 0x21, 0x3d];
-        let mut frame = Vec::new();
-        frame.push(0x80 | opcode); // FIN=1
-
-        let len = payload.len();
-        if len <= 125 {
-            frame.push(0x80 | len as u8); // MASK=1
-        } else if len <= 65535 {
-            frame.push(0x80 | 126);
-            frame.extend_from_slice(&(len as u16).to_be_bytes());
-        } else {
-            frame.push(0x80 | 127);
-            frame.extend_from_slice(&(len as u64).to_be_bytes());
-        }
-
-        frame.extend_from_slice(&mask_key);
-        for (i, &b) in payload.iter().enumerate() {
-            frame.push(b ^ mask_key[i & 3]);
-        }
-        frame
+        crate::ws_parse::build_masked_frame(opcode, payload, [0x37, 0xfa, 0x21, 0x3d])
     }
 
     /// Echo channel: joins any topic, echoes handle_in payloads back as replies.
@@ -1508,6 +1504,94 @@ mod tests {
                 "expected close opcode, got: {}",
                 frame_buf[0] & 0x0F
             );
+
+            "ok".to_string()
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn websocket_ping_pong() {
+        use std::time::Duration;
+
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+
+        let _server = std::thread::spawn(move || {
+            let ex = RebarExecutor::new(ExecutorConfig::default()).unwrap();
+            ex.block_on(async {
+                let listener =
+                    rebar_core::io::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let addr = listener.local_addr().unwrap();
+                addr_tx.send(addr).unwrap();
+
+                let router = MahaloRouter::new();
+                let channel_router = mahalo_channel::ChannelRouter::new()
+                    .channel("echo:*", Rc::new(EchoChannel));
+                let pubsub = mahalo_pubsub::PubSub::start();
+                let ws_config = Some(WsConfig {
+                    channel_router: Rc::new(channel_router),
+                    pubsub: pubsub.clone(),
+                });
+                let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
+
+                run_accept_loop(
+                    listener, router, None, vec![], runtime, 2 * 1024 * 1024, ws_config, None,
+                )
+                .await;
+            });
+        });
+
+        let addr = addr_rx.recv().unwrap();
+
+        let result = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_nodelay(true).unwrap();
+
+            // 1. Upgrade to WebSocket.
+            let upgrade_req = b"GET /ws HTTP/1.1\r\n\
+                Host: localhost\r\n\
+                Upgrade: websocket\r\n\
+                Connection: Upgrade\r\n\
+                Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                Sec-WebSocket-Version: 13\r\n\r\n";
+            stream.write_all(upgrade_req).unwrap();
+
+            let mut resp_buf = vec![0u8; 512];
+            let n = stream.read(&mut resp_buf).unwrap();
+            let resp = String::from_utf8_lossy(&resp_buf[..n]);
+            assert!(resp.starts_with("HTTP/1.1 101"), "expected 101, got: {resp}");
+
+            // 2. Send PING with payload "hello".
+            let ping_payload = b"hello";
+            let ping_frame = build_masked_frame(ws_parse::OPCODE_PING, ping_payload);
+            stream.write_all(&ping_frame).unwrap();
+
+            // 3. Read PONG — server frame is unmasked.
+            let mut frame_buf = vec![0u8; 256];
+            let n = stream.read(&mut frame_buf).unwrap();
+            assert!(n >= 2, "expected PONG frame, got {n} bytes");
+            assert_eq!(
+                frame_buf[0] & 0x0F,
+                ws_parse::OPCODE_PONG,
+                "expected PONG opcode, got: {}",
+                frame_buf[0] & 0x0F
+            );
+            let pong_len = frame_buf[1] as usize;
+            assert_eq!(pong_len, ping_payload.len(), "PONG payload length mismatch");
+            assert_eq!(
+                &frame_buf[2..2 + pong_len],
+                ping_payload,
+                "PONG must echo PING payload"
+            );
+
+            // 4. Clean close.
+            let close_frame = build_masked_frame(ws_parse::OPCODE_CLOSE, &1000u16.to_be_bytes());
+            stream.write_all(&close_frame).unwrap();
 
             "ok".to_string()
         })

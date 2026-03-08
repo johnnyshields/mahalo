@@ -11,11 +11,12 @@ crates/
   mahalo/           # Umbrella crate - re-exports everything
   mahalo-core/      # Conn, Plug, Pipeline, Controller, AssignKey
   mahalo-router/    # MahaloRouter, scopes, resources, named routes, path matching
-  mahalo-endpoint/  # Thread-per-core HTTP server (compio + turbine), error handlers, after-plugs, rebar supervision
+  mahalo-endpoint/  # Thread-per-core HTTP server (compio + turbine), error handlers, after-plugs, rebar supervision, WS transport
                     #   handler.rs    - shared request execution helper
                     #   worker.rs     - thread-per-core worker spawning with SO_REUSEPORT + CPU affinity
-                    #   server.rs     - compio accept loop + hybrid lease/Vec connection handler
-                    #   http_parse.rs - zero-alloc HTTP/1.1 parser + serializer
+                    #   server.rs     - compio accept loop + hybrid lease/Vec connection handler + WS transport bridge
+                    #   http_parse.rs - zero-alloc HTTP/1.1 parser + serializer + WS upgrade handshake
+                    #   ws_parse.rs   - RFC 6455 WebSocket frame parser + serializer (masked client frames, unmasked server frames)
   mahalo-sse/       # Server-Sent Events: Event builder, SseSender, sse_response() helper
   mahalo-pubsub/    # Topic-based PubSub with broadcast channels
   mahalo-channel/   # Phoenix-compatible WebSocket channels
@@ -30,7 +31,7 @@ crates/
 - **Pipeline** (`mahalo-core`): Ordered sequence of Plugs, halts early if `conn.halted`.
 - **Controller** (`mahalo-core`): RESTful trait with index/show/create/update/delete.
 - **MahaloRouter** (`mahalo-router`): Routes with scopes, named pipelines, named routes, `resources()` for CRUD, and `path_for()` reverse routing.
-- **MahaloEndpoint** (`mahalo-endpoint`): Thread-per-core HTTP server using compio (io_uring on Linux, IOCP on Windows, kqueue on macOS) with turbine zero-copy buffer pool. Factory pattern for per-thread state. Body limit: 2MB default. Supports custom error handlers and after-plugs (post-handler pipeline).
+- **MahaloEndpoint** (`mahalo-endpoint`): Thread-per-core HTTP server using compio (io_uring on Linux, IOCP on Windows, kqueue on macOS) with turbine zero-copy buffer pool. Factory pattern for per-thread state. Body limit: 2MB default. Supports custom error handlers, after-plugs (post-handler pipeline), and WebSocket upgrade with transport bridge to channel GenServer. WS max frame size: 1MB.
 - **ErrorHandler** (`mahalo-endpoint`): `Rc<dyn Fn(StatusCode, Conn) -> Conn>`. Built-in: `json_error_handler()`, `text_error_handler()`.
 - **SSE** (`mahalo-sse`): Server-Sent Events. `Event` builder serializes to SSE wire format. `sse_response(conn, options)` returns `(Conn, SseSender)`. Events are pre-serialized before entering the channel. `SseSender` and all SSE types are `!Send`.
 - **PubSub** (`mahalo-pubsub`): Dedicated `std::thread` managing topic -> crossbeam channel map. `Clone + Send + Sync`.
@@ -132,6 +133,7 @@ No nested module directories. Keep it flat.
 - **Add a named route**: Use `router.get_named("/path", "name", plug)` or `scope_builder.get_named()`. Retrieve URL with `router.path_for("name", &[("param", "value")])`.
 - **Add an SSE endpoint**: Use `sse_response(conn, SseOptions::default())` to get `(Conn, SseSender)`. Return the `Conn` from the handler; spawn a task that calls `sender.send(Event::default().data("..."))`. The connection closes when the sender is dropped. For keep-alive, use `SseOptions::default().keep_alive(KeepAlive::new(Duration::from_secs(15)))`.
 - **Add a new channel**: Implement the `Channel` trait, register with `ChannelRouter::channel("topic:*", handler)`.
+- **Enable WebSocket**: Pass `WsConfig { channel_router, pubsub }` to the endpoint. The server auto-detects `Upgrade: websocket` on GET requests, performs the RFC 6455 handshake, and bridges TCP frames to/from the channel GenServer. PING frames get automatic PONG replies. Max frame size is 1MB (closes with 1009 if exceeded).
 - **Add telemetry**: Use `telemetry.execute()` to emit, `telemetry.attach()` to listen, `telemetry.span()` for timing.
 - **Store per-request state**: Define `struct MyKey;` + `impl AssignKey for MyKey { type Value = T; }`, then `conn.assign::<MyKey>(value)`.
 - **Custom error handling**: Use `endpoint.error_handler(json_error_handler())` or provide a custom `Fn(StatusCode, Conn) -> Conn`.

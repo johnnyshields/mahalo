@@ -152,32 +152,35 @@ pub fn serialize_close_frame(code: u16, reason: &[u8], buf: &mut Vec<u8>) {
     serialize_frame(OPCODE_CLOSE, &payload, buf);
 }
 
+/// Build a masked client WebSocket frame for testing.
+///
+/// Constructs a properly masked frame per RFC 6455 §5.3.
+#[cfg(test)]
+pub(crate) fn build_masked_frame(opcode: u8, payload: &[u8], mask_key: [u8; 4]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.push(0x80 | opcode); // FIN=1
+
+    let len = payload.len();
+    if len <= 125 {
+        frame.push(0x80 | len as u8); // MASK=1
+    } else if len <= 65535 {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(len as u64).to_be_bytes());
+    }
+
+    frame.extend_from_slice(&mask_key);
+    for (i, &b) in payload.iter().enumerate() {
+        frame.push(b ^ mask_key[i & 3]);
+    }
+    frame
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Build a masked client frame for testing.
-    fn build_masked_frame(opcode: u8, payload: &[u8], mask_key: [u8; 4]) -> Vec<u8> {
-        let mut frame = Vec::new();
-        frame.push(0x80 | opcode); // FIN=1
-
-        let len = payload.len();
-        if len <= 125 {
-            frame.push(0x80 | len as u8); // MASK=1
-        } else if len <= 65535 {
-            frame.push(0x80 | 126);
-            frame.extend_from_slice(&(len as u16).to_be_bytes());
-        } else {
-            frame.push(0x80 | 127);
-            frame.extend_from_slice(&(len as u64).to_be_bytes());
-        }
-
-        frame.extend_from_slice(&mask_key);
-        for (i, &b) in payload.iter().enumerate() {
-            frame.push(b ^ mask_key[i & 3]);
-        }
-        frame
-    }
 
     #[test]
     fn parse_simple_text_frame() {
