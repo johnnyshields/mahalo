@@ -24,7 +24,7 @@ license = "MIT"
 [workspace.dependencies]
 rebar-core = { git = "https://github.com/johnnyshields/rebar.git", branch = "rebar-v5" }
 turbine-core = { git = "https://github.com/johnnyshields/turbine.git", branch = "master" }
-crossbeam-channel = "0.5"
+local-sync = "0.1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 http = "1"

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crossbeam_channel as crossbeam;
+use std::sync::mpsc;
 use tracing::{debug, trace};
 
 use rebar_core::process::ExitReason;
@@ -22,7 +22,7 @@ pub struct PubSubMessage {
 enum PubSubCommand {
     Subscribe {
         topic: String,
-        reply: crossbeam::Sender<crossbeam::Receiver<PubSubMessage>>,
+        reply: mpsc::SyncSender<mpsc::Receiver<PubSubMessage>>,
     },
     Broadcast {
         topic: String,
@@ -37,18 +37,18 @@ enum PubSubCommand {
 /// A cloneable handle to the PubSub server.
 ///
 /// The server runs on a dedicated background thread using blocking
-/// crossbeam channel operations. This handle is `Clone + Send + Sync`
+/// mpsc channel operations. This handle is `Clone + Send + Sync`
 /// so it can be shared freely across worker threads.
 #[derive(Clone)]
 pub struct PubSub {
-    cmd_tx: crossbeam::Sender<PubSubCommand>,
+    cmd_tx: mpsc::Sender<PubSubCommand>,
 }
 
 impl PubSub {
     /// Start the PubSub server on a dedicated background thread.
     /// Returns a handle for interacting with it.
     pub fn start() -> Self {
-        let (cmd_tx, cmd_rx) = crossbeam::unbounded();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
 
         std::thread::spawn(move || {
             Self::run_server(cmd_rx);
@@ -58,9 +58,9 @@ impl PubSub {
         PubSub { cmd_tx }
     }
 
-    /// The server event loop — blocks on crossbeam recv.
-    fn run_server(cmd_rx: crossbeam::Receiver<PubSubCommand>) {
-        let mut topics: HashMap<String, Vec<crossbeam::Sender<PubSubMessage>>> = HashMap::new();
+    /// The server event loop — blocks on mpsc recv.
+    fn run_server(cmd_rx: mpsc::Receiver<PubSubCommand>) {
+        let mut topics: HashMap<String, Vec<mpsc::Sender<PubSubMessage>>> = HashMap::new();
 
         while let Ok(cmd) = cmd_rx.recv() {
             if Self::handle_command(cmd, &mut topics) {
@@ -83,11 +83,11 @@ impl PubSub {
     /// Handle a single command. Returns `true` if shutdown was requested.
     fn handle_command(
         cmd: PubSubCommand,
-        topics: &mut HashMap<String, Vec<crossbeam::Sender<PubSubMessage>>>,
+        topics: &mut HashMap<String, Vec<mpsc::Sender<PubSubMessage>>>,
     ) -> bool {
         match cmd {
             PubSubCommand::Subscribe { topic, reply } => {
-                let (tx, rx) = crossbeam::unbounded();
+                let (tx, rx) = mpsc::channel();
                 let senders = topics.entry(topic.clone()).or_insert_with(|| {
                     trace!(topic = %topic, "creating new topic");
                     Vec::new()
@@ -122,13 +122,13 @@ impl PubSub {
     /// Start the PubSub server as a rebar process. Returns a handle.
     ///
     /// The server loop runs on a dedicated background thread. The rebar
-    /// process monitors it via a crossbeam channel and exits when the
+    /// process monitors it via a mpsc channel and exits when the
     /// server thread completes.
     pub fn start_with_runtime(runtime: &Runtime) -> Self {
-        let (cmd_tx, cmd_rx) = crossbeam::unbounded();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
 
         // The actual server runs on a dedicated thread
-        let (done_tx, done_rx) = crossbeam::bounded::<()>(1);
+        let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
         std::thread::spawn(move || {
             Self::run_server(cmd_rx);
             let _ = done_tx.send(());
@@ -139,8 +139,8 @@ impl PubSub {
             // Poll for server thread completion
             loop {
                 match done_rx.try_recv() {
-                    Ok(()) | Err(crossbeam::TryRecvError::Disconnected) => break,
-                    Err(crossbeam::TryRecvError::Empty) => {
+                    Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Empty) => {
                         rebar_core::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                 }
@@ -151,12 +151,12 @@ impl PubSub {
         PubSub { cmd_tx }
     }
 
-    /// Subscribe to a topic. Returns a crossbeam receiver that will receive
+    /// Subscribe to a topic. Returns a mpsc receiver that will receive
     /// all future messages published to this topic.
     ///
     /// Returns `None` if the PubSub server has been dropped.
-    pub fn subscribe(&self, topic: &str) -> Option<crossbeam::Receiver<PubSubMessage>> {
-        let (reply_tx, reply_rx) = crossbeam::bounded(1);
+    pub fn subscribe(&self, topic: &str) -> Option<mpsc::Receiver<PubSubMessage>> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.cmd_tx
             .send(PubSubCommand::Subscribe {
                 topic: topic.to_string(),
@@ -215,7 +215,7 @@ impl PubSub {
     /// each own their respective end. The supervised process *is* the server
     /// loop — if it crashes the supervisor will restart it correctly.
     pub fn new_supervised() -> (Self, ChildEntry) {
-        let (cmd_tx, cmd_rx) = crossbeam::unbounded::<PubSubCommand>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<PubSubCommand>();
         let cmd_rx = Rc::new(RefCell::new(Some(cmd_rx)));
         let handle = PubSub { cmd_tx };
         let entry = ChildEntry::new(ChildSpec::new("mahalo_pubsub"), move || {
@@ -226,15 +226,15 @@ impl PubSub {
                     .take()
                     .expect("PubSub factory called twice");
                 // Run server on a background thread; wait for it via polling
-                let (done_tx, done_rx) = crossbeam::bounded::<()>(1);
+                let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
                 std::thread::spawn(move || {
                     Self::run_server(rx);
                     let _ = done_tx.send(());
                 });
                 loop {
                     match done_rx.try_recv() {
-                        Ok(()) | Err(crossbeam::TryRecvError::Disconnected) => break,
-                        Err(crossbeam::TryRecvError::Empty) => {
+                        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                        Err(mpsc::TryRecvError::Empty) => {
                             rebar_core::time::sleep(std::time::Duration::from_millis(10)).await;
                         }
                     }

@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use crossbeam_channel as crossbeam;
+use std::sync::mpsc;
 use serde_json::Value;
 
 use crate::pubsub::{PubSub, PubSubMessage};
@@ -22,7 +22,7 @@ use crate::pubsub::{PubSub, PubSubMessage};
 ///
 /// # Distributed Wiring
 ///
-/// Nodes exchange their `DistributedPubSub` handles (or a crossbeam sender
+/// Nodes exchange their `DistributedPubSub` handles (or a mpsc sender
 /// wrapped around their local PubSub) out-of-band (e.g., via the cluster
 /// node_up event). Call [`add_peer()`] to register each peer's broadcast sender.
 ///
@@ -34,7 +34,7 @@ pub struct DistributedPubSub {
     local: PubSub,
     /// Peer broadcast channels. Each peer's channel accepts `PubSubMessage`
     /// values that the peer forwards to its own local PubSub.
-    peers: Arc<RwLock<Vec<crossbeam::Sender<PubSubMessage>>>>,
+    peers: Arc<RwLock<Vec<mpsc::Sender<PubSubMessage>>>>,
 }
 
 impl DistributedPubSub {
@@ -62,7 +62,7 @@ impl DistributedPubSub {
     }
 
     /// Subscribe to a topic. Delegates to the local PubSub.
-    pub fn subscribe(&self, topic: &str) -> Option<crossbeam::Receiver<PubSubMessage>> {
+    pub fn subscribe(&self, topic: &str) -> Option<mpsc::Receiver<PubSubMessage>> {
         self.local.subscribe(topic)
     }
 
@@ -76,14 +76,14 @@ impl DistributedPubSub {
     ///
     /// Returns the corresponding receiver that the peer should poll.
     pub fn peer_channel() -> (
-        crossbeam::Sender<PubSubMessage>,
-        crossbeam::Receiver<PubSubMessage>,
+        mpsc::Sender<PubSubMessage>,
+        mpsc::Receiver<PubSubMessage>,
     ) {
-        crossbeam::unbounded()
+        mpsc::channel()
     }
 
     /// Register a peer's inbound sender so this node will forward broadcasts to it.
-    pub fn add_peer(&self, sender: crossbeam::Sender<PubSubMessage>) {
+    pub fn add_peer(&self, sender: mpsc::Sender<PubSubMessage>) {
         self.peers.write().unwrap().push(sender);
     }
 
@@ -94,7 +94,7 @@ impl DistributedPubSub {
     /// the relay to complete (it runs until the sender is dropped).
     pub fn spawn_relay(
         local: PubSub,
-        peer_rx: crossbeam::Receiver<PubSubMessage>,
+        peer_rx: mpsc::Receiver<PubSubMessage>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             while let Ok(msg) = peer_rx.recv() {

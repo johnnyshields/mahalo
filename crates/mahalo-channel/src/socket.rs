@@ -10,7 +10,7 @@ use serde_json::Value;
 /// Decoupled from any specific WebSocket library.
 pub type WsSendItem = String;
 
-use rebar_core::channel::mpsc::unbounded;
+use local_sync::mpsc::unbounded;
 use rebar_core::gen_server::{self, CastReply, CallReply, GenServer, GenServerContext, InfoReply, From as GsFrom};
 use rebar_core::process::ProcessId;
 use rebar_core::runtime::Runtime;
@@ -298,10 +298,10 @@ async fn handle_join(
                                     }
                                 }
                             }
-                            Err(crossbeam_channel::TryRecvError::Empty) => {
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
                                 rebar_core::time::sleep(Duration::from_millis(5)).await;
                             }
-                            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                         }
                     }
                 }).detach();

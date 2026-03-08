@@ -12,7 +12,6 @@ mahalo-channel = { path = "../mahalo-channel" }
 mahalo-pubsub = { path = "../mahalo-pubsub" }
 rebar-core = { workspace = true }
 turbine-core = { workspace = true }
-crossbeam-channel = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
 http = { workspace = true }
@@ -28,6 +27,7 @@ serde_json = { workspace = true }
 rmpv = { workspace = true }
 
 [dev-dependencies]
+local-sync = { workspace = true }
 tokio = { version = "1", features = ["full", "test-util"] }
 serde_json = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }

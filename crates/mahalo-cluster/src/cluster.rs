@@ -206,15 +206,12 @@ mod tests {
         let _cluster = MahaloCluster::start(20, topo, pubsub.clone()).await;
 
         // Drain the initial node_up message via spawn_blocking to not block tokio
-        let rx2 = {
-            let msg = tokio::task::spawn_blocking({
-                let rx = rx.clone();
-                move || rx.recv_timeout(Duration::from_secs(2))
-                    .expect("timed out waiting for initial node_up")
-            }).await.unwrap();
-            assert_eq!(msg.event, "node_up");
-            rx
-        };
+        let (msg, rx2) = tokio::task::spawn_blocking(move || {
+            let msg = rx.recv_timeout(Duration::from_secs(2))
+                .expect("timed out waiting for initial node_up");
+            (msg, rx)
+        }).await.unwrap();
+        assert_eq!(msg.event, "node_up");
 
         // Remove the peer so next poll detects it as gone
         *poll_peers.lock().unwrap() = vec![];
