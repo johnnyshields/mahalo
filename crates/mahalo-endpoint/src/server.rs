@@ -11,9 +11,23 @@ use rebar_core::runtime::Runtime;
 
 use crate::endpoint::{ErrorHandler, WsConfig};
 use crate::http_parse::{self, ParseError};
+use crate::ws_parse;
 
 /// Default buffer size for read operations (lease and Vec fallback).
 const DEFAULT_BUF_SIZE: usize = 8192;
+
+/// Outcome of processing a single HTTP request.
+enum RequestOutcome {
+    /// Continue the keep-alive connection.
+    KeepAlive,
+    /// Close the connection.
+    Close,
+    /// HTTP→WebSocket upgrade completed; caller should enter WS streaming loop.
+    WebSocketUpgrade {
+        ws_msg_tx: local_sync::mpsc::unbounded::Tx<String>,
+        ws_out_rx: local_sync::mpsc::unbounded::Rx<String>,
+    },
+}
 
 // ---------------------------------------------------------------------------
 // MahaloStream — abstracts over plain TCP and TLS-encrypted connections
@@ -184,22 +198,32 @@ async fn handle_connection(
     // (buf, filled) where filled is the number of valid bytes in buf.
     let mut accum: Option<(Vec<u8>, usize)> = None;
 
-    loop {
+    // Main HTTP read loop. Breaks out with Some(...) on WebSocket upgrade,
+    // returns None on close/error (so we can move `stream` into Rc for WS).
+    let ws_upgrade: Option<(
+        local_sync::mpsc::unbounded::Tx<String>,
+        local_sync::mpsc::unbounded::Rx<String>,
+    )> = loop {
         // If we have accumulated data from a previous partial read, use Vec path.
         if let Some((ref mut buf, ref mut filled)) = accum {
-            if !vec_read_loop(
+            match vec_read_loop(
                 &stream, peer_addr, router, error_handler, after_plugs,
                 runtime, body_limit, ws_config, buf, filled, &mut resp_buf,
             )
             .await
             {
-                return;
+                VecLoopOutcome::Continue => {
+                    // If we fully drained accum, switch back to lease path.
+                    if *filled == 0 {
+                        accum = None;
+                    }
+                    continue;
+                }
+                VecLoopOutcome::Close => break None,
+                VecLoopOutcome::WebSocketUpgrade { ws_msg_tx, ws_out_rx } => {
+                    break Some((ws_msg_tx, ws_out_rx));
+                }
             }
-            // If we fully drained accum, switch back to lease path.
-            if *filled == 0 {
-                accum = None;
-            }
-            continue;
         }
 
         // TLS connections skip the lease path (decryption copies anyway).
@@ -222,9 +246,9 @@ async fn handle_connection(
                     }
                 };
                 let n = match result {
-                    Ok(0) => return,
+                    Ok(0) => break None,
                     Ok(n) => n,
-                    Err(_) => return,
+                    Err(_) => break None,
                 };
 
                 // Try to parse directly from leased memory.
@@ -243,13 +267,17 @@ async fn handle_connection(
                         };
 
                         // Execute the request — lease can be dropped after this.
-                        if !execute_and_respond(
+                        match execute_and_respond(
                             &stream, router, error_handler, after_plugs,
                             runtime, ws_config, parsed, &mut resp_buf,
                         )
                         .await
                         {
-                            return;
+                            RequestOutcome::KeepAlive => {}
+                            RequestOutcome::Close => break None,
+                            RequestOutcome::WebSocketUpgrade { ws_msg_tx, ws_out_rx } => {
+                                break Some((ws_msg_tx, ws_out_rx));
+                            }
                         }
 
                         if let Some(mut leftover_bytes) = leftover_data {
@@ -272,11 +300,11 @@ async fn handle_connection(
                     }
                     Err(ParseError::BodyTooLarge) => {
                         let _ = stream.write_all(http_parse::RESPONSE_413.to_vec()).await;
-                        return;
+                        break None;
                     }
                     Err(ParseError::InvalidRequest) => {
                         let _ = stream.write_all(http_parse::RESPONSE_400.to_vec()).await;
-                        return;
+                        break None;
                     }
                 }
             }
@@ -285,11 +313,14 @@ async fn handle_connection(
                 accum = Some((vec![0u8; DEFAULT_BUF_SIZE], 0));
             }
         }
+    };
+
+    if let Some((ws_msg_tx, ws_out_rx)) = ws_upgrade {
+        ws_streaming_loop(Rc::new(stream), ws_msg_tx, ws_out_rx).await;
     }
 }
 
-/// Execute a parsed request and write the response. Returns `true` to continue
-/// the connection, `false` to close it.
+/// Execute a parsed request and write the response.
 async fn execute_and_respond(
     stream: &MahaloStream,
     router: &MahaloRouter,
@@ -299,21 +330,33 @@ async fn execute_and_respond(
     ws_config: &Option<WsConfig>,
     parsed: http_parse::ParsedRequest,
     resp_buf: &mut Vec<u8>,
-) -> bool {
+) -> RequestOutcome {
     let keep_alive = parsed.keep_alive;
 
     // Check for WebSocket upgrade.
-    if let (Some(ws_key), Some(_wsc)) = (&parsed.ws_key, ws_config.as_ref()) {
+    if let (Some(ws_key), Some(wsc)) = (&parsed.ws_key, ws_config.as_ref()) {
         resp_buf.clear();
         http_parse::serialize_ws_accept_response(ws_key, resp_buf);
         let resp = std::mem::take(resp_buf);
         let BufResult(result, returned) = stream.write_all(resp).await;
         *resp_buf = returned;
         if result.is_err() {
-            return false;
+            return RequestOutcome::Close;
         }
-        tracing::warn!("WebSocket upgrade accepted but handler not yet implemented");
-        return false;
+
+        // Create channels bridging the TCP stream ↔ channel GenServer.
+        let (ws_msg_tx, ws_msg_rx) = local_sync::mpsc::unbounded::channel::<String>();
+        let (ws_out_tx, ws_out_rx) = local_sync::mpsc::unbounded::channel::<String>();
+
+        let channel_router = Rc::clone(&wsc.channel_router);
+        let pubsub = wsc.pubsub.clone();
+        let rt = Rc::clone(runtime);
+        rebar_core::executor::spawn(async move {
+            mahalo_channel::handle_websocket(ws_msg_rx, ws_out_tx, channel_router, pubsub, rt).await;
+        })
+        .detach();
+
+        return RequestOutcome::WebSocketUpgrade { ws_msg_tx, ws_out_rx };
     }
 
     let conn = if ws_config.is_some() {
@@ -334,11 +377,11 @@ async fn execute_and_respond(
         let BufResult(result, returned) = stream.write_all(resp).await;
         *resp_buf = returned;
         if result.is_err() {
-            return false;
+            return RequestOutcome::Close;
         }
 
         sse_streaming_loop(stream, sse_stream, keep_alive_cfg).await;
-        return false; // SSE connection done — no keep-alive
+        return RequestOutcome::Close; // SSE connection done — no keep-alive
     }
 
     resp_buf.clear();
@@ -348,10 +391,14 @@ async fn execute_and_respond(
     let BufResult(result, returned) = stream.write_all(resp).await;
     *resp_buf = returned;
     if result.is_err() {
-        return false;
+        return RequestOutcome::Close;
     }
 
-    keep_alive
+    if keep_alive {
+        RequestOutcome::KeepAlive
+    } else {
+        RequestOutcome::Close
+    }
 }
 
 /// Stream SSE events from `sse_stream.rx` to the stream.
@@ -397,8 +444,17 @@ async fn sse_streaming_loop(
     }
 }
 
-/// Vec-based read + parse loop (fallback path). Returns `true` to continue
-/// the connection (caller should check if accum is drained), `false` to close.
+/// Outcome of `vec_read_loop`.
+enum VecLoopOutcome {
+    Continue,
+    Close,
+    WebSocketUpgrade {
+        ws_msg_tx: local_sync::mpsc::unbounded::Tx<String>,
+        ws_out_rx: local_sync::mpsc::unbounded::Rx<String>,
+    },
+}
+
+/// Vec-based read + parse loop (fallback path).
 async fn vec_read_loop(
     stream: &MahaloStream,
     peer_addr: SocketAddr,
@@ -411,12 +467,12 @@ async fn vec_read_loop(
     buf: &mut Vec<u8>,
     filled: &mut usize,
     resp_buf: &mut Vec<u8>,
-) -> bool {
+) -> VecLoopOutcome {
     // Read more data.
     if *filled == buf.len() {
         if buf.len() >= body_limit + DEFAULT_BUF_SIZE {
             let _ = stream.write_all(http_parse::RESPONSE_413.to_vec()).await;
-            return false;
+            return VecLoopOutcome::Close;
         }
         buf.resize(buf.len() * 2, 0);
     }
@@ -424,12 +480,12 @@ async fn vec_read_loop(
     let read_buf = buf.split_off(*filled);
     let BufResult(result, returned_buf) = stream.read(read_buf).await;
     match result {
-        Ok(0) => return false,
+        Ok(0) => return VecLoopOutcome::Close,
         Ok(n) => {
             buf.extend_from_slice(&returned_buf[..n]);
             *filled += n;
         }
-        Err(_) => return false,
+        Err(_) => return VecLoopOutcome::Close,
     }
 
     // Parse loop — process as many complete requests as possible.
@@ -438,13 +494,17 @@ async fn vec_read_loop(
             Ok(Some(parsed)) => {
                 let bytes_consumed = parsed.bytes_consumed;
 
-                if !execute_and_respond(
+                match execute_and_respond(
                     stream, router, error_handler, after_plugs,
                     runtime, ws_config, parsed, resp_buf,
                 )
                 .await
                 {
-                    return false;
+                    RequestOutcome::KeepAlive => {}
+                    RequestOutcome::Close => return VecLoopOutcome::Close,
+                    RequestOutcome::WebSocketUpgrade { ws_msg_tx, ws_out_rx } => {
+                        return VecLoopOutcome::WebSocketUpgrade { ws_msg_tx, ws_out_rx };
+                    }
                 }
 
                 // Shift unconsumed bytes to the front.
@@ -452,29 +512,149 @@ async fn vec_read_loop(
                 *filled -= bytes_consumed;
 
                 if *filled == 0 {
-                    return true;
+                    return VecLoopOutcome::Continue;
                 }
             }
             Ok(None) => {
                 if *filled == buf.len() {
                     if buf.len() >= body_limit + DEFAULT_BUF_SIZE {
                         let _ = stream.write_all(http_parse::RESPONSE_413.to_vec()).await;
-                        return false;
+                        return VecLoopOutcome::Close;
                     }
                     buf.resize(buf.len() * 2, 0);
                 }
-                return true;
+                return VecLoopOutcome::Continue;
             }
             Err(ParseError::BodyTooLarge) => {
                 let _ = stream.write_all(http_parse::RESPONSE_413.to_vec()).await;
-                return false;
+                return VecLoopOutcome::Close;
             }
             Err(ParseError::InvalidRequest) => {
                 let _ = stream.write_all(http_parse::RESPONSE_400.to_vec()).await;
-                return false;
+                return VecLoopOutcome::Close;
             }
         }
     }
+}
+
+/// WebSocket streaming loop — bridges TCP frames to/from the channel GenServer.
+///
+/// Two concurrent tasks share `Rc<MahaloStream>`:
+/// - **Writer** (spawned, detached): reads from `ws_out_rx`, serializes TEXT frames, writes.
+/// - **Reader** (inline): reads TCP data, parses WS frames, dispatches to `ws_msg_tx`.
+async fn ws_streaming_loop(
+    stream: Rc<MahaloStream>,
+    ws_msg_tx: local_sync::mpsc::unbounded::Tx<String>,
+    mut ws_out_rx: local_sync::mpsc::unbounded::Rx<String>,
+) {
+    // Writer task: channel GenServer → TCP.
+    let writer_stream = Rc::clone(&stream);
+    rebar_core::executor::spawn(async move {
+        let mut frame_buf = Vec::with_capacity(256);
+        while let Some(msg) = ws_out_rx.recv().await {
+            frame_buf.clear();
+            ws_parse::serialize_frame(ws_parse::OPCODE_TEXT, msg.as_bytes(), &mut frame_buf);
+            let data = frame_buf.clone();
+            let BufResult(result, _) = writer_stream.write_all(data).await;
+            if result.is_err() {
+                return;
+            }
+        }
+    })
+    .detach();
+
+    // Reader: TCP → channel GenServer.
+    let mut read_buf = vec![0u8; DEFAULT_BUF_SIZE];
+    let mut filled = 0usize;
+
+    loop {
+        // Ensure space for reading.
+        if filled == read_buf.len() {
+            read_buf.resize(read_buf.len() * 2, 0);
+        }
+
+        let tail = read_buf.split_off(filled);
+        let BufResult(result, returned) = stream.read(tail).await;
+        match result {
+            Ok(0) => return,
+            Ok(n) => {
+                read_buf.extend_from_slice(&returned[..n]);
+                filled += n;
+            }
+            Err(_) => return,
+        }
+
+        // Parse as many frames as possible from the buffer.
+        loop {
+            match ws_parse::try_parse_frame(&read_buf[..filled]) {
+                Ok(Some((frame, consumed))) => {
+                    match frame.opcode {
+                        ws_parse::OPCODE_TEXT => {
+                            let text = String::from_utf8_lossy(&frame.payload).into_owned();
+                            if ws_msg_tx.send(text).is_err() {
+                                return; // GenServer shut down
+                            }
+                        }
+                        ws_parse::OPCODE_BINARY => {
+                            tracing::debug!("ignoring binary WebSocket frame");
+                        }
+                        ws_parse::OPCODE_PING => {
+                            let mut pong_buf = Vec::with_capacity(2 + frame.payload.len());
+                            ws_parse::serialize_frame(
+                                ws_parse::OPCODE_PONG,
+                                &frame.payload,
+                                &mut pong_buf,
+                            );
+                            let BufResult(result, _) = stream.write_all(pong_buf).await;
+                            if result.is_err() {
+                                return;
+                            }
+                        }
+                        ws_parse::OPCODE_PONG => {} // ignore
+                        ws_parse::OPCODE_CLOSE => {
+                            // Echo close frame back.
+                            let mut close_buf = Vec::with_capacity(4);
+                            if frame.payload.len() >= 2 {
+                                let code = u16::from_be_bytes([
+                                    frame.payload[0],
+                                    frame.payload[1],
+                                ]);
+                                ws_parse::serialize_close_frame(
+                                    code,
+                                    &frame.payload[2..],
+                                    &mut close_buf,
+                                );
+                            } else {
+                                ws_parse::serialize_close_frame(1000, b"", &mut close_buf);
+                            }
+                            let _ = stream.write_all(close_buf).await;
+                            return;
+                        }
+                        _ => {
+                            // Unknown opcode — send 1002 (protocol error) close.
+                            let mut close_buf = Vec::new();
+                            ws_parse::serialize_close_frame(1002, b"", &mut close_buf);
+                            let _ = stream.write_all(close_buf).await;
+                            return;
+                        }
+                    }
+
+                    // Shift unconsumed bytes forward.
+                    read_buf.copy_within(consumed..filled, 0);
+                    filled -= consumed;
+                }
+                Ok(None) => break, // need more data
+                Err(_) => {
+                    // Protocol error — send 1002 close frame.
+                    let mut close_buf = Vec::new();
+                    ws_parse::serialize_close_frame(1002, b"protocol error", &mut close_buf);
+                    let _ = stream.write_all(close_buf).await;
+                    return;
+                }
+            }
+        }
+    }
+    // ws_msg_tx dropped here → signals GenServer to shut down.
 }
 
 #[cfg(test)]
@@ -1039,5 +1219,301 @@ mod tests {
             response.contains("pong"),
             "response body missing: {response}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP method integration tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a plug that responds with "{method_label} ok".
+    fn method_plug(label: &str) -> impl Plug {
+        let label = label.to_string();
+        plug_fn(move |conn: Conn| {
+            let l = label.clone();
+            async move { conn.put_status(StatusCode::OK).put_resp_body(format!("{l} ok")) }
+        })
+    }
+
+    /// Helper: start a server with routes for all HTTP methods, send one request.
+    fn serve_method_request(path: &str, request: &[u8]) -> String {
+        let path_str = path.to_string();
+        let request = request.to_vec();
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let ex = RebarExecutor::new(ExecutorConfig::default()).unwrap();
+            ex.block_on(async {
+                let listener =
+                    rebar_core::io::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let addr = listener.local_addr().unwrap();
+                addr_tx.send(addr).unwrap();
+
+                let router = MahaloRouter::new()
+                    .get(&path_str, method_plug("GET"))
+                    .post(&path_str, method_plug("POST"))
+                    .put(&path_str, method_plug("PUT"))
+                    .patch(&path_str, method_plug("PATCH"))
+                    .delete(&path_str, method_plug("DELETE"));
+
+                let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
+                run_accept_loop(
+                    listener, router, None, vec![], runtime, 2 * 1024 * 1024, None, None,
+                )
+                .await;
+            });
+        });
+
+        let addr = addr_rx.recv().unwrap();
+        let response = http_roundtrip(addr, &request);
+        drop(handle);
+        response
+    }
+
+    #[test]
+    fn http_get_returns_200() {
+        let resp = serve_method_request(
+            "/api",
+            b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {resp}");
+        assert!(resp.contains("GET ok"), "body: {resp}");
+    }
+
+    #[test]
+    fn http_post_returns_200() {
+        let resp = serve_method_request(
+            "/api",
+            b"POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {resp}");
+        assert!(resp.contains("POST ok"), "body: {resp}");
+    }
+
+    #[test]
+    fn http_put_returns_200() {
+        let resp = serve_method_request(
+            "/api",
+            b"PUT /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {resp}");
+        assert!(resp.contains("PUT ok"), "body: {resp}");
+    }
+
+    #[test]
+    fn http_patch_returns_200() {
+        let resp = serve_method_request(
+            "/api",
+            b"PATCH /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {resp}");
+        assert!(resp.contains("PATCH ok"), "body: {resp}");
+    }
+
+    #[test]
+    fn http_delete_returns_200() {
+        let resp = serve_method_request(
+            "/api",
+            b"DELETE /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {resp}");
+        assert!(resp.contains("DELETE ok"), "body: {resp}");
+    }
+
+    #[test]
+    fn http_head_matches_get_route() {
+        // HEAD uses GET route table (router.rs:61).
+        // Note: body stripping for HEAD is not yet implemented — the server
+        // currently returns the full body. This test documents existing behavior.
+        let resp = serve_method_request(
+            "/api",
+            b"HEAD /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {resp}");
+        assert!(resp.contains("content-length: 6"), "headers: {resp}");
+    }
+
+    #[test]
+    fn http_options_returns_404() {
+        // Router doesn't have explicit OPTIONS support; returns 404.
+        let resp = serve_method_request(
+            "/api",
+            b"OPTIONS /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.contains("404"), "OPTIONS should 404: {resp}");
+    }
+
+    // -----------------------------------------------------------------------
+    // WebSocket integration test
+    // -----------------------------------------------------------------------
+
+    /// Build a masked client WebSocket frame (test helper).
+    fn build_masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mask_key: [u8; 4] = [0x37, 0xfa, 0x21, 0x3d];
+        let mut frame = Vec::new();
+        frame.push(0x80 | opcode); // FIN=1
+
+        let len = payload.len();
+        if len <= 125 {
+            frame.push(0x80 | len as u8); // MASK=1
+        } else if len <= 65535 {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+
+        frame.extend_from_slice(&mask_key);
+        for (i, &b) in payload.iter().enumerate() {
+            frame.push(b ^ mask_key[i & 3]);
+        }
+        frame
+    }
+
+    /// Echo channel: joins any topic, echoes handle_in payloads back as replies.
+    struct EchoChannel;
+
+    impl mahalo_channel::Channel for EchoChannel {
+        fn join<'a>(
+            &'a self,
+            _topic: &'a str,
+            _payload: &'a serde_json::Value,
+            _socket: &'a mut mahalo_channel::ChannelSocket,
+        ) -> mahalo_core::plug::BoxFuture<'a, Result<serde_json::Value, mahalo_channel::ChannelError>>
+        {
+            Box::pin(async { Ok(serde_json::json!({})) })
+        }
+
+        fn handle_in<'a>(
+            &'a self,
+            _event: &'a str,
+            payload: &'a serde_json::Value,
+            _socket: &'a mut mahalo_channel::ChannelSocket,
+        ) -> mahalo_core::plug::BoxFuture<
+            'a,
+            Result<Option<mahalo_channel::Reply>, mahalo_channel::ChannelError>,
+        > {
+            let p = payload.clone();
+            Box::pin(async move { Ok(Some(mahalo_channel::Reply::ok(p))) })
+        }
+    }
+
+    #[test]
+    fn websocket_upgrade_join_heartbeat_close() {
+        use std::time::Duration;
+
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+
+        let _server = std::thread::spawn(move || {
+            let ex = RebarExecutor::new(ExecutorConfig::default()).unwrap();
+            ex.block_on(async {
+                let listener =
+                    rebar_core::io::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let addr = listener.local_addr().unwrap();
+                addr_tx.send(addr).unwrap();
+
+                let router = MahaloRouter::new();
+                let channel_router = mahalo_channel::ChannelRouter::new()
+                    .channel("echo:*", Rc::new(EchoChannel));
+                let pubsub = mahalo_pubsub::PubSub::start();
+                let ws_config = Some(WsConfig {
+                    channel_router: Rc::new(channel_router),
+                    pubsub: pubsub.clone(),
+                });
+                let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
+
+                run_accept_loop(
+                    listener, router, None, vec![], runtime, 2 * 1024 * 1024, ws_config, None,
+                )
+                .await;
+            });
+        });
+
+        let addr = addr_rx.recv().unwrap();
+
+        let result = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_nodelay(true).unwrap();
+
+            // 1. Send HTTP upgrade request.
+            let upgrade_req = b"GET /ws HTTP/1.1\r\n\
+                Host: localhost\r\n\
+                Upgrade: websocket\r\n\
+                Connection: Upgrade\r\n\
+                Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                Sec-WebSocket-Version: 13\r\n\r\n";
+            stream.write_all(upgrade_req).unwrap();
+
+            // 2. Read 101 Switching Protocols.
+            let mut resp_buf = vec![0u8; 512];
+            let n = stream.read(&mut resp_buf).unwrap();
+            let resp = String::from_utf8_lossy(&resp_buf[..n]);
+            assert!(
+                resp.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+                "expected 101, got: {resp}"
+            );
+
+            // 3. Send phx_join.
+            let join_msg = serde_json::json!({
+                "topic": "echo:lobby",
+                "event": "phx_join",
+                "payload": {},
+                "ref": "1"
+            });
+            let join_frame = build_masked_frame(1, join_msg.to_string().as_bytes());
+            stream.write_all(&join_frame).unwrap();
+
+            // 4. Read join reply.
+            let mut frame_buf = vec![0u8; 4096];
+            let n = stream.read(&mut frame_buf).unwrap();
+            assert!(n > 2, "expected reply frame, got {n} bytes");
+            // Parse unmasked server frame: FIN+TEXT, length, payload
+            let payload_start = if frame_buf[1] <= 125 { 2 } else { 4 };
+            let reply_text = String::from_utf8_lossy(&frame_buf[payload_start..n]);
+            let reply: serde_json::Value = serde_json::from_str(&reply_text)
+                .unwrap_or_else(|e| panic!("invalid JSON reply: {e}, raw: {reply_text}"));
+            assert_eq!(reply["event"], "phx_reply", "reply: {reply}");
+            assert_eq!(reply["topic"], "echo:lobby", "reply: {reply}");
+
+            // 5. Send heartbeat.
+            let hb_msg = serde_json::json!({
+                "topic": "phoenix",
+                "event": "heartbeat",
+                "payload": {},
+                "ref": "2"
+            });
+            let hb_frame = build_masked_frame(1, hb_msg.to_string().as_bytes());
+            stream.write_all(&hb_frame).unwrap();
+
+            // 6. Read heartbeat reply.
+            let n = stream.read(&mut frame_buf).unwrap();
+            let payload_start = if frame_buf[1] <= 125 { 2 } else { 4 };
+            let hb_reply_text = String::from_utf8_lossy(&frame_buf[payload_start..n]);
+            let hb_reply: serde_json::Value = serde_json::from_str(&hb_reply_text)
+                .unwrap_or_else(|e| panic!("invalid JSON hb reply: {e}, raw: {hb_reply_text}"));
+            assert_eq!(hb_reply["event"], "phx_reply", "hb: {hb_reply}");
+
+            // 7. Send close frame.
+            let close_frame = build_masked_frame(8, &1000u16.to_be_bytes());
+            stream.write_all(&close_frame).unwrap();
+
+            // 8. Verify close reply.
+            let n = stream.read(&mut frame_buf).unwrap();
+            assert!(n >= 2, "expected close reply");
+            assert_eq!(
+                frame_buf[0] & 0x0F,
+                8,
+                "expected close opcode, got: {}",
+                frame_buf[0] & 0x0F
+            );
+
+            "ok".to_string()
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(result, "ok");
     }
 }
