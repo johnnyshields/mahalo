@@ -98,6 +98,11 @@ impl MahaloEndpoint {
     ///
     /// The `Arc<ServerConfig>` is shared across all worker threads; each worker
     /// creates a thread-local `TlsAcceptor` from it.
+    ///
+    /// If a TLS handshake fails (e.g. a plain HTTP client connects), the error
+    /// is logged at `warn` level and the connection is closed. The accept loop
+    /// continues serving other connections — no retry is attempted for the
+    /// failed connection.
     pub fn tls(mut self, config: Arc<rustls::ServerConfig>) -> Self {
         self.tls_config = Some(config);
         self

@@ -83,7 +83,7 @@ pub(crate) fn start_server(
             let handle = std::thread::Builder::new()
                 .name(format!("mahalo-worker-{i}"))
                 .spawn_scoped(scope, move || {
-                    run_worker(i, addr, rf, ehf, apf, body_limit, wcf, tls);
+                    run_worker_arc(i, addr, rf, ehf, apf, body_limit, wcf, tls);
                 })
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                     Box::new(e)
@@ -147,24 +147,6 @@ fn run_worker_arc(
         )
         .await;
     });
-}
-
-/// Worker body for reference-based factories (used by start_server via scoped threads).
-fn run_worker(
-    worker_id: usize,
-    addr: SocketAddr,
-    router_factory: &(dyn Fn() -> MahaloRouter + Send + Sync),
-    error_handler_factory: Option<&(dyn Fn() -> ErrorHandler + Send + Sync)>,
-    after_plug_factories: &[Arc<dyn Fn() -> Box<dyn Plug> + Send + Sync>],
-    body_limit: usize,
-    ws_config_factory: Option<&(dyn Fn() -> WsConfig + Send + Sync)>,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
-) {
-    // Same implementation — delegate to shared code.
-    run_worker_arc(
-        worker_id, addr, router_factory, error_handler_factory,
-        after_plug_factories, body_limit, ws_config_factory, tls_config,
-    );
 }
 
 /// Best-effort CPU affinity pinning (Linux only).

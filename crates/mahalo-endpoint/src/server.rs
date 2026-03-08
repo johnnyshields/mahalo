@@ -43,7 +43,9 @@ impl MahaloStream {
                 // 0 so the full capacity is available for the read, matching
                 // rebar TcpStream::read semantics which ignore len.
                 buf.clear();
-                // SAFETY: Single-threaded executor — no concurrent access.
+                // SAFETY: RebarExecutor is a single-threaded, cooperative executor.
+                // Only one task runs at a time, so no concurrent access to the
+                // TlsStream is possible. The UnsafeCell is never shared across threads.
                 let s = unsafe { &mut *cell.get() };
                 AsyncRead::read(s, buf).await
             }
@@ -57,7 +59,9 @@ impl MahaloStream {
             MahaloStream::Plain(s) => s.write_all(buf).await,
             MahaloStream::Tls(cell) => {
                 use compio_io::{AsyncWrite, AsyncWriteExt};
-                // SAFETY: Single-threaded executor — no concurrent access.
+                // SAFETY: RebarExecutor is a single-threaded, cooperative executor.
+                // Only one task runs at a time, so no concurrent access to the
+                // TlsStream is possible. The UnsafeCell is never shared across threads.
                 let s = unsafe { &mut *cell.get() };
                 match AsyncWriteExt::write_all(s, buf).await {
                     BufResult(Ok(_n), b) => {
@@ -129,7 +133,7 @@ pub(crate) async fn run_accept_loop(
                         Some(acc) => match acc.accept(stream).await {
                             Ok(tls) => MahaloStream::Tls(UnsafeCell::new(tls)),
                             Err(e) => {
-                                tracing::debug!("TLS handshake failed: {e}");
+                                tracing::warn!("TLS handshake failed: {e}");
                                 return;
                             }
                         },
@@ -920,6 +924,103 @@ mod tests {
 
         drop(server_handle);
         client_handle.join().unwrap();
+    }
+
+    #[test]
+    fn tls_handshake_failure_does_not_crash_server() {
+        let (server_config, client_config) = test_tls_configs();
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        // Server thread with TLS enabled.
+        let server_handle = std::thread::spawn(move || {
+            let ex = RebarExecutor::new(ExecutorConfig::default()).unwrap();
+            ex.block_on(async {
+                let listener =
+                    rebar_core::io::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let addr = listener.local_addr().unwrap();
+                addr_tx.send(addr).unwrap();
+
+                let router = MahaloRouter::new().get(
+                    "/ok",
+                    plug_fn(|conn: Conn| async move {
+                        conn.put_status(StatusCode::OK).put_resp_body("still-alive")
+                    }),
+                );
+                let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
+                let tls_acceptor = Some(rebar_core::tls::TlsAcceptor::new(server_config));
+
+                run_accept_loop(
+                    listener, router, None, vec![], runtime, 2 * 1024 * 1024, None, tls_acceptor,
+                )
+                .await;
+            });
+        });
+
+        let addr = addr_rx.recv().unwrap();
+
+        // 1) Send a plain TCP (non-TLS) request — this should fail the handshake
+        //    but NOT crash the server.
+        let bad_handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let _ = stream.write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let mut response = Vec::new();
+            let _ = stream.read_to_end(&mut response);
+            // The server should close the connection without a valid HTTP response.
+            response
+        });
+        let bad_response = bad_handle.join().unwrap();
+        // Plain TCP to TLS server yields no valid HTTP response (empty or TLS alert).
+        assert!(
+            bad_response.is_empty() || !bad_response.starts_with(b"HTTP/1.1"),
+            "plain TCP should not get a valid HTTP response from TLS server"
+        );
+
+        // 2) Now send a proper TLS request — the server should still be alive.
+        let good_handle = std::thread::spawn(move || {
+            // Small delay to ensure the failed connection is fully cleaned up.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let ex = RebarExecutor::new(ExecutorConfig::default()).unwrap();
+            ex.block_on(async {
+                let stream = rebar_core::io::TcpStream::connect(addr).await.unwrap();
+                let connector = compio_tls::TlsConnector::from(client_config);
+                let mut tls = connector.connect("localhost", stream).await.unwrap();
+
+                use compio_io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+                let req = b"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_vec();
+                AsyncWriteExt::write_all(&mut tls, req).await.0.unwrap();
+                AsyncWrite::flush(&mut tls).await.unwrap();
+
+                let mut all_data = Vec::new();
+                loop {
+                    let buf = Vec::with_capacity(4096);
+                    let rebar_core::io::BufResult(result, buf) = AsyncRead::read(&mut tls, buf).await;
+                    match result {
+                        Ok(0) => break,
+                        Ok(n) => all_data.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                result_tx.send(String::from_utf8(all_data).unwrap()).unwrap();
+            });
+        });
+
+        let response = result_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "server should still be alive after failed handshake: {response}"
+        );
+        assert!(
+            response.contains("still-alive"),
+            "response body missing: {response}"
+        );
+
+        drop(server_handle);
+        good_handle.join().unwrap();
     }
 
     #[test]
