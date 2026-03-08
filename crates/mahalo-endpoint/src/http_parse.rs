@@ -480,6 +480,51 @@ pub fn serialize_response_into(conn: &Conn, keep_alive: bool, buf: &mut Vec<u8>)
 }
 
 
+/// Serialize SSE response headers into an existing buffer.
+///
+/// Writes status line + response headers + `connection: close` + date + server.
+/// No `Content-Length` (streaming). No `Transfer-Encoding: chunked` (raw SSE).
+pub fn serialize_sse_headers_into(conn: &Conn, buf: &mut Vec<u8>) {
+    let code = conn.status.as_u16();
+
+    let mut header_bytes = 0;
+    for (name, value) in conn.resp_headers.iter() {
+        header_bytes += name.as_str().len() + 2 + value.len() + 2;
+    }
+    let needed = 128 + header_bytes;
+
+    buf.clear();
+    if buf.capacity() < needed {
+        buf.reserve(needed);
+    }
+
+    let precomputed = status_line(code);
+    if !precomputed.is_empty() {
+        buf.extend_from_slice(precomputed);
+    } else {
+        buf.extend_from_slice(b"HTTP/1.1 ");
+        buf.push(b'0' + (code / 100) as u8);
+        buf.push(b'0' + ((code / 10) % 10) as u8);
+        buf.push(b'0' + (code % 10) as u8);
+        buf.push(b' ');
+        let reason = conn.status.canonical_reason().unwrap_or("Unknown");
+        buf.extend_from_slice(reason.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+
+    for (name, value) in conn.resp_headers.iter() {
+        buf.extend_from_slice(name.as_str().as_bytes());
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(value.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+
+    buf.extend_from_slice(b"connection: close\r\n");
+    write_date_header(buf);
+    buf.extend_from_slice(SERVER_HEADER);
+    buf.extend_from_slice(b"\r\n");
+}
+
 /// Serialize a WebSocket upgrade response (HTTP 101 Switching Protocols).
 ///
 /// Computes the `Sec-WebSocket-Accept` value per RFC 6455 §4.2.2:

@@ -8,6 +8,7 @@ members = [
     "crates/mahalo-channel",
     "crates/mahalo-telemetry",
     "crates/mahalo-plug",
+    "crates/mahalo-sse",
     "crates/mahalo-cluster",
     "crates/mahalo-presence",
     "crates/mahalo",

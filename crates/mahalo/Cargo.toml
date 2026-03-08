@@ -13,6 +13,7 @@ mahalo-pubsub = { path = "../mahalo-pubsub" }
 mahalo-channel = { path = "../mahalo-channel" }
 mahalo-telemetry = { path = "../mahalo-telemetry" }
 mahalo-plug = { path = "../mahalo-plug" }
+mahalo-sse = { path = "../mahalo-sse" }
 mahalo-cluster = { path = "../mahalo-cluster" }
 mahalo-presence = { path = "../mahalo-presence" }
 

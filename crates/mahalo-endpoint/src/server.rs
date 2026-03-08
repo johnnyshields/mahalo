@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use rebar_core::io::{BufResult, TcpListener, TcpStream};
 
+use mahalo_core::conn::{SseKeepAliveKey, SseStreamKey};
 use mahalo_core::plug::Plug;
 use mahalo_router::MahaloRouter;
 use rebar_core::runtime::Runtime;
@@ -208,7 +209,24 @@ async fn execute_and_respond(
         parsed.conn
     };
 
-    let conn = crate::handler::execute_request(conn, router, error_handler, after_plugs).await;
+    let mut conn = crate::handler::execute_request(conn, router, error_handler, after_plugs).await;
+
+    // Check for SSE stream assign — if present, switch to streaming mode.
+    if let Some(sse_stream) = conn.take_assign::<SseStreamKey>() {
+        let keep_alive_cfg = conn.take_assign::<SseKeepAliveKey>();
+
+        resp_buf.clear();
+        http_parse::serialize_sse_headers_into(&conn, resp_buf);
+        let resp = std::mem::take(resp_buf);
+        let BufResult(result, returned) = stream.write_all(resp).await;
+        *resp_buf = returned;
+        if result.is_err() {
+            return false;
+        }
+
+        sse_streaming_loop(stream, sse_stream, keep_alive_cfg).await;
+        return false; // SSE connection done — no keep-alive
+    }
 
     resp_buf.clear();
     http_parse::serialize_response_into(&conn, keep_alive, resp_buf);
@@ -221,6 +239,48 @@ async fn execute_and_respond(
     }
 
     keep_alive
+}
+
+/// Stream SSE events from `sse_stream.rx` to the TCP stream.
+///
+/// If keep-alive is configured, sends a comment when idle for the keep-alive interval.
+/// Exits when the sender is dropped (rx returns None) or on write error.
+async fn sse_streaming_loop(
+    stream: &TcpStream,
+    mut sse_stream: mahalo_core::conn::SseStream,
+    keep_alive_cfg: Option<mahalo_core::conn::KeepAlive>,
+) {
+    match keep_alive_cfg {
+        Some(ka) => {
+            let comment = format!(": {}\n\n", ka.text);
+            loop {
+                match rebar_core::time::timeout(ka.interval, sse_stream.rx.recv()).await {
+                    Ok(Some(data)) => {
+                        let BufResult(result, _) = stream.write_all(data.into_bytes()).await;
+                        if result.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return, // sender dropped
+                    Err(_elapsed) => {
+                        let BufResult(result, _) =
+                            stream.write_all(comment.as_bytes().to_vec()).await;
+                        if result.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        None => {
+            while let Some(data) = sse_stream.rx.recv().await {
+                let BufResult(result, _) = stream.write_all(data.into_bytes()).await;
+                if result.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Vec-based read + parse loop (fallback path). Returns `true` to continue

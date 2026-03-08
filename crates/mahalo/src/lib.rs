@@ -23,6 +23,10 @@ pub use mahalo_channel::{
     HEARTBEAT, PHX_JOIN, PHX_LEAVE, PHX_REPLY,
 };
 
+// SSE
+pub use mahalo_core::conn::{KeepAlive, SseStream};
+pub use mahalo_sse::{sse_response, Event, SseOptions, SseSendError, SseSender};
+
 // Plugs
 pub use mahalo_plug::{
     CsrfProtection, CsrfToken, ETag, RequestId, RequestIdKey, RequestStartTime, SecureHeaders,

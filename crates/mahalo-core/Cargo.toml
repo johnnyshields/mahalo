@@ -12,6 +12,7 @@ bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+local-sync = { workspace = true }
 percent-encoding = "2"
 smallvec = { workspace = true }
 

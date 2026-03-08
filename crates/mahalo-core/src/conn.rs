@@ -2,9 +2,11 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, Uri};
+use local_sync::mpsc::unbounded as mpsc_unbounded;
 use percent_encoding::percent_decode_str;
 use rebar_core::runtime::Runtime;
 use smallvec::SmallVec;
@@ -159,6 +161,13 @@ impl Conn {
             .and_then(|v| v.downcast_ref())
     }
 
+    pub fn take_assign<K: AssignKey>(&mut self) -> Option<K::Value> {
+        self.assigns
+            .as_mut()?
+            .remove(&TypeId::of::<K>())
+            .and_then(|v| v.downcast().ok().map(|b| *b))
+    }
+
     #[inline]
     pub fn with_runtime(mut self, runtime: Rc<Runtime>) -> Self {
         self.runtime = Some(runtime);
@@ -198,6 +207,47 @@ impl Conn {
     #[inline]
     pub fn query_param(&self, name: &str) -> Option<&str> {
         self.query_params.as_ref()?.get(name).map(|s| s.as_str())
+    }
+}
+
+// --- SSE types (minimal, lives in core to avoid circular deps) ---
+
+/// Assign key for SSE stream receiver.
+pub struct SseStreamKey;
+impl AssignKey for SseStreamKey {
+    type Value = SseStream;
+}
+
+/// Assign key for SSE keep-alive config.
+pub struct SseKeepAliveKey;
+impl AssignKey for SseKeepAliveKey {
+    type Value = KeepAlive;
+}
+
+/// Receiver half of SSE channel. Events are pre-serialized to SSE wire format strings.
+pub struct SseStream {
+    pub rx: mpsc_unbounded::Rx<String>,
+}
+
+/// Keep-alive configuration for SSE connections.
+pub struct KeepAlive {
+    pub interval: Duration,
+    pub text: String,
+}
+
+impl KeepAlive {
+    /// Create a new keep-alive config.
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            text: "keep-alive".to_string(),
+        }
+    }
+
+    /// Set custom keep-alive comment text.
+    pub fn text(mut self, text: impl Into<String>) -> Self {
+        self.text = text.into();
+        self
     }
 }
 
@@ -257,6 +307,23 @@ mod tests {
     fn get_missing_assign_returns_none() {
         let conn = Conn::new(Method::GET, Uri::from_static("/"));
         assert_eq!(conn.get_assign::<UserId>(), None);
+    }
+
+    #[test]
+    fn take_assign_removes_value() {
+        let mut conn = Conn::new(Method::GET, Uri::from_static("/"))
+            .assign::<UserId>(42)
+            .assign::<UserName>("alice".to_string());
+
+        assert_eq!(conn.take_assign::<UserId>(), Some(42));
+        assert_eq!(conn.get_assign::<UserId>(), None);
+        assert_eq!(conn.get_assign::<UserName>(), Some(&"alice".to_string()));
+    }
+
+    #[test]
+    fn take_assign_missing_returns_none() {
+        let mut conn = Conn::new(Method::GET, Uri::from_static("/"));
+        assert_eq!(conn.take_assign::<UserId>(), None);
     }
 
     #[test]
