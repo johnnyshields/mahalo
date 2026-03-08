@@ -26,6 +26,7 @@ use mahalo::{
     AssignKey, Channel, ChannelError, ChannelRouter, ChannelSocket, Conn, Controller,
     MahaloEndpoint, MahaloRouter, Pipeline, PubSub, Reply, StaticFiles, Telemetry,
     plug_fn, BoxFuture,
+    sse_response, Event, SseOptions, KeepAlive,
 };
 
 // ---------------------------------------------------------------------------
@@ -562,6 +563,7 @@ impl Channel for OrderChannel {
 
 struct StoreChannel {
     store: Store,
+    pubsub: PubSub,
 }
 
 impl Channel for StoreChannel {
@@ -643,6 +645,17 @@ impl Channel for StoreChannel {
                         let flavor_name = flavor.name.clone();
 
                         socket.broadcast(
+                            "price_updated",
+                            serde_json::json!({
+                                "flavor_id": flavor_id,
+                                "price": price_str,
+                                "flavor_name": &flavor_name,
+                            }),
+                        );
+
+                        // Also broadcast to "prices" topic for SSE clients
+                        self.pubsub.broadcast(
+                            "prices",
                             "price_updated",
                             serde_json::json!({
                                 "flavor_id": flavor_id,
@@ -1021,7 +1034,7 @@ fn main() {
                         pubsub: pubsub.clone(),
                     }),
                 )
-                .channel("store:lobby", Rc::new(StoreChannel { store: store.clone() }))
+                .channel("store:lobby", Rc::new(StoreChannel { store: store.clone(), pubsub: pubsub.clone() }))
                 .channel("support:*", Rc::new(SupportChannel));
             WsConfig {
                 channel_router: Rc::new(channel_router),
@@ -1059,7 +1072,7 @@ fn main() {
     std::thread::spawn(move || {
         let mut tick = 0u64;
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(15));
+            std::thread::sleep(std::time::Duration::from_secs(3));
             tick += 1;
 
             let update = {
@@ -1084,7 +1097,7 @@ fn main() {
             );
 
             price_pubsub.broadcast(
-                "store:lobby",
+                "prices",
                 "price_updated",
                 serde_json::json!({
                     "flavor_id": update.0,
@@ -1098,7 +1111,7 @@ fn main() {
     tracing::info!("🍦 Starting Mahalo Ice Cream Store on http://{addr}");
     tracing::info!("🔌 WebSocket available at ws://{addr}/ws");
     tracing::info!("💬 Support chat on the About page!");
-    tracing::info!("💰 Prices update in real-time every 15s!");
+    tracing::info!("📡 Prices stream via SSE every 3s at /api/prices/stream");
     tracing::info!("🌐 Try: curl http://{addr}/api/menu");
 
     if let Err(e) = endpoint.start() {
@@ -1306,6 +1319,53 @@ fn build_router(
                         .put_resp_body(specials_json())
                 }),
             );
+
+            // SSE price stream
+            {
+                let pubsub = pubsub.clone();
+                s.get(
+                    "/prices/stream",
+                    plug_fn(move |conn: Conn| {
+                        let pubsub = pubsub.clone();
+                        async move {
+                            let (conn, sender) = sse_response(
+                                conn,
+                                SseOptions::default()
+                                    .keep_alive(KeepAlive::new(std::time::Duration::from_secs(15))),
+                            );
+                            if let Some(rx) = pubsub.subscribe("prices") {
+                                rebar_core::executor::spawn(async move {
+                                    loop {
+                                        match rx.try_recv() {
+                                            Ok(msg) => {
+                                                if msg.event == "price_updated" {
+                                                    let event = Event::default()
+                                                        .event("price_updated")
+                                                        .json_data(&*msg.payload);
+                                                    if sender.send(event).is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                                rebar_core::time::sleep(
+                                                    std::time::Duration::from_millis(5),
+                                                )
+                                                .await;
+                                            }
+                                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                })
+                                .detach();
+                            }
+                            conn
+                        }
+                    }),
+                );
+            }
         })
         // Orders scope - auth-protected
         .scope("/api", &["api", "auth"], |s| {

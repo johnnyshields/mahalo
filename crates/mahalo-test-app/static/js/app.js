@@ -152,64 +152,33 @@ document.addEventListener('DOMContentLoaded', function() {
         connect();
     }
 
-    // === Real-time Price Updates (menu & flavor detail pages) ===
+    // === Real-time Price Updates via SSE (menu & flavor detail pages) ===
     var priceElements = document.querySelectorAll('.price[data-flavor-id]');
     if (priceElements.length > 0) {
-        var protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        var wsUrl = protocol + '//' + window.location.host + '/ws';
-        var priceRef = 1;
-
-        function connectPrices() {
-            var ws = new WebSocket(wsUrl);
-
-            ws.onopen = function() {
-                var joinMsg = {topic: 'store:lobby', event: 'phx_join', payload: { customer_name: 'Price Watcher' }, ref: String(priceRef)};
-                ws.send(JSON.stringify(joinMsg));
-                priceRef++;
-
-                setInterval(function() {
-                    if (ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({topic: 'phoenix', event: 'heartbeat', payload: {}, ref: String(priceRef)}));
-                        priceRef++;
+        var evtSource = new EventSource('/api/prices/stream');
+        evtSource.addEventListener('price_updated', function(event) {
+            try {
+                var payload = JSON.parse(event.data);
+                var flavorId = payload.flavor_id;
+                var newPrice = payload.price;
+                priceElements.forEach(function(el) {
+                    if (el.dataset.flavorId === String(flavorId)) {
+                        el.textContent = newPrice;
+                        el.classList.add('price-updated');
+                        setTimeout(function() { el.classList.remove('price-updated'); }, 600);
                     }
-                }, 30000);
-            };
+                });
 
-            ws.onmessage = function(event) {
-                try {
-                    var msg = JSON.parse(event.data);
-                    var eventName = msg.event;
-                    var payload = msg.payload;
-
-                    if (eventName === 'price_updated' && payload) {
-                        var flavorId = payload.flavor_id;
-                        var newPrice = payload.price;
-                        priceElements.forEach(function(el) {
-                            if (el.dataset.flavorId === String(flavorId)) {
-                                el.textContent = newPrice;
-                                el.classList.add('price-updated');
-                                setTimeout(function() { el.classList.remove('price-updated'); }, 600);
-                            }
-                        });
-
-                        var toast = document.getElementById('price-update-toast');
-                        if (toast) {
-                            toast.textContent = '\ud83d\udcb0 ' + payload.flavor_name + ' is now ' + newPrice + '!';
-                            toast.className = 'toast visible';
-                            setTimeout(function() { toast.className = 'toast hidden'; }, 3000);
-                        }
-                    }
-                } catch (e) {
-                    console.error('Price WS parse error:', e);
+                var toast = document.getElementById('price-update-toast');
+                if (toast) {
+                    toast.textContent = '\ud83d\udcb0 ' + payload.flavor_name + ' is now ' + newPrice + '!';
+                    toast.className = 'toast visible';
+                    setTimeout(function() { toast.className = 'toast hidden'; }, 3000);
                 }
-            };
-
-            ws.onclose = function() {
-                setTimeout(connectPrices, 5000);
-            };
-        }
-
-        connectPrices();
+            } catch (e) {
+                console.error('Price SSE parse error:', e);
+            }
+        });
     }
 
     // === Global Chat Widget ===
