@@ -390,8 +390,7 @@ async fn execute_and_respond(
     }
 
     resp_buf.clear();
-    let is_head = conn.method == http::Method::HEAD;
-    http_parse::serialize_response_into(&conn, keep_alive, is_head, resp_buf);
+    http_parse::serialize_response_into(&conn, keep_alive, resp_buf);
 
     let resp = std::mem::take(resp_buf);
     let BufResult(result, returned) = stream.write_all(resp).await;
@@ -579,9 +578,12 @@ async fn ws_streaming_loop(
         if filled == read_buf.len() {
             if read_buf.len() >= WS_MAX_FRAME_SIZE {
                 tracing::warn!("WebSocket frame exceeds {} bytes, closing with 1009", WS_MAX_FRAME_SIZE);
-                let mut close_buf = Vec::with_capacity(16);
+                let mut close_buf = Vec::with_capacity(20);
                 ws_parse::serialize_close_frame(1009, b"message too big", &mut close_buf);
-                let _ = stream.write_all(close_buf).await;
+                let BufResult(res, _) = stream.write_all(close_buf).await;
+                if res.is_err() {
+                    tracing::warn!("failed to write 1009 close frame");
+                }
                 return;
             }
             read_buf.resize(read_buf.len() * 2, 0);
@@ -627,7 +629,7 @@ async fn ws_streaming_loop(
                         ws_parse::OPCODE_PONG => {} // ignore
                         ws_parse::OPCODE_CLOSE => {
                             // Echo close frame back.
-                            let mut close_buf = Vec::with_capacity(4);
+                            let mut close_buf = Vec::with_capacity(20);
                             if frame.payload.len() >= 2 {
                                 let code = u16::from_be_bytes([
                                     frame.payload[0],
@@ -641,14 +643,20 @@ async fn ws_streaming_loop(
                             } else {
                                 ws_parse::serialize_close_frame(1000, b"", &mut close_buf);
                             }
-                            let _ = stream.write_all(close_buf).await;
+                            let BufResult(res, _) = stream.write_all(close_buf).await;
+                            if res.is_err() {
+                                tracing::warn!("failed to write close frame reply");
+                            }
                             return;
                         }
                         _ => {
                             // Unknown opcode — send 1002 (protocol error) close.
-                            let mut close_buf = Vec::new();
+                            let mut close_buf = Vec::with_capacity(20);
                             ws_parse::serialize_close_frame(1002, b"", &mut close_buf);
-                            let _ = stream.write_all(close_buf).await;
+                            let BufResult(res, _) = stream.write_all(close_buf).await;
+                            if res.is_err() {
+                                tracing::warn!("failed to write 1002 close frame");
+                            }
                             return;
                         }
                     }
@@ -660,9 +668,12 @@ async fn ws_streaming_loop(
                 Ok(None) => break, // need more data
                 Err(_) => {
                     // Protocol error — send 1002 close frame.
-                    let mut close_buf = Vec::new();
+                    let mut close_buf = Vec::with_capacity(20);
                     ws_parse::serialize_close_frame(1002, b"protocol error", &mut close_buf);
-                    let _ = stream.write_all(close_buf).await;
+                    let BufResult(res, _) = stream.write_all(close_buf).await;
+                    if res.is_err() {
+                        tracing::warn!("failed to write 1002 close frame");
+                    }
                     return;
                 }
             }
@@ -1366,6 +1377,18 @@ mod tests {
         crate::ws_parse::build_masked_frame(opcode, payload, [0x37, 0xfa, 0x21, 0x3d])
     }
 
+    /// Compute the byte offset where the payload begins in an unmasked server
+    /// WebSocket frame. Reads the length indicator from the frame header per
+    /// RFC 6455 §5.2 (server frames are never masked).
+    fn ws_payload_start(frame: &[u8]) -> usize {
+        assert!(frame.len() >= 2, "frame too short");
+        match frame[1] & 0x7F {
+            126 => 4,  // 16-bit extended length
+            127 => 10, // 64-bit extended length
+            _ => 2,    // 7-bit length
+        }
+    }
+
     /// Echo channel: joins any topic, echoes handle_in payloads back as replies.
     struct EchoChannel;
 
@@ -1465,9 +1488,8 @@ mod tests {
             let mut frame_buf = vec![0u8; 4096];
             let n = stream.read(&mut frame_buf).unwrap();
             assert!(n > 2, "expected reply frame, got {n} bytes");
-            // Parse unmasked server frame: FIN+TEXT, length, payload
-            let payload_start = if frame_buf[1] <= 125 { 2 } else { 4 };
-            let reply_text = String::from_utf8_lossy(&frame_buf[payload_start..n]);
+            let ps = ws_payload_start(&frame_buf[..n]);
+            let reply_text = String::from_utf8_lossy(&frame_buf[ps..n]);
             let reply: serde_json::Value = serde_json::from_str(&reply_text)
                 .unwrap_or_else(|e| panic!("invalid JSON reply: {e}, raw: {reply_text}"));
             assert_eq!(reply["event"], "phx_reply", "reply: {reply}");
@@ -1485,8 +1507,8 @@ mod tests {
 
             // 6. Read heartbeat reply.
             let n = stream.read(&mut frame_buf).unwrap();
-            let payload_start = if frame_buf[1] <= 125 { 2 } else { 4 };
-            let hb_reply_text = String::from_utf8_lossy(&frame_buf[payload_start..n]);
+            let ps = ws_payload_start(&frame_buf[..n]);
+            let hb_reply_text = String::from_utf8_lossy(&frame_buf[ps..n]);
             let hb_reply: serde_json::Value = serde_json::from_str(&hb_reply_text)
                 .unwrap_or_else(|e| panic!("invalid JSON hb reply: {e}, raw: {hb_reply_text}"));
             assert_eq!(hb_reply["event"], "phx_reply", "hb: {hb_reply}");
@@ -1699,8 +1721,8 @@ mod tests {
             stream.write_all(&build_masked_frame(1, join_msg.to_string().as_bytes())).unwrap();
             let mut frame_buf = vec![0u8; 4096];
             let n = stream.read(&mut frame_buf).unwrap();
-            let payload_start = if frame_buf[1] <= 125 { 2 } else { 4 };
-            let reply: serde_json::Value = serde_json::from_slice(&frame_buf[payload_start..n]).unwrap();
+            let ps = ws_payload_start(&frame_buf[..n]);
+            let reply: serde_json::Value = serde_json::from_slice(&frame_buf[ps..n]).unwrap();
             assert_eq!(reply["event"], "phx_reply");
 
             // 3. Send an event that triggers socket.broadcast().
@@ -1711,15 +1733,15 @@ mod tests {
 
             // 4. Read the reply first.
             let n = stream.read(&mut frame_buf).unwrap();
-            let payload_start = if frame_buf[1] <= 125 { 2 } else { 4 };
-            let reply: serde_json::Value = serde_json::from_slice(&frame_buf[payload_start..n]).unwrap();
+            let ps = ws_payload_start(&frame_buf[..n]);
+            let reply: serde_json::Value = serde_json::from_slice(&frame_buf[ps..n]).unwrap();
             assert_eq!(reply["event"], "phx_reply", "expected reply, got: {reply}");
             assert_eq!(reply["payload"]["response"]["sent"], true);
 
             // 5. Read the PubSub broadcast pushed via handle_info → push.
             let n = stream.read(&mut frame_buf).unwrap();
-            let payload_start = if frame_buf[1] <= 125 { 2 } else { 4 };
-            let broadcast: serde_json::Value = serde_json::from_slice(&frame_buf[payload_start..n]).unwrap();
+            let ps = ws_payload_start(&frame_buf[..n]);
+            let broadcast: serde_json::Value = serde_json::from_slice(&frame_buf[ps..n]).unwrap();
             assert_eq!(broadcast["event"], "announce", "expected broadcast event, got: {broadcast}");
             assert_eq!(broadcast["payload"]["text"], "hello", "broadcast payload mismatch: {broadcast}");
             assert_eq!(broadcast["topic"], "bc:room", "broadcast topic mismatch: {broadcast}");
