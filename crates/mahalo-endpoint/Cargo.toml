@@ -10,7 +10,10 @@ mahalo-core = { path = "../mahalo-core" }
 mahalo-router = { path = "../mahalo-router" }
 mahalo-channel = { path = "../mahalo-channel" }
 mahalo-pubsub = { path = "../mahalo-pubsub" }
-rebar-core = { workspace = true }
+rebar-core = { workspace = true, features = ["tls"] }
+compio-io = { workspace = true }
+compio-tls = { workspace = true }
+rustls = { workspace = true }
 turbine-core = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
@@ -31,3 +34,4 @@ local-sync = { workspace = true }
 tokio = { version = "1", features = ["full", "test-util"] }
 serde_json = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
+rcgen = { workspace = true }

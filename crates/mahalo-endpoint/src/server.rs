@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
@@ -14,6 +15,84 @@ use crate::http_parse::{self, ParseError};
 /// Default buffer size for read operations (lease and Vec fallback).
 const DEFAULT_BUF_SIZE: usize = 8192;
 
+// ---------------------------------------------------------------------------
+// MahaloStream — abstracts over plain TCP and TLS-encrypted connections
+// ---------------------------------------------------------------------------
+
+/// A connection stream that is either plain TCP or TLS-encrypted.
+///
+/// `MahaloStream::Plain` delegates directly to rebar's `TcpStream` methods
+/// (zero overhead). `MahaloStream::Tls` uses compio-io `AsyncRead`/`AsyncWrite`
+/// through `compio_tls::TlsStream`, wrapped in `UnsafeCell` for interior
+/// mutability (safe because we run on a single-threaded executor).
+pub(crate) enum MahaloStream {
+    Plain(TcpStream),
+    Tls(UnsafeCell<compio_tls::TlsStream<TcpStream>>),
+}
+
+impl MahaloStream {
+    /// Read into a Vec buffer. For Plain, delegates to TcpStream::read.
+    /// For TLS, uses compio-io AsyncRead.
+    pub async fn read(&self, mut buf: Vec<u8>) -> BufResult<usize, Vec<u8>> {
+        match self {
+            MahaloStream::Plain(s) => s.read(buf).await,
+            MahaloStream::Tls(cell) => {
+                use compio_io::AsyncRead;
+                // compio-io reads into available capacity (cap - len). The caller
+                // may pass a Vec with len > 0 (e.g. from split_off). Truncate to
+                // 0 so the full capacity is available for the read, matching
+                // rebar TcpStream::read semantics which ignore len.
+                buf.clear();
+                // SAFETY: Single-threaded executor — no concurrent access.
+                let s = unsafe { &mut *cell.get() };
+                AsyncRead::read(s, buf).await
+            }
+        }
+    }
+
+    /// Write all bytes. For Plain, delegates to TcpStream::write_all.
+    /// For TLS, uses compio-io AsyncWriteExt::write_all.
+    pub async fn write_all(&self, buf: Vec<u8>) -> BufResult<(), Vec<u8>> {
+        match self {
+            MahaloStream::Plain(s) => s.write_all(buf).await,
+            MahaloStream::Tls(cell) => {
+                use compio_io::{AsyncWrite, AsyncWriteExt};
+                // SAFETY: Single-threaded executor — no concurrent access.
+                let s = unsafe { &mut *cell.get() };
+                match AsyncWriteExt::write_all(s, buf).await {
+                    BufResult(Ok(_n), b) => {
+                        // Flush TLS record buffer so data reaches the peer.
+                        let _ = AsyncWrite::flush(s).await;
+                        BufResult(Ok(()), b)
+                    }
+                    BufResult(Err(e), b) => BufResult(Err(e), b),
+                }
+            }
+        }
+    }
+
+    /// Try to lease a buffer and read (zero-copy). Returns None for TLS
+    /// since TLS decryption necessarily copies data.
+    pub async fn read_lease(
+        &self,
+        lease: turbine_core::buffer::leased::LeasedBuffer,
+    ) -> Option<BufResult<usize, turbine_core::buffer::leased::LeasedBuffer>> {
+        match self {
+            MahaloStream::Plain(s) => Some(s.read_lease(lease).await),
+            MahaloStream::Tls(_) => None, // Falls through to Vec path
+        }
+    }
+
+    /// Returns true if this is a TLS connection.
+    pub fn is_tls(&self) -> bool {
+        matches!(self, MahaloStream::Tls(_))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Accept loop
+// ---------------------------------------------------------------------------
+
 /// Run the accept loop on the current executor using an existing listener.
 pub(crate) async fn run_accept_loop(
     listener: TcpListener,
@@ -23,11 +102,13 @@ pub(crate) async fn run_accept_loop(
     runtime: Rc<Runtime>,
     body_limit: usize,
     ws_config: Option<WsConfig>,
+    tls_acceptor: Option<rebar_core::tls::TlsAcceptor>,
 ) {
     let router = Rc::new(router);
     let error_handler = Rc::new(error_handler);
     let after_plugs: Rc<Vec<Box<dyn Plug>>> = Rc::new(after_plugs);
     let ws_config = Rc::new(ws_config);
+    let tls_acceptor = Rc::new(tls_acceptor);
 
     loop {
         match listener.accept().await {
@@ -37,8 +118,22 @@ pub(crate) async fn run_accept_loop(
                 let after_plugs = Rc::clone(&after_plugs);
                 let runtime = Rc::clone(&runtime);
                 let ws_config = Rc::clone(&ws_config);
+                let tls_acceptor = Rc::clone(&tls_acceptor);
 
                 rebar_core::executor::spawn(async move {
+                    // TLS handshake (if configured) happens inside the spawned
+                    // task, not blocking the accept loop.
+                    let stream = match tls_acceptor.as_ref() {
+                        Some(acc) => match acc.accept(stream).await {
+                            Ok(tls) => MahaloStream::Tls(UnsafeCell::new(tls)),
+                            Err(e) => {
+                                tracing::debug!("TLS handshake failed: {e}");
+                                return;
+                            }
+                        },
+                        None => MahaloStream::Plain(stream),
+                    };
+
                     handle_connection(
                         stream,
                         peer_addr,
@@ -60,16 +155,15 @@ pub(crate) async fn run_accept_loop(
     }
 }
 
-/// Handle a single TCP connection, supporting HTTP keep-alive and WebSocket upgrade.
+/// Handle a single connection, supporting HTTP keep-alive and WebSocket upgrade.
 ///
 /// Uses a hybrid read strategy:
-/// - **Fast path**: When a turbine buffer pool is available, lease an arena buffer
-///   for reads. If the request completes in a single read, no allocator call is
-///   needed for the read buffer.
-/// - **Fallback path**: When no pool is configured, the pool is exhausted, or a
-///   partial request spans multiple reads, falls back to a heap-allocated `Vec<u8>`.
+/// - **Fast path**: When a turbine buffer pool is available and the connection is
+///   plain TCP, lease an arena buffer for reads (zero-alloc for single-read requests).
+/// - **Fallback path**: When no pool, TLS (decryption copies anyway), or partial
+///   requests span multiple reads, uses a heap-allocated `Vec<u8>`.
 async fn handle_connection(
-    stream: TcpStream,
+    stream: MahaloStream,
     peer_addr: SocketAddr,
     router: &MahaloRouter,
     error_handler: &Option<ErrorHandler>,
@@ -102,12 +196,25 @@ async fn handle_connection(
             continue;
         }
 
+        // TLS connections skip the lease path (decryption copies anyway).
+        if stream.is_tls() {
+            accum = Some((vec![0u8; DEFAULT_BUF_SIZE], 0));
+            continue;
+        }
+
         // Fast path: lease a buffer, read, try to parse in one shot.
         let lease = rebar_core::executor::with_buffer_pool(|pool| pool.lease(DEFAULT_BUF_SIZE)).flatten();
 
         match lease {
             Some(lease) => {
-                let BufResult(result, lease) = stream.read_lease(lease).await;
+                let BufResult(result, lease) = match stream.read_lease(lease).await {
+                    Some(r) => r,
+                    None => {
+                        // Shouldn't happen for Plain, but fall back gracefully.
+                        accum = Some((vec![0u8; DEFAULT_BUF_SIZE], 0));
+                        continue;
+                    }
+                };
                 let n = match result {
                     Ok(0) => return,
                     Ok(n) => n,
@@ -178,7 +285,7 @@ async fn handle_connection(
 /// Execute a parsed request and write the response. Returns `true` to continue
 /// the connection, `false` to close it.
 async fn execute_and_respond(
-    stream: &TcpStream,
+    stream: &MahaloStream,
     router: &MahaloRouter,
     error_handler: &Option<ErrorHandler>,
     after_plugs: &[Box<dyn Plug>],
@@ -241,12 +348,12 @@ async fn execute_and_respond(
     keep_alive
 }
 
-/// Stream SSE events from `sse_stream.rx` to the TCP stream.
+/// Stream SSE events from `sse_stream.rx` to the stream.
 ///
 /// If keep-alive is configured, sends a comment when idle for the keep-alive interval.
 /// Exits when the sender is dropped (rx returns None) or on write error.
 async fn sse_streaming_loop(
-    stream: &TcpStream,
+    stream: &MahaloStream,
     mut sse_stream: mahalo_core::conn::SseStream,
     keep_alive_cfg: Option<mahalo_core::conn::KeepAlive>,
 ) {
@@ -287,7 +394,7 @@ async fn sse_streaming_loop(
 /// Vec-based read + parse loop (fallback path). Returns `true` to continue
 /// the connection (caller should check if accum is drained), `false` to close.
 async fn vec_read_loop(
-    stream: &TcpStream,
+    stream: &MahaloStream,
     peer_addr: SocketAddr,
     router: &MahaloRouter,
     error_handler: &Option<ErrorHandler>,
@@ -426,7 +533,7 @@ mod tests {
                 );
                 let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
 
-                run_accept_loop(listener, router, None, vec![], runtime, 2 * 1024 * 1024, None)
+                run_accept_loop(listener, router, None, vec![], runtime, 2 * 1024 * 1024, None, None)
                     .await;
             });
         });
@@ -500,7 +607,7 @@ mod tests {
                 );
                 let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
 
-                run_accept_loop(listener, router, None, vec![], runtime, 2 * 1024 * 1024, None)
+                run_accept_loop(listener, router, None, vec![], runtime, 2 * 1024 * 1024, None, None)
                     .await;
             });
         });
@@ -589,7 +696,7 @@ mod tests {
                 );
                 let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
 
-                run_accept_loop(listener, router, None, vec![], runtime, 2 * 1024 * 1024, None)
+                run_accept_loop(listener, router, None, vec![], runtime, 2 * 1024 * 1024, None, None)
                     .await;
             });
         });
@@ -614,6 +721,105 @@ mod tests {
         );
 
         drop(handle);
+    }
+
+    /// Generate self-signed cert and matching server/client TLS configs.
+    fn test_tls_configs() -> (std::sync::Arc<rustls::ServerConfig>, std::sync::Arc<rustls::ClientConfig>) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let server_config = std::sync::Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .unwrap(),
+        );
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store
+            .add(rustls::pki_types::CertificateDer::from(
+                cert.cert.der().to_vec(),
+            ))
+            .unwrap();
+        let client_config = std::sync::Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+        (server_config, client_config)
+    }
+
+    #[test]
+    fn tls_serves_https_request() {
+        let (server_config, client_config) = test_tls_configs();
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        // Server thread.
+        let server_handle = std::thread::spawn(move || {
+            let ex = RebarExecutor::new(ExecutorConfig::default()).unwrap();
+            ex.block_on(async {
+                let listener =
+                    rebar_core::io::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let addr = listener.local_addr().unwrap();
+                addr_tx.send(addr).unwrap();
+
+                let router = MahaloRouter::new().get(
+                    "/secure",
+                    plug_fn(|conn: Conn| async move {
+                        conn.put_status(StatusCode::OK).put_resp_body("tls-ok")
+                    }),
+                );
+                let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
+                let tls_acceptor = Some(rebar_core::tls::TlsAcceptor::new(server_config));
+
+                run_accept_loop(
+                    listener, router, None, vec![], runtime, 2 * 1024 * 1024, None, tls_acceptor,
+                )
+                .await;
+            });
+        });
+
+        // Client thread — uses compio TLS connector for the handshake.
+        let addr = addr_rx.recv().unwrap();
+        let client_handle = std::thread::spawn(move || {
+            let ex = RebarExecutor::new(ExecutorConfig::default()).unwrap();
+            ex.block_on(async {
+                let stream = rebar_core::io::TcpStream::connect(addr).await.unwrap();
+                let connector = compio_tls::TlsConnector::from(client_config);
+                let mut tls = connector.connect("localhost", stream).await.unwrap();
+
+                use compio_io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+                let req = b"GET /secure HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_vec();
+                AsyncWriteExt::write_all(&mut tls, req).await.0.unwrap();
+                AsyncWrite::flush(&mut tls).await.unwrap();
+
+                let mut all_data = Vec::new();
+                loop {
+                    let buf = Vec::with_capacity(4096);
+                    let rebar_core::io::BufResult(result, buf) = AsyncRead::read(&mut tls, buf).await;
+                    match result {
+                        Ok(0) => break,
+                        Ok(n) => all_data.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                result_tx.send(String::from_utf8(all_data).unwrap()).unwrap();
+            });
+        });
+
+        let response = result_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            response.contains("tls-ok"),
+            "response body missing: {response}"
+        );
+
+        drop(server_handle);
+        client_handle.join().unwrap();
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub(crate) fn spawn_workers(
     after_plug_factories: Arc<Vec<Arc<dyn Fn() -> Box<dyn Plug> + Send + Sync>>>,
     body_limit: usize,
     ws_config_factory: Option<Arc<dyn Fn() -> WsConfig + Send + Sync>>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -32,6 +33,7 @@ pub(crate) fn spawn_workers(
         let error_handler_factory = error_handler_factory.clone();
         let after_plug_factories = Arc::clone(&after_plug_factories);
         let ws_config_factory = ws_config_factory.clone();
+        let tls_config = tls_config.clone();
 
         std::thread::Builder::new()
             .name(format!("mahalo-worker-{i}"))
@@ -43,6 +45,7 @@ pub(crate) fn spawn_workers(
                     &*after_plug_factories,
                     body_limit,
                     ws_config_factory.as_deref(),
+                    tls_config,
                 );
             })?;
     }
@@ -61,6 +64,7 @@ pub(crate) fn start_server(
     after_plug_factories: Vec<Arc<dyn Fn() -> Box<dyn Plug> + Send + Sync>>,
     body_limit: usize,
     ws_config_factory: Option<Arc<dyn Fn() -> WsConfig + Send + Sync>>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -74,11 +78,12 @@ pub(crate) fn start_server(
             let ehf = error_handler_factory.as_deref();
             let apf = &after_plug_factories;
             let wcf = ws_config_factory.as_deref();
+            let tls = tls_config.clone();
 
             let handle = std::thread::Builder::new()
                 .name(format!("mahalo-worker-{i}"))
                 .spawn_scoped(scope, move || {
-                    run_worker(i, addr, rf, ehf, apf, body_limit, wcf);
+                    run_worker(i, addr, rf, ehf, apf, body_limit, wcf, tls);
                 })
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                     Box::new(e)
@@ -108,6 +113,7 @@ fn run_worker_arc(
     after_plug_factories: &[Arc<dyn Fn() -> Box<dyn Plug> + Send + Sync>],
     body_limit: usize,
     ws_config_factory: Option<&(dyn Fn() -> WsConfig + Send + Sync)>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 ) {
     setup_cpu_affinity(worker_id);
 
@@ -132,9 +138,12 @@ fn run_worker_arc(
         let after_plugs: Vec<Box<dyn Plug>> = after_plug_factories.iter().map(|f| f()).collect();
         let ws_config = ws_config_factory.map(|f| f());
 
+        // Create thread-local TLS acceptor from shared config.
+        let tls_acceptor = tls_config.map(rebar_core::tls::TlsAcceptor::new);
+
         crate::server::run_accept_loop(
             listener, router, error_handler, after_plugs,
-            runtime, body_limit, ws_config,
+            runtime, body_limit, ws_config, tls_acceptor,
         )
         .await;
     });
@@ -149,11 +158,12 @@ fn run_worker(
     after_plug_factories: &[Arc<dyn Fn() -> Box<dyn Plug> + Send + Sync>],
     body_limit: usize,
     ws_config_factory: Option<&(dyn Fn() -> WsConfig + Send + Sync)>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 ) {
     // Same implementation — delegate to shared code.
     run_worker_arc(
         worker_id, addr, router_factory, error_handler_factory,
-        after_plug_factories, body_limit, ws_config_factory,
+        after_plug_factories, body_limit, ws_config_factory, tls_config,
     );
 }
 

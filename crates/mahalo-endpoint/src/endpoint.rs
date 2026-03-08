@@ -42,6 +42,7 @@ pub struct MahaloEndpoint {
     error_handler_factory: Option<Arc<dyn Fn() -> ErrorHandler + Send + Sync>>,
     after_plug_factories: Vec<Arc<dyn Fn() -> Box<dyn Plug> + Send + Sync>>,
     ws_config_factory: Option<Arc<dyn Fn() -> WsConfig + Send + Sync>>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl MahaloEndpoint {
@@ -55,6 +56,7 @@ impl MahaloEndpoint {
             error_handler_factory: None,
             after_plug_factories: Vec::new(),
             ws_config_factory: None,
+            tls_config: None,
         }
     }
 
@@ -92,6 +94,15 @@ impl MahaloEndpoint {
         self
     }
 
+    /// Enable TLS (HTTPS) with the given rustls server configuration.
+    ///
+    /// The `Arc<ServerConfig>` is shared across all worker threads; each worker
+    /// creates a thread-local `TlsAcceptor` from it.
+    pub fn tls(mut self, config: Arc<rustls::ServerConfig>) -> Self {
+        self.tls_config = Some(config);
+        self
+    }
+
     /// Start the HTTP server, blocking until shutdown.
     pub fn start(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let addr = self.addr;
@@ -104,6 +115,7 @@ impl MahaloEndpoint {
             self.after_plug_factories,
             DEFAULT_BODY_LIMIT,
             self.ws_config_factory,
+            self.tls_config,
         )
     }
 
@@ -115,12 +127,14 @@ impl MahaloEndpoint {
         let error_handler_factory = self.error_handler_factory;
         let after_plug_factories = Arc::new(self.after_plug_factories);
         let ws_config_factory = self.ws_config_factory;
+        let tls_config = self.tls_config;
 
         ChildEntry::new(spec, move || {
             let router_factory = Arc::clone(&router_factory);
             let error_handler_factory = error_handler_factory.clone();
             let after_plug_factories = Arc::clone(&after_plug_factories);
             let ws_config_factory = ws_config_factory.clone();
+            let tls_config = tls_config.clone();
 
             async move {
                 tracing::info!("Mahalo endpoint listening on {}", addr);
@@ -132,6 +146,7 @@ impl MahaloEndpoint {
                     after_plug_factories,
                     DEFAULT_BODY_LIMIT,
                     ws_config_factory,
+                    tls_config,
                 );
 
                 match spawn_result {
