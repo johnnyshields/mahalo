@@ -22,7 +22,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-rebar-core = { git = "https://github.com/johnnyshields/rebar.git", branch = "rebar-v5-tls" }
+rebar-core = { git = "https://github.com/johnnyshields/rebar.git", branch = "rebar-v5" }
 turbine-core = { git = "https://github.com/johnnyshields/turbine.git", branch = "master" }
 local-sync = "0.1"
 serde = { version = "1", features = ["derive", "rc"] }

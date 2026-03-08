@@ -422,10 +422,12 @@ pub struct ChannelConnectionState {
 
 impl GenServer for ChannelConnectionServer {
     type State = ChannelConnectionState;
+    type Call = rmpv::Value;
+    type Cast = rmpv::Value;
+    type Reply = rmpv::Value;
 
     async fn init(
         &self,
-        _args: rmpv::Value,
         ctx: &GenServerContext,
     ) -> Result<Self::State, String> {
         Ok(ChannelConnectionState {
@@ -437,7 +439,7 @@ impl GenServer for ChannelConnectionServer {
 
     async fn handle_call(
         &self,
-        _request: rmpv::Value,
+        _request: Self::Call,
         _from: GsFrom,
         state: Self::State,
         _ctx: &GenServerContext,
@@ -447,7 +449,7 @@ impl GenServer for ChannelConnectionServer {
 
     async fn handle_cast(
         &self,
-        request: rmpv::Value,
+        request: Self::Cast,
         mut state: Self::State,
         _ctx: &GenServerContext,
     ) -> CastReply<Self::State> {
@@ -546,7 +548,7 @@ pub async fn handle_websocket(
         ws_tx_out,
         Rc::clone(&runtime),
     );
-    let pid = gen_server::start(&runtime, server, rmpv::Value::Nil);
+    let pid = gen_server::start(&runtime, server);
 
     // Read WebSocket messages and cast them to the GenServer
     while let Some(text) = ws_rx.recv().await {
@@ -1167,7 +1169,7 @@ mod tests {
             tx,
             Rc::clone(&runtime),
         );
-        let pid = gen_server::start(&runtime, server, rmpv::Value::Nil);
+        let pid = gen_server::start(&runtime, server);
         (pid, rx, runtime, pubsub)
     }
 
