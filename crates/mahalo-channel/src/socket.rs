@@ -10,7 +10,7 @@ use serde_json::Value;
 /// Decoupled from any specific WebSocket library.
 pub type WsSendItem = String;
 
-use local_sync::mpsc::unbounded;
+use rebar_core::channel::mpsc::unbounded;
 use rebar_core::gen_server::{self, CastReply, CallReply, GenServer, GenServerContext, InfoReply, From as GsFrom};
 use rebar_core::process::ProcessId;
 use rebar_core::runtime::Runtime;

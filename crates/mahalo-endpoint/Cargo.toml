@@ -12,7 +12,6 @@ mahalo-channel = { path = "../mahalo-channel" }
 mahalo-pubsub = { path = "../mahalo-pubsub" }
 rebar-core = { workspace = true }
 turbine-core = { workspace = true }
-local-sync = { workspace = true }
 crossbeam-channel = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }

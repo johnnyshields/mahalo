@@ -181,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn handle_info_default_pushes_to_client() {
         use mahalo_pubsub::{PubSub, PubSubMessage};
-        use local_sync::mpsc::unbounded;
+        use rebar_core::channel::mpsc::unbounded;
 
         let pubsub = PubSub::start();
         let (tx, mut rx) = unbounded::channel();
@@ -207,7 +207,7 @@ mod tests {
     #[tokio::test]
     async fn terminate_default_does_nothing() {
         use mahalo_pubsub::PubSub;
-        use local_sync::mpsc::unbounded;
+        use rebar_core::channel::mpsc::unbounded;
 
         let pubsub = PubSub::start();
         let (tx, _rx) = unbounded::channel();
@@ -223,7 +223,7 @@ mod tests {
     #[tokio::test]
     async fn started_default_does_nothing() {
         use mahalo_pubsub::PubSub;
-        use local_sync::mpsc::unbounded;
+        use rebar_core::channel::mpsc::unbounded;
 
         let pubsub = PubSub::start();
         let (tx, _rx) = unbounded::channel();
@@ -239,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn stopping_default_returns_yes() {
         use mahalo_pubsub::PubSub;
-        use local_sync::mpsc::unbounded;
+        use rebar_core::channel::mpsc::unbounded;
 
         let pubsub = PubSub::start();
         let (tx, _rx) = unbounded::channel();
