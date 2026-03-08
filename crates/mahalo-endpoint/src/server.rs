@@ -62,7 +62,9 @@ impl MahaloStream {
                 match AsyncWriteExt::write_all(s, buf).await {
                     BufResult(Ok(_n), b) => {
                         // Flush TLS record buffer so data reaches the peer.
-                        let _ = AsyncWrite::flush(s).await;
+                        if let Err(e) = AsyncWrite::flush(s).await {
+                            return BufResult(Err(e), b);
+                        }
                         BufResult(Ok(()), b)
                     }
                     BufResult(Err(e), b) => BufResult(Err(e), b),
@@ -816,6 +818,104 @@ mod tests {
         assert!(
             response.contains("tls-ok"),
             "response body missing: {response}"
+        );
+
+        drop(server_handle);
+        client_handle.join().unwrap();
+    }
+
+    #[test]
+    fn tls_sse_streams_events() {
+        let (server_config, client_config) = test_tls_configs();
+
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        let server_handle = std::thread::spawn(move || {
+            let ex = RebarExecutor::new(ExecutorConfig::default()).unwrap();
+            ex.block_on(async {
+                let listener =
+                    rebar_core::io::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let addr = listener.local_addr().unwrap();
+                addr_tx.send(addr).unwrap();
+
+                let router = MahaloRouter::new().get(
+                    "/events",
+                    plug_fn(|conn: Conn| async move {
+                        let (tx, rx) = local_sync::mpsc::unbounded::channel::<String>();
+
+                        let conn = conn
+                            .put_status(StatusCode::OK)
+                            .put_resp_header("content-type", "text/event-stream")
+                            .put_resp_header("cache-control", "no-cache")
+                            .assign::<mahalo_core::conn::SseStreamKey>(
+                                mahalo_core::conn::SseStream { rx },
+                            );
+
+                        rebar_core::executor::spawn(async move {
+                            for i in 1..=3 {
+                                let _ = tx.send(format!("data: tls-event {i}\n\n"));
+                                rebar_core::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                        })
+                        .detach();
+
+                        conn
+                    }),
+                );
+                let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
+                let tls_acceptor = Some(rebar_core::tls::TlsAcceptor::new(server_config));
+
+                run_accept_loop(
+                    listener, router, None, vec![], runtime, 2 * 1024 * 1024, None, tls_acceptor,
+                )
+                .await;
+            });
+        });
+
+        let addr = addr_rx.recv().unwrap();
+        let client_handle = std::thread::spawn(move || {
+            let ex = RebarExecutor::new(ExecutorConfig::default()).unwrap();
+            ex.block_on(async {
+                let stream = rebar_core::io::TcpStream::connect(addr).await.unwrap();
+                let connector = compio_tls::TlsConnector::from(client_config);
+                let mut tls = connector.connect("localhost", stream).await.unwrap();
+
+                use compio_io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+                let req = b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".to_vec();
+                AsyncWriteExt::write_all(&mut tls, req).await.0.unwrap();
+                AsyncWrite::flush(&mut tls).await.unwrap();
+
+                let mut all_data = Vec::new();
+                loop {
+                    let buf = Vec::with_capacity(4096);
+                    let rebar_core::io::BufResult(result, buf) = AsyncRead::read(&mut tls, buf).await;
+                    match result {
+                        Ok(0) => break,
+                        Ok(n) => all_data.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                result_tx.send(String::from_utf8(all_data).unwrap()).unwrap();
+            });
+        });
+
+        let response = result_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert!(
+            response.contains("text/event-stream"),
+            "missing SSE content-type: {response}"
+        );
+        assert!(
+            response.contains("data: tls-event 1"),
+            "missing event 1: {response}"
+        );
+        assert!(
+            response.contains("data: tls-event 2"),
+            "missing event 2: {response}"
+        );
+        assert!(
+            response.contains("data: tls-event 3"),
+            "missing event 3: {response}"
         );
 
         drop(server_handle);
