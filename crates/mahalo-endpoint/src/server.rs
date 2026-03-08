@@ -458,6 +458,92 @@ mod tests {
     }
 
     #[test]
+    fn sse_streams_events_and_closes_on_sender_drop() {
+        let request = b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let ex = RebarExecutor::new(ExecutorConfig::default()).unwrap();
+            ex.block_on(async {
+                let listener =
+                    rebar_core::io::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let addr = listener.local_addr().unwrap();
+                addr_tx.send(addr).unwrap();
+
+                let router = MahaloRouter::new().get(
+                    "/events",
+                    plug_fn(|conn: Conn| async move {
+                        let (tx, rx) = local_sync::mpsc::unbounded::channel::<String>();
+
+                        let conn = conn
+                            .put_status(StatusCode::OK)
+                            .put_resp_header("content-type", "text/event-stream")
+                            .put_resp_header("cache-control", "no-cache")
+                            .assign::<mahalo_core::conn::SseStreamKey>(
+                                mahalo_core::conn::SseStream { rx },
+                            );
+
+                        // Spawn a task that sends 3 events then drops sender.
+                        rebar_core::executor::spawn(async move {
+                            for i in 1..=3 {
+                                let _ = tx.send(format!("data: event {i}\n\n"));
+                                rebar_core::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                            // tx dropped here — closes the stream
+                        })
+                        .detach();
+
+                        conn
+                    }),
+                );
+                let runtime = Rc::new(rebar_core::runtime::Runtime::new(1));
+
+                run_accept_loop(listener, router, None, vec![], runtime, 2 * 1024 * 1024, None)
+                    .await;
+            });
+        });
+
+        let addr = addr_rx.recv().unwrap();
+        let response = http_roundtrip(addr, request);
+
+        // Verify SSE headers.
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "unexpected status: {response}"
+        );
+        assert!(
+            response.contains("content-type: text/event-stream"),
+            "missing content-type: {response}"
+        );
+        assert!(
+            response.contains("connection: close"),
+            "missing connection: close: {response}"
+        );
+        // No content-length for streaming.
+        assert!(
+            !response.contains("content-length"),
+            "SSE should not have content-length: {response}"
+        );
+
+        // Verify all 3 events arrived.
+        assert!(
+            response.contains("data: event 1"),
+            "missing event 1: {response}"
+        );
+        assert!(
+            response.contains("data: event 2"),
+            "missing event 2: {response}"
+        );
+        assert!(
+            response.contains("data: event 3"),
+            "missing event 3: {response}"
+        );
+
+        drop(handle);
+    }
+
+    #[test]
     fn fallback_vec_path_serves_http_request() {
         let response = serve_one_request(
             ExecutorConfig::default(),
