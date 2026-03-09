@@ -4,39 +4,39 @@
 
 {% block content %}
 <div class="container" style="text-align: center;">
-    <h2>📦 Order #{{ order_id }}</h2>
+    <h2>🧾 Order #{{ order_id }} — hang tight!</h2>
 
     <div class="status-section">
-        <p>Current Status:</p>
+        <p>Here's where we're at:</p>
         <div id="order-status" class="badge badge-large pending">⏳ Connecting...</div>
     </div>
 
     <div class="status-timeline">
         <div class="timeline-step" data-status="pending">
             <div class="timeline-dot"></div>
-            <span>📝 Pending</span>
+            <span>📝 Got it!</span>
         </div>
         <div class="timeline-step" data-status="preparing">
             <div class="timeline-dot"></div>
-            <span>👨‍🍳 Preparing</span>
+            <span>👨‍🍳 Scooping away...</span>
         </div>
         <div class="timeline-step" data-status="ready">
             <div class="timeline-dot"></div>
-            <span>✅ Ready</span>
+            <span>✅ Come and get it!</span>
         </div>
         <div class="timeline-step" data-status="delivered">
             <div class="timeline-dot"></div>
-            <span>🎉 Delivered</span>
+            <span>🎉 Enjoy, mahalo!</span>
         </div>
     </div>
 
-    <p id="ws-status" class="ws-connecting">🔌 Connecting to live updates...</p>
+    <p id="ws-status" class="ws-connecting">🔌 Hooking up live updates...</p>
 
     <div id="order-data" data-order-id="{{ order_id }}"></div>
 
     <div class="cta-buttons">
-        <a href="/order" class="btn btn-secondary">🛒 Place Another Order</a>
-        <a href="/menu" class="btn">📋 View Menu</a>
+        <a href="/order" class="btn btn-secondary">🛒 Order more (no judgement)</a>
+        <a href="/menu" class="btn">📋 Browse the menu</a>
     </div>
 </div>
 {% endblock content %}

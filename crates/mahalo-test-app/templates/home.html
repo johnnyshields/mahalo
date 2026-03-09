@@ -6,11 +6,11 @@
 <section class="hero">
     <h1>🌺 Welcome to Mahalo Ice Cream 🍦</h1>
     <p class="tagline">🌴 Tropical flavors, island vibes 🤙</p>
-    <p>Aloha! We serve the finest tropical ice cream on the island. 🏝️</p>
+    <p>Aloha! Life's short — eat ice cream. 🏝️</p>
 </section>
 
 <div class="container">
-    <h2>🍨 Our Flavors</h2>
+    <h2>🍨 What's in the freezer?</h2>
     <div class="grid">
         {% for flavor in flavors %}
         <a href="/flavors/{{ flavor.id }}" class="card card-link">
@@ -22,7 +22,7 @@
     </div>
 
     {% if specials %}
-    <h2>🎉 Specials</h2>
+    <h2>🎉 Sweet deals this week</h2>
     <div class="grid">
         {% for special in specials %}
         <div class="card specials-card">
@@ -35,8 +35,8 @@
     {% endif %}
 
     <div class="cta-buttons">
-        <a href="/menu" class="btn">📋 View Full Menu</a>
-        <a href="/order" class="btn btn-secondary">🛒 Order Now</a>
+        <a href="/menu" class="btn">📋 See the full menu</a>
+        <a href="/order" class="btn btn-secondary">🛒 I'm ready to order!</a>
     </div>
 </div>
 {% endblock content %}

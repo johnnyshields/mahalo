@@ -4,7 +4,7 @@
 
 {% block content %}
 <div class="container">
-    <a href="/menu" class="back-link">⬅️ Back to Menu</a>
+    <a href="/menu" class="back-link">⬅️ Back to the menu</a>
 
     <div class="flavor-detail">
         <div class="flavor-hero">
@@ -13,16 +13,16 @@
             <div class="flavor-meta">
                 <span class="price price-large" data-flavor-id="{{ flavor.id }}">{{ flavor.price }}</span>
                 {% if flavor.in_stock %}
-                <span class="badge in-stock badge-large">✅ Available</span>
+                <span class="badge in-stock badge-large">🤙 Ready to scoop!</span>
                 {% else %}
-                <span class="badge sold-out badge-large">❌ Sold Out</span>
+                <span class="badge sold-out badge-large">😭 All gone... for now</span>
                 {% endif %}
             </div>
         </div>
 
         {% if flavor.in_stock %}
         <div class="cta-buttons">
-            <a href="/order?flavor_id={{ flavor.id }}" class="btn btn-large">🛒 Order This Flavor!</a>
+            <a href="/order?flavor_id={{ flavor.id }}" class="btn btn-large">🛒 I need this in my life!</a>
         </div>
         {% endif %}
     </div>
