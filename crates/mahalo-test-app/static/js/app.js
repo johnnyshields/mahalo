@@ -4,16 +4,75 @@ document.addEventListener('DOMContentLoaded', function() {
     var itemsContainer = document.getElementById('items-container');
     var addItemBtn = document.getElementById('add-item-btn');
 
+    var MAX_SCOOPS = 3;
+
+    function addScoopToRow(row) {
+        var scoopsList = row.querySelector('.scoops-list');
+        var existing = scoopsList.querySelectorAll('.scoop-select');
+        if (existing.length >= MAX_SCOOPS) return;
+
+        var template = scoopsList.querySelector('.scoop-select');
+        var newScoop = template.cloneNode(true);
+        newScoop.selectedIndex = 0;
+
+        var wrapper = document.createElement('div');
+        wrapper.className = 'scoop-entry';
+        wrapper.appendChild(newScoop);
+
+        var removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'remove-scoop-btn';
+        removeBtn.textContent = '\u00d7';
+        removeBtn.onclick = function() { wrapper.remove(); updateAddScoopBtn(row); };
+        wrapper.appendChild(removeBtn);
+
+        scoopsList.appendChild(wrapper);
+        updateAddScoopBtn(row);
+    }
+
+    function updateAddScoopBtn(row) {
+        var btn = row.querySelector('.add-scoop-btn');
+        var count = row.querySelectorAll('.scoop-select').length;
+        if (btn) btn.style.display = count >= MAX_SCOOPS ? 'none' : '';
+    }
+
+    // Wire up add-scoop buttons on existing rows
+    function wireAddScoopBtns(row) {
+        var btn = row.querySelector('.add-scoop-btn');
+        if (btn) {
+            btn.addEventListener('click', function() { addScoopToRow(row); });
+        }
+    }
+
+    // Wire initial row
+    var initialRow = itemsContainer ? itemsContainer.querySelector('.item-row') : null;
+    if (initialRow) wireAddScoopBtns(initialRow);
+
     if (addItemBtn && itemsContainer) {
         addItemBtn.addEventListener('click', function() {
             var firstRow = itemsContainer.querySelector('.item-row');
             if (!firstRow) return;
             var newRow = firstRow.cloneNode(true);
-            newRow.querySelector('select[name="flavor_id"]').selectedIndex = 0;
-            newRow.querySelector('input[name="scoops"]').value = 1;
+
+            // Reset vessel
+            var vesselSelect = newRow.querySelector('select[name="vessel"]');
+            if (vesselSelect) vesselSelect.selectedIndex = 0;
+
+            // Reset scoops: keep only the first scoop select, remove extras
+            var scoopsList = newRow.querySelector('.scoops-list');
+            var scoopEntries = scoopsList.querySelectorAll('.scoop-entry');
+            scoopEntries.forEach(function(entry) { entry.remove(); });
+            var firstScoop = scoopsList.querySelector('.scoop-select');
+            if (firstScoop) firstScoop.selectedIndex = 0;
+
+            // Reset topping
             var toppingSelect = newRow.querySelector('select[name="topping"]');
             if (toppingSelect) toppingSelect.selectedIndex = 0;
 
+            // Show add scoop button
+            updateAddScoopBtn(newRow);
+
+            // Add remove-item button
             var removeBtn = document.createElement('button');
             removeBtn.type = 'button';
             removeBtn.className = 'remove-item-btn';
@@ -21,8 +80,26 @@ document.addEventListener('DOMContentLoaded', function() {
             removeBtn.onclick = function() { newRow.remove(); };
             newRow.appendChild(removeBtn);
 
+            wireAddScoopBtns(newRow);
             itemsContainer.appendChild(newRow);
         });
+    }
+
+    // Pre-select flavor from URL ?flavor_id=
+    if (itemsContainer) {
+        var params = new URLSearchParams(window.location.search);
+        var preselect = params.get('flavor_id');
+        if (preselect) {
+            var firstScoop = itemsContainer.querySelector('.scoop-select');
+            if (firstScoop) {
+                for (var i = 0; i < firstScoop.options.length; i++) {
+                    if (firstScoop.options[i].value === preselect) {
+                        firstScoop.selectedIndex = i;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     if (orderForm) {
@@ -32,11 +109,19 @@ document.addEventListener('DOMContentLoaded', function() {
             var rows = itemsContainer.querySelectorAll('.item-row');
             var items = [];
             rows.forEach(function(row) {
-                var flavorId = parseInt(row.querySelector('select[name="flavor_id"]').value);
-                var scoops = parseInt(row.querySelector('input[name="scoops"]').value) || 1;
+                var vesselEl = row.querySelector('select[name="vessel"]');
+                var vessel = vesselEl ? vesselEl.value : 'cup';
+
+                var scoopSelects = row.querySelectorAll('.scoop-select');
+                var scoopFlavors = [];
+                scoopSelects.forEach(function(sel) {
+                    var val = parseInt(sel.value);
+                    if (val) scoopFlavors.push(val);
+                });
+
                 var toppingEl = row.querySelector('select[name="topping"]');
                 var topping = toppingEl && toppingEl.value ? toppingEl.value : null;
-                items.push({ flavor_id: flavorId, scoops: scoops, topping: topping });
+                items.push({ scoop_flavors: scoopFlavors, vessel: vessel, topping: topping });
             });
 
             fetch('/api/orders', {

@@ -55,8 +55,8 @@ struct Order {
 
 #[derive(Debug, Clone, Serialize)]
 struct OrderItem {
-    flavor_id: u64,
-    scoops: u32,
+    scoop_flavors: Vec<u64>,
+    vessel: String,
     topping: Option<String>,
 }
 
@@ -309,10 +309,16 @@ impl Controller for OrderController {
                     .as_array()
                     .map(|arr| {
                         arr.iter()
-                            .map(|item| OrderItem {
-                                flavor_id: item["flavor_id"].as_u64().unwrap_or(0),
-                                scoops: item["scoops"].as_u64().unwrap_or(1) as u32,
-                                topping: item["topping"].as_str().map(|s| s.to_string()),
+                            .map(|item| {
+                                let scoop_flavors = item["scoop_flavors"]
+                                    .as_array()
+                                    .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+                                    .unwrap_or_default();
+                                OrderItem {
+                                    scoop_flavors,
+                                    vessel: item["vessel"].as_str().unwrap_or("cup").to_string(),
+                                    topping: item["topping"].as_str().map(|s| s.to_string()),
+                                }
                             })
                             .collect()
                     })
@@ -514,9 +520,13 @@ impl Channel for OrderChannel {
                 "add_item" => {
                     let order_id = parse_order_id(&socket.topic);
 
+                    let scoop_flavors = payload["scoop_flavors"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+                        .unwrap_or_default();
                     let item = OrderItem {
-                        flavor_id: payload["flavor_id"].as_u64().unwrap_or(0),
-                        scoops: payload["scoops"].as_u64().unwrap_or(1) as u32,
+                        scoop_flavors,
+                        vessel: payload["vessel"].as_str().unwrap_or("cup").to_string(),
                         topping: payload["topping"].as_str().map(|s| s.to_string()),
                     };
 
@@ -832,8 +842,15 @@ fn render_template(conn: Conn, tera: &Tera, name: &str, context: &Context) -> Co
 fn render_home(conn: Conn, tera: &Tera, store: &Store) -> Conn {
     let mut context = Context::new();
     let flavors = store.data.flavors.lock().unwrap();
-    let featured: Vec<serde_json::Value> = flavors.iter().take(3).map(|f| format_flavor(f)).collect();
-    context.insert("flavors", &featured);
+    let all_flavors: Vec<serde_json::Value> = flavors.iter().map(|f| format_flavor(f)).collect();
+    context.insert("flavors", &all_flavors);
+
+    let specials: Vec<serde_json::Value> = specials_data()
+        .iter()
+        .map(|s| serde_json::json!({"name": s.name, "description": s.description, "days": s.days}))
+        .collect();
+    context.insert("specials", &specials);
+
     render_template(conn, tera, "home.html", &context)
 }
 

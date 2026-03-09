@@ -22,7 +22,7 @@
 
         {% if flavor.in_stock %}
         <div class="cta-buttons">
-            <a href="/order" class="btn btn-large">🛒 Order This Flavor!</a>
+            <a href="/order?flavor_id={{ flavor.id }}" class="btn btn-large">🛒 Order This Flavor!</a>
         </div>
         {% endif %}
     </div>

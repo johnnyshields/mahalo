@@ -4,37 +4,52 @@
 
 {% block content %}
 <div class="container">
-    <h2>🛒 Place Your Order</h2>
+    <h2>🤙 Let's Build Your Order!</h2>
 
     <form id="order-form">
         <div class="form-group">
-            <label for="customer_name">👤 Your Name</label>
-            <input type="text" id="customer_name" name="customer_name" required placeholder="Enter your name">
+            <label for="customer_name">👤 Who's this for?</label>
+            <input type="text" id="customer_name" name="customer_name" placeholder="Or stay mysterious... we'll call you Guest 😎">
         </div>
 
-        <h3>🍦 Items</h3>
+        <h3>🍦 What are you having?</h3>
         <div id="items-container">
             <div class="item-row">
-                <select name="flavor_id" required>
-                    <option value="">🍨 Select a flavor...</option>
-                    {% for flavor in flavors %}
-                    <option value="{{ flavor.id }}">{{ flavor.name }} - {{ flavor.price }}</option>
-                    {% endfor %}
-                </select>
-                <input type="number" name="scoops" min="1" max="5" value="1" placeholder="Scoops">
-                <select name="topping">
-                    <option value="">No topping</option>
-                    {% for topping in toppings %}
-                    <option value="{{ topping.name }}">{{ topping.name }} ({{ topping.price }})</option>
-                    {% endfor %}
-                </select>
+                <div class="item-vessel">
+                    <label>🍦 Cone or Cup?</label>
+                    <select name="vessel">
+                        <option value="cone">🍦 Cone</option>
+                        <option value="cup">🥤 Cup</option>
+                    </select>
+                </div>
+                <div class="item-scoops">
+                    <label>🍨 Pick your scoops!</label>
+                    <div class="scoops-list">
+                        <select name="scoop_flavor" class="scoop-select">
+                            <option value="">Choose a flavor...</option>
+                            {% for flavor in flavors %}
+                            <option value="{{ flavor.id }}">{{ flavor.name }} - {{ flavor.price }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <button type="button" class="add-scoop-btn btn btn-secondary btn-small">🍨 Add Another Scoop!</button>
+                </div>
+                <div class="item-topping">
+                    <label>🍫 Top it off?</label>
+                    <select name="topping">
+                        <option value="">Nah, I'm good</option>
+                        {% for topping in toppings %}
+                        <option value="{{ topping.name }}">{{ topping.name }} ({{ topping.price }})</option>
+                        {% endfor %}
+                    </select>
+                </div>
             </div>
         </div>
 
-        <button type="button" id="add-item-btn" class="btn btn-secondary btn-small">➕ Add Another Item</button>
+        <button type="button" id="add-item-btn" class="btn btn-secondary btn-small">➕ I want more!</button>
 
         <div class="form-actions">
-            <button type="submit" class="btn btn-large">🎉 Place Order!</button>
+            <button type="submit" class="btn btn-large">🌺 Order it, mahalo!</button>
         </div>
     </form>
 </div>
