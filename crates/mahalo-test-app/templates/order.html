@@ -36,9 +36,8 @@
                 </div>
 
                 <div class="order-step">
-                    <h3>🍫 Add a topping?</h3>
+                    <h3>🍫 Add toppings?</h3>
                     <div class="topping-picker">
-                        <button type="button" class="topping-chip active" data-topping="">Skip</button>
                         {% for topping in toppings %}
                         <button type="button" class="topping-chip" data-topping="{{ topping.name }}">
                             {{ topping.name }} <span class="topping-price">{{ topping.price }}</span>
@@ -189,6 +188,9 @@
     border-radius: 20px;
     font-size: 0.9rem;
     font-weight: 600;
+}
+
+.scoop-tag.pop-in {
     animation: popIn 0.2s ease;
 }
 
@@ -260,8 +262,8 @@
     const MAX_SCOOPS = 3;
     const item = document.querySelector('.order-item');
     const scoops = [];
+    const toppings = new Set();
     let vessel = 'cone';
-    let topping = '';
 
     // Vessel toggle
     item.querySelectorAll('.vessel-btn').forEach(btn => {
@@ -272,8 +274,25 @@
         });
     });
 
+    // Scoop tag helper
+    function makeScoopTag(name, index, animate) {
+        const span = document.createElement('span');
+        span.className = 'scoop-tag' + (animate ? ' pop-in' : '');
+        span.textContent = name + ' ';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'remove-scoop';
+        btn.innerHTML = '&times;';
+        btn.addEventListener('click', () => {
+            scoops.splice(index, 1);
+            updateFlavorChips(-1);
+        });
+        span.appendChild(btn);
+        return span;
+    }
+
     // Flavor picker
-    function updateFlavorChips() {
+    function updateFlavorChips(newIndex) {
         const countEl = item.querySelector('.scoop-count');
         countEl.textContent = `(${scoops.length}/${MAX_SCOOPS})`;
 
@@ -283,30 +302,17 @@
             } else {
                 chip.classList.remove('maxed');
             }
-        });
-
-        // Render selected scoops
-        const container = item.querySelector('.selected-scoops');
-        container.innerHTML = scoops.map((s, i) =>
-            `<span class="scoop-tag">${s.name} <button type="button" class="remove-scoop" data-index="${i}">&times;</button></span>`
-        ).join('');
-
-        container.querySelectorAll('.remove-scoop').forEach(btn => {
-            btn.addEventListener('click', () => {
-                const idx = parseInt(btn.dataset.index);
-                scoops.splice(idx, 1);
-                updateFlavorChips();
-            });
-        });
-
-        // Update chip selected state (a flavor can be selected multiple times)
-        item.querySelectorAll('.flavor-chip').forEach(chip => {
             const id = parseInt(chip.dataset.flavorId);
-            const count = scoops.filter(s => s.id === id).length;
-            chip.classList.toggle('selected', count > 0);
+            chip.classList.toggle('selected', scoops.some(s => s.id === id));
         });
 
-        // Enable/disable submit
+        // Rebuild scoop tags, only animating the new one
+        const container = item.querySelector('.selected-scoops');
+        container.innerHTML = '';
+        scoops.forEach((s, i) => {
+            container.appendChild(makeScoopTag(s.name, i, i === newIndex));
+        });
+
         document.getElementById('submit-btn').disabled = scoops.length === 0;
     }
 
@@ -316,16 +322,21 @@
             const id = parseInt(chip.dataset.flavorId);
             const name = chip.querySelector('.flavor-chip-name').textContent;
             scoops.push({ id, name });
-            updateFlavorChips();
+            updateFlavorChips(scoops.length - 1);
         });
     });
 
-    // Topping picker
+    // Topping picker (multi-select toggle)
     item.querySelectorAll('.topping-chip').forEach(chip => {
         chip.addEventListener('click', () => {
-            item.querySelectorAll('.topping-chip').forEach(c => c.classList.remove('active'));
-            chip.classList.add('active');
-            topping = chip.dataset.topping;
+            const name = chip.dataset.topping;
+            if (toppings.has(name)) {
+                toppings.delete(name);
+                chip.classList.remove('active');
+            } else {
+                toppings.add(name);
+                chip.classList.add('active');
+            }
         });
     });
 
@@ -340,7 +351,7 @@
             items: [{
                 scoop_flavors: scoops.map(s => s.id),
                 vessel: vessel,
-                topping: topping || undefined,
+                toppings: [...toppings],
             }]
         };
 

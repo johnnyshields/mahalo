@@ -58,7 +58,7 @@ struct Order {
 struct OrderItem {
     scoop_flavors: Vec<u64>,
     vessel: String,
-    topping: Option<String>,
+    toppings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -849,12 +849,15 @@ fn parse_order_item(item: &serde_json::Value) -> Option<OrderItem> {
     }
     .to_string();
 
-    let topping = item["topping"].as_str().map(|s| s.to_string());
+    let toppings: Vec<String> = item["toppings"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
 
     Some(OrderItem {
         scoop_flavors,
         vessel,
-        topping,
+        toppings,
     })
 }
 
@@ -1611,11 +1614,11 @@ mod tests {
 
     #[test]
     fn test_parse_order_item_valid() {
-        let v = serde_json::json!({"scoop_flavors": [1, 2], "vessel": "cone", "topping": "Hot Fudge"});
+        let v = serde_json::json!({"scoop_flavors": [1, 2], "vessel": "cone", "toppings": ["Hot Fudge", "Mochi Bits"]});
         let item = parse_order_item(&v).unwrap();
         assert_eq!(item.scoop_flavors, vec![1, 2]);
         assert_eq!(item.vessel, "cone");
-        assert_eq!(item.topping.as_deref(), Some("Hot Fudge"));
+        assert_eq!(item.toppings, vec!["Hot Fudge", "Mochi Bits"]);
     }
 
     #[test]
@@ -1623,7 +1626,7 @@ mod tests {
         let v = serde_json::json!({"scoop_flavors": [3]});
         let item = parse_order_item(&v).unwrap();
         assert_eq!(item.vessel, "cup");
-        assert_eq!(item.topping, None);
+        assert!(item.toppings.is_empty());
     }
 
     #[test]
