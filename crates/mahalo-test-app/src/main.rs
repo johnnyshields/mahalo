@@ -39,6 +39,7 @@ use mahalo::{
 struct Flavor {
     id: u64,
     name: String,
+    summary: String,
     description: String,
     price_cents: u64,
     in_stock: bool,
@@ -81,13 +82,48 @@ struct Store {
 impl StoreData {
     fn new() -> Self {
         let flavors = vec![
-            Flavor { id: 1, name: "Coconut Dream".into(), description: "Creamy coconut with toasted flakes".into(), price_cents: 450, in_stock: true },
-            Flavor { id: 2, name: "Pineapple Paradise".into(), description: "Tangy pineapple sorbet".into(), price_cents: 400, in_stock: true },
-            Flavor { id: 3, name: "Passion Fruit Swirl".into(), description: "Tart passion fruit with vanilla swirl".into(), price_cents: 500, in_stock: true },
-            Flavor { id: 4, name: "Guava Sunset".into(), description: "Sweet guava with a hint of lime".into(), price_cents: 475, in_stock: true },
-            Flavor { id: 5, name: "Mango Tango".into(), description: "Rich mango with chili flakes".into(), price_cents: 450, in_stock: true },
-            Flavor { id: 6, name: "Lychee Blossom".into(), description: "Delicate lychee with rose water".into(), price_cents: 525, in_stock: true },
-            Flavor { id: 7, name: "Papaya Cream".into(), description: "Smooth papaya with coconut cream".into(), price_cents: 450, in_stock: false },
+            Flavor {
+                id: 1, name: "Coconut Dream".into(),
+                summary: "Creamy coconut with toasted flakes".into(),
+                description: "We source our coconuts from a small grove in Moloa\u{2018}a on Kaua\u{2018}i\u{2019}s north shore, where the trees catch the trade winds rolling off Kalihiwai Ridge. The meat is hand-pressed the same morning it\u{2019}s picked, then slow-churned with a pinch of Hawaiian sea salt from Hanapepe. Each scoop is finished with toasted coconut flakes roasted low and slow at our shop in Kapa\u{2018}a\u{2014}crunchy, buttery, and impossible to stop eating.".into(),
+                price_cents: 450, in_stock: true,
+            },
+            Flavor {
+                id: 2, name: "Pineapple Paradise".into(),
+                summary: "Tangy pineapple sorbet".into(),
+                description: "This bright, dairy-free sorbet starts with Sugarloaf pineapples grown on the red dirt hillsides above Po\u{2018}ip\u{016b}. They\u{2019}re sweeter and less acidic than anything you\u{2019}ll find on the mainland, with a floral perfume that hits you the second we crack one open. We juice them whole\u{2014}core and all\u{2014}and freeze the base fast to lock in that just-picked tang. It tastes like standing barefoot in a Kaua\u{2018}i pineapple field with the sun on your shoulders.".into(),
+                price_cents: 400, in_stock: true,
+            },
+            Flavor {
+                id: 3, name: "Passion Fruit Swirl".into(),
+                summary: "Tart passion fruit with vanilla swirl".into(),
+                description: "Liliko\u{2018}i vines grow wild along the fences and trailheads all over Kaua\u{2018}i, and our neighbors in Kilauea drop off bags of ripe fruit at our back door every week. We strain the seeds out (mostly) and fold that electric-yellow pulp into a tart, custardy base. The vanilla swirl comes from real Tahitian vanilla beans\u{2014}the same variety that thrives in Kaua\u{2018}i\u{2019}s humid valleys. One bite and you\u{2019}ll taste the wild, untamed side of the Garden Isle.".into(),
+                price_cents: 500, in_stock: true,
+            },
+            Flavor {
+                id: 4, name: "Guava Sunset".into(),
+                summary: "Sweet guava with a hint of lime".into(),
+                description: "Pink guava trees line the back roads from Wailua to Anahola, dropping fruit so ripe it perfumes the whole neighborhood. We collect ours from a family farm tucked behind Sleeping Giant, where the volcanic soil gives the fruit an almost candy-like sweetness. A squeeze of fresh lime from our own trees in Kapa\u{2018}a cuts through the richness and keeps every spoonful bright. The color is a deep sunset pink\u{2014}no dye needed, just pure Kaua\u{2018}i guava doing its thing.".into(),
+                price_cents: 475, in_stock: true,
+            },
+            Flavor {
+                id: 5, name: "Mango Tango".into(),
+                summary: "Rich mango with chili flakes".into(),
+                description: "Every summer, the Hayden and Rapoza mango trees across Kaua\u{2018}i go absolutely wild, and we stockpile the best of the harvest from orchards along the Coconut Coast. The base is thick, almost chewy with real mango fiber\u{2014}none of that thin, syrupy stuff. We finish each batch with a dusting of dried Hawaiian chili flakes from a small farm in Hanapepe Valley. The heat sneaks up on you after the sweetness fades, like the afternoon sun breaking through the clouds over Waimea Canyon.".into(),
+                price_cents: 450, in_stock: true,
+            },
+            Flavor {
+                id: 6, name: "Lychee Blossom".into(),
+                summary: "Delicate lychee with rose water".into(),
+                description: "Kaua\u{2018}i\u{2019}s lychee season is short and frantic\u{2014}the trees around \u{2018}\u{014c}lelo and Kalaheo burst with fruit for just a few weeks in June, and everyone races to pick before the birds get them all. We peel and pit each one by hand, keeping that translucent, floral sweetness intact. A few drops of rose water made from Damask roses grown at a small botanical garden near Princeville give it an almost perfume-like elegance. This is our most delicate flavor, and regulars plan their visits around lychee season.".into(),
+                price_cents: 525, in_stock: true,
+            },
+            Flavor {
+                id: 7, name: "Papaya Cream".into(),
+                summary: "Smooth papaya with coconut cream".into(),
+                description: "Sunrise papayas from the east side of Kaua\u{2018}i are the heart of this flavor\u{2014}smaller and sweeter than the big ones you see at the supermarket, with salmon-orange flesh that melts on your tongue. We blend them with rich coconut cream from the same Moloa\u{2018}a grove that supplies our Coconut Dream, creating something silky and tropical that tastes like breakfast on a lanai overlooking Kalapak\u{012b} Bay. When it\u{2019}s in stock, it goes fast\u{2014}so grab a scoop while you can.".into(),
+                price_cents: 450, in_stock: false,
+            },
         ];
 
         StoreData {
@@ -176,6 +212,7 @@ impl Controller for FlavorController {
                 let flavor = Flavor {
                     id: next_id,
                     name: body["name"].as_str().unwrap_or("Unknown").to_string(),
+                    summary: body["summary"].as_str().unwrap_or("").to_string(),
                     description: body["description"].as_str().unwrap_or("").to_string(),
                     price_cents: body["price_cents"].as_u64().unwrap_or(0),
                     in_stock: body["in_stock"].as_bool().unwrap_or(true),
@@ -214,6 +251,9 @@ impl Controller for FlavorController {
                 Some(flavor) => {
                     if let Some(name) = body["name"].as_str() {
                         flavor.name = name.to_string();
+                    }
+                    if let Some(summary) = body["summary"].as_str() {
+                        flavor.summary = summary.to_string();
                     }
                     if let Some(desc) = body["description"].as_str() {
                         flavor.description = desc.to_string();
@@ -838,6 +878,7 @@ fn format_flavor(f: &Flavor) -> serde_json::Value {
     serde_json::json!({
         "id": f.id,
         "name": f.name,
+        "summary": f.summary,
         "description": f.description,
         "price": format_price(f.price_cents),
         "in_stock": f.in_stock,
@@ -1257,6 +1298,7 @@ fn build_router(
                                             serde_json::json!({
                                                 "name": f.name,
                                                 "price": format!("${:.2}", f.price_cents as f64 / 100.0),
+                                                "summary": f.summary,
                                                 "description": f.description,
                                             })
                                         })
@@ -1417,7 +1459,8 @@ mod tests {
         let f = Flavor {
             id: 1,
             name: "Test".into(),
-            description: "Desc".into(),
+            summary: "Desc".into(),
+            description: "Long desc".into(),
             price_cents: 450,
             in_stock: true,
         };

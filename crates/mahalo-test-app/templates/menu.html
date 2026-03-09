@@ -9,7 +9,7 @@
         {% for flavor in flavors %}
         <a href="/flavors/{{ flavor.id }}" class="card card-link">
             <h3>🍦 {{ flavor.name }}</h3>
-            <p>{{ flavor.description }}</p>
+            <p>{{ flavor.summary }}</p>
             <div class="card-footer">
                 <span class="price" data-flavor-id="{{ flavor.id }}">{{ flavor.price }}</span>
                 {% if flavor.in_stock %}
