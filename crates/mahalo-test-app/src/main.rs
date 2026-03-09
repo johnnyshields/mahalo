@@ -307,21 +307,7 @@ impl Controller for OrderController {
 
                 let items: Vec<OrderItem> = body["items"]
                     .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .map(|item| {
-                                let scoop_flavors = item["scoop_flavors"]
-                                    .as_array()
-                                    .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
-                                    .unwrap_or_default();
-                                OrderItem {
-                                    scoop_flavors,
-                                    vessel: item["vessel"].as_str().unwrap_or("cup").to_string(),
-                                    topping: item["topping"].as_str().map(|s| s.to_string()),
-                                }
-                            })
-                            .collect()
-                    })
+                    .map(|arr| arr.iter().filter_map(|item| parse_order_item(item)).collect())
                     .unwrap_or_default();
 
                 let order = Order {
@@ -520,14 +506,13 @@ impl Channel for OrderChannel {
                 "add_item" => {
                     let order_id = parse_order_id(&socket.topic);
 
-                    let scoop_flavors = payload["scoop_flavors"]
-                        .as_array()
-                        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
-                        .unwrap_or_default();
-                    let item = OrderItem {
-                        scoop_flavors,
-                        vessel: payload["vessel"].as_str().unwrap_or("cup").to_string(),
-                        topping: payload["topping"].as_str().map(|s| s.to_string()),
+                    let item = match parse_order_item(payload) {
+                        Some(item) => item,
+                        None => {
+                            return Ok(Some(Reply::error(
+                                serde_json::json!({"error": "at least 1 scoop flavor required"}),
+                            )));
+                        }
                     };
 
                     let mut orders = self.store.data.orders.lock().unwrap();
@@ -802,6 +787,37 @@ fn chrono_now() -> String {
     format!("{}s", d.as_secs())
 }
 
+/// Max scoops per item (matches frontend MAX_SCOOPS).
+const MAX_SCOOPS: usize = 3;
+
+/// Parse an OrderItem from a JSON value, validating vessel and scoop count.
+/// Returns `None` if scoop_flavors is empty (invalid item).
+fn parse_order_item(item: &serde_json::Value) -> Option<OrderItem> {
+    let mut scoop_flavors: Vec<u64> = item["scoop_flavors"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+        .unwrap_or_default();
+
+    if scoop_flavors.is_empty() {
+        return None;
+    }
+    scoop_flavors.truncate(MAX_SCOOPS);
+
+    let vessel = match item["vessel"].as_str() {
+        Some("cone") => "cone",
+        _ => "cup",
+    }
+    .to_string();
+
+    let topping = item["topping"].as_str().map(|s| s.to_string());
+
+    Some(OrderItem {
+        scoop_flavors,
+        vessel,
+        topping,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Template Rendering Helpers
 // ---------------------------------------------------------------------------
@@ -839,18 +855,26 @@ fn render_template(conn: Conn, tera: &Tera, name: &str, context: &Context) -> Co
     }
 }
 
+fn format_specials() -> Vec<serde_json::Value> {
+    specials_data()
+        .iter()
+        .map(|s| serde_json::json!({"name": s.name, "description": s.description, "days": s.days}))
+        .collect()
+}
+
+fn format_toppings() -> Vec<serde_json::Value> {
+    toppings_data()
+        .iter()
+        .map(|t| serde_json::json!({"name": t.name, "price": format_price(t.price_cents)}))
+        .collect()
+}
+
 fn render_home(conn: Conn, tera: &Tera, store: &Store) -> Conn {
     let mut context = Context::new();
     let flavors = store.data.flavors.lock().unwrap();
     let all_flavors: Vec<serde_json::Value> = flavors.iter().map(|f| format_flavor(f)).collect();
     context.insert("flavors", &all_flavors);
-
-    let specials: Vec<serde_json::Value> = specials_data()
-        .iter()
-        .map(|s| serde_json::json!({"name": s.name, "description": s.description, "days": s.days}))
-        .collect();
-    context.insert("specials", &specials);
-
+    context.insert("specials", &format_specials());
     render_template(conn, tera, "home.html", &context)
 }
 
@@ -859,19 +883,8 @@ fn render_menu(conn: Conn, tera: &Tera, store: &Store) -> Conn {
     let flavors = store.data.flavors.lock().unwrap();
     let all_flavors: Vec<serde_json::Value> = flavors.iter().map(|f| format_flavor(f)).collect();
     context.insert("flavors", &all_flavors);
-
-    let toppings: Vec<serde_json::Value> = toppings_data()
-        .iter()
-        .map(|t| serde_json::json!({"name": t.name, "price": format_price(t.price_cents)}))
-        .collect();
-    context.insert("toppings", &toppings);
-
-    let specials: Vec<serde_json::Value> = specials_data()
-        .iter()
-        .map(|s| serde_json::json!({"name": s.name, "description": s.description, "days": s.days}))
-        .collect();
-    context.insert("specials", &specials);
-
+    context.insert("toppings", &format_toppings());
+    context.insert("specials", &format_specials());
     render_template(conn, tera, "menu.html", &context)
 }
 
@@ -880,11 +893,7 @@ fn render_order(conn: Conn, tera: &Tera, store: &Store) -> Conn {
     let flavors = store.data.flavors.lock().unwrap();
     let in_stock: Vec<serde_json::Value> = flavors.iter().filter(|f| f.in_stock).map(|f| format_flavor(f)).collect();
     context.insert("flavors", &in_stock);
-    let toppings: Vec<serde_json::Value> = toppings_data()
-        .iter()
-        .map(|t| serde_json::json!({"name": t.name, "price": format_price(t.price_cents)}))
-        .collect();
-    context.insert("toppings", &toppings);
+    context.insert("toppings", &format_toppings());
     render_template(conn, tera, "order.html", &context)
 }
 
@@ -909,11 +918,7 @@ fn render_about(conn: Conn, tera: &Tera) -> Conn {
     ];
     context.insert("hours", &hours);
 
-    let specials: Vec<serde_json::Value> = specials_data()
-        .iter()
-        .map(|s| serde_json::json!({"name": s.name, "description": s.description, "days": s.days}))
-        .collect();
-    context.insert("specials", &specials);
+    context.insert("specials", &format_specials());
 
     render_template(conn, tera, "about.html", &context)
 }
@@ -1557,5 +1562,85 @@ mod tests {
         let arr = json["specials"].as_array().unwrap();
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["name"], "Mahalo Monday");
+    }
+
+    // -- parse_order_item --
+
+    #[test]
+    fn test_parse_order_item_valid() {
+        let v = serde_json::json!({"scoop_flavors": [1, 2], "vessel": "cone", "topping": "Hot Fudge"});
+        let item = parse_order_item(&v).unwrap();
+        assert_eq!(item.scoop_flavors, vec![1, 2]);
+        assert_eq!(item.vessel, "cone");
+        assert_eq!(item.topping.as_deref(), Some("Hot Fudge"));
+    }
+
+    #[test]
+    fn test_parse_order_item_defaults_cup() {
+        let v = serde_json::json!({"scoop_flavors": [3]});
+        let item = parse_order_item(&v).unwrap();
+        assert_eq!(item.vessel, "cup");
+        assert_eq!(item.topping, None);
+    }
+
+    #[test]
+    fn test_parse_order_item_invalid_vessel_defaults_cup() {
+        let v = serde_json::json!({"scoop_flavors": [1], "vessel": "banana"});
+        let item = parse_order_item(&v).unwrap();
+        assert_eq!(item.vessel, "cup");
+    }
+
+    #[test]
+    fn test_parse_order_item_empty_scoops_returns_none() {
+        let v = serde_json::json!({"scoop_flavors": [], "vessel": "cup"});
+        assert!(parse_order_item(&v).is_none());
+    }
+
+    #[test]
+    fn test_parse_order_item_missing_scoops_returns_none() {
+        let v = serde_json::json!({"vessel": "cup"});
+        assert!(parse_order_item(&v).is_none());
+    }
+
+    #[test]
+    fn test_parse_order_item_truncates_at_max_scoops() {
+        let v = serde_json::json!({"scoop_flavors": [1, 2, 3, 4, 5]});
+        let item = parse_order_item(&v).unwrap();
+        assert_eq!(item.scoop_flavors.len(), MAX_SCOOPS);
+        assert_eq!(item.scoop_flavors, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_parse_order_item_single_scoop() {
+        let v = serde_json::json!({"scoop_flavors": [5], "vessel": "cone"});
+        let item = parse_order_item(&v).unwrap();
+        assert_eq!(item.scoop_flavors, vec![5]);
+        assert_eq!(item.vessel, "cone");
+    }
+
+    // -- format_specials / format_toppings --
+
+    #[test]
+    fn test_format_specials_count_and_shape() {
+        let specials = format_specials();
+        assert_eq!(specials.len(), 3);
+        for s in &specials {
+            assert!(s["name"].is_string());
+            assert!(s["description"].is_string());
+            assert!(s["days"].is_string());
+        }
+        assert_eq!(specials[0]["name"], "Mahalo Monday");
+    }
+
+    #[test]
+    fn test_format_toppings_count_and_shape() {
+        let toppings = format_toppings();
+        assert_eq!(toppings.len(), 6);
+        for t in &toppings {
+            assert!(t["name"].is_string());
+            assert!(t["price"].is_string());
+        }
+        assert_eq!(toppings[0]["name"], "Macadamia Nuts");
+        assert_eq!(toppings[0]["price"], "$0.75");
     }
 }
